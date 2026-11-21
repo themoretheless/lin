@@ -55,6 +55,16 @@ impl ExactSum {
     }
 
     #[inline]
+    pub(crate) fn int_part(&self) -> i128 {
+        self.int
+    }
+
+    #[inline]
+    pub(crate) fn add_i64_slice(&mut self, vals: &[i64]) {
+        self.int += vals.iter().map(|&v| v as i128).sum::<i128>();
+    }
+
+    #[inline]
     pub(crate) fn add_f64(&mut self, v: f64) {
         let t = self.float + v;
         if t.is_finite() {
@@ -65,6 +75,13 @@ impl ExactSum {
             };
         }
         self.float = t;
+    }
+
+    #[inline]
+    pub(crate) fn add_f64_slice(&mut self, vals: &[f64]) {
+        for &v in vals {
+            self.add_f64(v);
+        }
     }
 
     /// A sum assembled from an exact integer part and a float part computed elsewhere

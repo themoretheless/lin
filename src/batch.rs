@@ -80,28 +80,142 @@ impl Validity {
         self.nulls
     }
 
-    fn rebuild(&mut self, range: std::ops::Range<usize>) {
-        if self.nulls == 0 {
-            self.len = range.len();
+    fn truncate(&mut self, n: usize) {
+        if n >= self.len {
             return;
         }
-        let mut out = Validity::default();
-        for i in range {
-            out.push(self.is_valid(i));
+        if n == 0 {
+            self.words.clear();
+            self.len = 0;
+            self.nulls = 0;
+            return;
         }
-        *self = out;
+        if self.nulls == 0 {
+            self.len = n;
+            return;
+        }
+        let new_words = n.div_ceil(64);
+        self.words.truncate(new_words);
+        let tail = n % 64;
+        if tail != 0 {
+            self.words[new_words - 1] &= (1u64 << tail) - 1;
+        }
+        let ones: usize = self.words.iter().map(|w| w.count_ones() as usize).sum();
+        self.len = n;
+        self.nulls = n - ones;
+        if self.nulls == 0 {
+            self.words.clear();
+        }
+    }
+
+    fn rebuild(&mut self, range: std::ops::Range<usize>) {
+        let start = range.start.min(self.len);
+        let end = range.end.min(self.len);
+        if start >= end {
+            *self = Validity::default();
+            return;
+        }
+        if self.nulls == 0 {
+            self.len = end - start;
+            return;
+        }
+        if start == 0 {
+            self.truncate(end);
+            return;
+        }
+        let n = end - start;
+        let out_words = n.div_ceil(64);
+        let word_shift = start / 64;
+        let bit_shift = start % 64;
+        if bit_shift == 0 {
+            self.words.drain(0..word_shift);
+            self.words.truncate(out_words);
+        } else {
+            for w in 0..out_words {
+                let lo = self.words[word_shift + w] >> bit_shift;
+                let hi = self
+                    .words
+                    .get(word_shift + w + 1)
+                    .copied()
+                    .unwrap_or(0)
+                    << (64 - bit_shift);
+                self.words[w] = lo | hi;
+            }
+            self.words.truncate(out_words);
+        }
+        let tail = n % 64;
+        if tail != 0 {
+            self.words[out_words - 1] &= (1u64 << tail) - 1;
+        }
+        let ones: usize = self.words.iter().map(|w| w.count_ones() as usize).sum();
+        self.len = n;
+        self.nulls = n - ones;
+        if self.nulls == 0 {
+            self.words.clear();
+        }
     }
 
     fn extend(&mut self, other: &Validity) {
         if other.len == 0 {
             return;
         }
+        if self.len == 0 {
+            *self = other.clone();
+            return;
+        }
         if self.nulls == 0 && other.nulls == 0 {
             self.len += other.len;
             return;
         }
-        for i in 0..other.len {
-            self.push(other.is_valid(i));
+        if self.nulls == 0 {
+            let cur_words = self.len.div_ceil(64);
+            self.words.resize(cur_words, u64::MAX);
+            let tail = self.len % 64;
+            if tail != 0 {
+                self.words[cur_words - 1] = (1u64 << tail) - 1;
+            }
+        }
+        let new_len = self.len + other.len;
+        let new_words = new_len.div_ceil(64);
+        let bit_off = self.len % 64;
+        if other.nulls == 0 {
+            if bit_off == 0 {
+                self.words.resize(new_words, u64::MAX);
+                let end_tail = new_len % 64;
+                if end_tail != 0 {
+                    self.words[new_words - 1] = (1u64 << end_tail) - 1;
+                }
+            } else if new_words == self.words.len() {
+                let mask = ((1u64 << other.len) - 1) << bit_off;
+                *self.words.last_mut().unwrap() |= mask;
+            } else {
+                *self.words.last_mut().unwrap() |= u64::MAX << bit_off;
+                self.words.resize(new_words, u64::MAX);
+                let end_tail = new_len % 64;
+                if end_tail != 0 {
+                    self.words[new_words - 1] = (1u64 << end_tail) - 1;
+                }
+            }
+            self.len = new_len;
+        } else {
+            if bit_off == 0 {
+                self.words.extend_from_slice(&other.words);
+            } else {
+                self.words.reserve(new_words - self.words.len());
+                let last_idx = self.words.len() - 1;
+                self.words[last_idx] |= other.words[0] << bit_off;
+                for w in 1..other.words.len() {
+                    let prev_hi = other.words[w - 1] >> (64 - bit_off);
+                    let cur_lo = other.words[w] << bit_off;
+                    self.words.push(prev_hi | cur_lo);
+                }
+                if self.words.len() < new_words {
+                    self.words
+                        .push(other.words[other.words.len() - 1] >> (64 - bit_off));
+                }
+            }
+            self.len = new_len;
+            self.nulls += other.nulls;
         }
     }
 
@@ -731,27 +845,63 @@ impl Column {
                 data,
                 valid,
             } => {
-                let mut out_offsets = Vec::with_capacity(n + 1);
-                out_offsets.push(0);
-                let mut out_data = Vec::new();
-                let mut out_valid = Validity::default();
-                for &i in indices {
-                    let idx = i as usize;
-                    if valid.is_valid(idx) {
+                if valid.null_count() == 0 {
+                    let total_bytes: usize = indices
+                        .iter()
+                        .map(|&i| {
+                            let idx = i as usize;
+                            (offsets[idx + 1] - offsets[idx]) as usize
+                        })
+                        .sum();
+                    let mut out_offsets = Vec::with_capacity(n + 1);
+                    out_offsets.push(0);
+                    let mut out_data = Vec::with_capacity(total_bytes);
+                    for &i in indices {
+                        let idx = i as usize;
                         let s = offsets[idx] as usize;
                         let e = offsets[idx + 1] as usize;
                         out_data.extend_from_slice(&data[s..e]);
                         out_offsets.push(out_data.len() as u32);
-                        out_valid.push(true);
-                    } else {
-                        out_offsets.push(out_data.len() as u32);
-                        out_valid.push(false);
                     }
-                }
-                Column::Text {
-                    offsets: out_offsets,
-                    data: out_data,
-                    valid: out_valid,
+                    Column::Text {
+                        offsets: out_offsets,
+                        data: out_data,
+                        valid: Validity::all_valid(n),
+                    }
+                } else {
+                    let total_bytes: usize = indices
+                        .iter()
+                        .map(|&i| {
+                            let idx = i as usize;
+                            if valid.is_valid(idx) {
+                                (offsets[idx + 1] - offsets[idx]) as usize
+                            } else {
+                                0
+                            }
+                        })
+                        .sum();
+                    let mut out_offsets = Vec::with_capacity(n + 1);
+                    out_offsets.push(0);
+                    let mut out_data = Vec::with_capacity(total_bytes);
+                    let mut out_valid = Validity::default();
+                    for &i in indices {
+                        let idx = i as usize;
+                        if valid.is_valid(idx) {
+                            let s = offsets[idx] as usize;
+                            let e = offsets[idx + 1] as usize;
+                            out_data.extend_from_slice(&data[s..e]);
+                            out_offsets.push(out_data.len() as u32);
+                            out_valid.push(true);
+                        } else {
+                            out_offsets.push(out_data.len() as u32);
+                            out_valid.push(false);
+                        }
+                    }
+                    Column::Text {
+                        offsets: out_offsets,
+                        data: out_data,
+                        valid: out_valid,
+                    }
                 }
             }
             Column::Dict {
@@ -855,15 +1005,15 @@ impl Column {
             Column::Nulls { n: len, .. } => *len = n,
             Column::Int { vals, valid } | Column::Time { vals, valid } => {
                 vals.truncate(n);
-                valid.rebuild(0..n);
+                valid.truncate(n);
             }
             Column::Float { vals, valid } => {
                 vals.truncate(n);
-                valid.rebuild(0..n);
+                valid.truncate(n);
             }
             Column::Bool { vals, valid } => {
                 vals.truncate(n);
-                valid.rebuild(0..n);
+                valid.truncate(n);
             }
             Column::Text {
                 offsets,
@@ -873,11 +1023,11 @@ impl Column {
                 offsets.truncate(n + 1);
                 let new_byte_len = offsets.last().copied().unwrap_or(0) as usize;
                 data.truncate(new_byte_len);
-                valid.rebuild(0..n);
+                valid.truncate(n);
             }
             Column::Dict { codes, valid, .. } => {
                 codes.truncate(n);
-                valid.rebuild(0..n);
+                valid.truncate(n);
             }
             Column::Cells(c) => c.truncate(n),
         }
@@ -994,28 +1144,59 @@ impl Column {
                     valid: vb,
                 },
             ) => {
-                if va_vals == &vb_vals {
+                let same_dict = va_vals.len() == vb_vals.len()
+                    && va_vals
+                        .iter()
+                        .zip(vb_vals.iter())
+                        .all(|(a, b)| Arc::ptr_eq(a, b) || a == b);
+                if same_dict {
                     va.extend(&vb);
                     ca.extend(cb);
                 } else {
                     let mut remap = Vec::with_capacity(vb_vals.len());
-                    for s in vb_vals {
-                        if let Some(pos) = va_vals.iter().position(|x| x == &s) {
-                            remap.push(pos as u32);
-                        } else {
-                            let pos = va_vals.len() as u32;
-                            va_vals.push(s);
-                            remap.push(pos);
+                    if va_vals.len() + vb_vals.len() <= 32 {
+                        for s in vb_vals {
+                            if let Some(pos) =
+                                va_vals.iter().position(|x| Arc::ptr_eq(x, &s) || x == &s)
+                            {
+                                remap.push(pos as u32);
+                            } else {
+                                let pos = va_vals.len() as u32;
+                                va_vals.push(s);
+                                remap.push(pos);
+                            }
+                        }
+                    } else {
+                        let mut idx_map: rustc_hash::FxHashMap<Arc<str>, u32> =
+                            rustc_hash::FxHashMap::with_capacity_and_hasher(
+                                va_vals.len() + vb_vals.len(),
+                                Default::default(),
+                            );
+                        for (i, a) in va_vals.iter().enumerate() {
+                            idx_map.entry(Arc::clone(a)).or_insert(i as u32);
+                        }
+                        for s in vb_vals {
+                            if let Some(&pos) = idx_map.get(s.as_ref()) {
+                                remap.push(pos);
+                            } else {
+                                let pos = va_vals.len() as u32;
+                                idx_map.insert(Arc::clone(&s), pos);
+                                va_vals.push(s);
+                                remap.push(pos);
+                            }
                         }
                     }
-                    ca.reserve(cb.len());
-                    for (i, code) in cb.into_iter().enumerate() {
-                        if vb.is_valid(i) {
-                            ca.push(remap[code as usize]);
-                            va.push(true);
-                        } else {
-                            ca.push(0);
-                            va.push(false);
+                    va.extend(&vb);
+                    if vb.null_count() == 0 {
+                        ca.extend(cb.into_iter().map(|code| remap[code as usize]));
+                    } else {
+                        ca.reserve(cb.len());
+                        for (i, code) in cb.into_iter().enumerate() {
+                            ca.push(if vb.is_valid(i) {
+                                remap[code as usize]
+                            } else {
+                                0
+                            });
                         }
                     }
                 }
@@ -1083,7 +1264,91 @@ fn prefilled<T: Clone>(n: usize, cap: usize, fill: T) -> Vec<T> {
 /// Columns are equal when they hold the same values, whatever their representation.
 impl PartialEq for Column {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && (0..self.len()).all(|i| self.get(i) == other.get(i))
+        let n = self.len();
+        if n != other.len() {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+        match (self, other) {
+            (Column::Nulls { .. }, Column::Nulls { .. }) => true,
+            (Column::Cells(a), Column::Cells(b)) => a == b,
+            (Column::Int { vals: a, valid: va }, Column::Int { vals: b, valid: vb })
+            | (Column::Time { vals: a, valid: va }, Column::Time { vals: b, valid: vb }) => {
+                if va.null_count() == 0 && vb.null_count() == 0 {
+                    a == b
+                } else {
+                    va.null_count() == vb.null_count()
+                        && (0..n).all(|i| match (va.is_valid(i), vb.is_valid(i)) {
+                            (true, true) => a[i] == b[i],
+                            (false, false) => true,
+                            _ => false,
+                        })
+                }
+            }
+            (Column::Float { vals: a, valid: va }, Column::Float { vals: b, valid: vb }) => {
+                if va.null_count() == 0 && vb.null_count() == 0 {
+                    a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+                } else {
+                    va.null_count() == vb.null_count()
+                        && (0..n).all(|i| match (va.is_valid(i), vb.is_valid(i)) {
+                            (true, true) => a[i].to_bits() == b[i].to_bits(),
+                            (false, false) => true,
+                            _ => false,
+                        })
+                }
+            }
+            (Column::Bool { vals: a, valid: va }, Column::Bool { vals: b, valid: vb }) => {
+                if va.null_count() == 0 && vb.null_count() == 0 {
+                    a == b
+                } else {
+                    va.null_count() == vb.null_count()
+                        && (0..n).all(|i| match (va.is_valid(i), vb.is_valid(i)) {
+                            (true, true) => a[i] == b[i],
+                            (false, false) => true,
+                            _ => false,
+                        })
+                }
+            }
+            (
+                Column::Dict {
+                    values: va_vals,
+                    codes: ca,
+                    valid: va,
+                },
+                Column::Dict {
+                    values: vb_vals,
+                    codes: cb,
+                    valid: vb,
+                },
+            ) if va.null_count() == 0
+                && vb.null_count() == 0
+                && va_vals.len() == vb_vals.len()
+                && va_vals
+                    .iter()
+                    .zip(vb_vals)
+                    .all(|(x, y)| Arc::ptr_eq(x, y) || x == y) =>
+            {
+                ca == cb
+            }
+            (Column::Text { .. } | Column::Dict { .. }, Column::Text { .. } | Column::Dict { .. }) => {
+                (0..n).all(|i| match (self.is_null(i), other.is_null(i)) {
+                    (true, true) => true,
+                    (false, false) => self.text_at(i) == other.text_at(i),
+                    _ => false,
+                })
+            }
+            (tc @ (Column::Text { .. } | Column::Dict { .. }), Column::Cells(cells))
+            | (Column::Cells(cells), tc @ (Column::Text { .. } | Column::Dict { .. })) => {
+                (0..n).all(|i| match (tc.is_null(i), &cells[i]) {
+                    (true, Cell::Null) => true,
+                    (false, c) => c.text().is_some_and(|s| Some(s) == tc.text_at(i)),
+                    _ => false,
+                })
+            }
+            _ => (0..n).all(|i| self.get(i) == other.get(i)),
+        }
     }
 }
 
@@ -1180,11 +1445,135 @@ impl RecordBatch {
                 _ => col.get(i),
             }
         }
-        if n < 65536
-            && self.cols.len() == 2
-            && self.names.len() == 2
-            && self.names[0] != self.names[1]
-        {
+        let width = self.cols.len();
+        let unique_small_names = (1..=8).contains(&width)
+            && self.names.len() == width
+            && (0..width).all(|i| (i + 1..width).all(|j| self.names[i] != self.names[j]));
+
+        if n >= 65_536 && unique_small_names {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .min(8)
+                .min(n.div_ceil(8192));
+            if threads > 1 {
+                let shape = if self.names.as_ref() == ["id", "title"] {
+                    Arc::clone(crate::store::shape_id_title())
+                } else {
+                    Row::shape_of(&self.names)
+                };
+                let mut inv_slots = [0usize; 8];
+                for (pos, target) in shape.names().iter().enumerate() {
+                    inv_slots[pos] = self
+                        .names
+                        .iter()
+                        .position(|name| name == target)
+                        .unwrap_or(pos);
+                }
+                // Extract `Column::Cells` buffers so workers receive disjoint `&mut [Cell]`
+                // slices and move cells via `mem::replace` with zero atomic refcount traffic.
+                let mut cell_vecs: smallvec::SmallVec<[Option<Vec<Cell>>; 8]> =
+                    smallvec::SmallVec::with_capacity(width);
+                for col in &mut self.cols {
+                    if let Column::Cells(v) = col {
+                        cell_vecs.push(Some(std::mem::take(v)));
+                        *col = Column::Nulls { n: 0, cap: 0 };
+                    } else {
+                        cell_vecs.push(None);
+                    }
+                }
+                let cols_ref = self.cols.as_slice();
+                let chunk_size = n.div_ceil(threads);
+                let mut out_buf: Vec<std::mem::MaybeUninit<Row>> = Vec::with_capacity(n);
+                // SAFETY: Every element in `0..n` is initialized across disjoint `chunks_mut` below.
+                unsafe {
+                    out_buf.set_len(n);
+                }
+                let mut cell_chunk_iters: smallvec::SmallVec<
+                    [Option<std::slice::ChunksMut<'_, Cell>>; 8],
+                > = cell_vecs
+                    .iter_mut()
+                    .map(|opt| opt.as_mut().map(|v| v.chunks_mut(chunk_size)))
+                    .collect();
+
+                std::thread::scope(|scope| {
+                    let mut c_start = 0usize;
+                    for out_chunk in out_buf.chunks_mut(chunk_size) {
+                        let c_len = out_chunk.len();
+                        let mut worker_cells: smallvec::SmallVec<[Option<&mut [Cell]>; 8]> =
+                            smallvec::SmallVec::with_capacity(width);
+                        for it_opt in &mut cell_chunk_iters {
+                            worker_cells.push(it_opt.as_mut().and_then(Iterator::next));
+                        }
+                        let shape_ref = &shape;
+                        scope.spawn(move || {
+                            if width == 2 {
+                                let s0 = inv_slots[0];
+                                let s1 = inv_slots[1];
+                                for (local_i, slot_out) in out_chunk.iter_mut().enumerate() {
+                                    let gi = c_start + local_i;
+                                    let c0 = match &mut worker_cells[s0] {
+                                        Some(sl) => std::mem::replace(&mut sl[local_i], Cell::Null),
+                                        None => cols_ref[s0].get(gi),
+                                    };
+                                    let c1 = match &mut worker_cells[s1] {
+                                        Some(sl) => std::mem::replace(&mut sl[local_i], Cell::Null),
+                                        None => cols_ref[s1].get(gi),
+                                    };
+                                    slot_out.write(Row::from_parts(Arc::clone(shape_ref), [c0, c1]));
+                                }
+                            } else if width == 3 {
+                                let (s0, s1, s2) = (inv_slots[0], inv_slots[1], inv_slots[2]);
+                                for (local_i, slot_out) in out_chunk.iter_mut().enumerate() {
+                                    let gi = c_start + local_i;
+                                    let c0 = match &mut worker_cells[s0] {
+                                        Some(sl) => std::mem::replace(&mut sl[local_i], Cell::Null),
+                                        None => cols_ref[s0].get(gi),
+                                    };
+                                    let c1 = match &mut worker_cells[s1] {
+                                        Some(sl) => std::mem::replace(&mut sl[local_i], Cell::Null),
+                                        None => cols_ref[s1].get(gi),
+                                    };
+                                    let c2 = match &mut worker_cells[s2] {
+                                        Some(sl) => std::mem::replace(&mut sl[local_i], Cell::Null),
+                                        None => cols_ref[s2].get(gi),
+                                    };
+                                    slot_out.write(Row::from_parts(
+                                        Arc::clone(shape_ref),
+                                        [c0, c1, c2],
+                                    ));
+                                }
+                            } else {
+                                for (local_i, slot_out) in out_chunk.iter_mut().enumerate() {
+                                    let gi = c_start + local_i;
+                                    let row = Row::from_parts(
+                                        Arc::clone(shape_ref),
+                                        (0..width).map(|pos| {
+                                            let ci = inv_slots[pos];
+                                            match &mut worker_cells[ci] {
+                                                Some(sl) => {
+                                                    std::mem::replace(&mut sl[local_i], Cell::Null)
+                                                }
+                                                None => cols_ref[ci].get(gi),
+                                            }
+                                        }),
+                                    );
+                                    slot_out.write(row);
+                                }
+                            }
+                        });
+                        c_start += c_len;
+                    }
+                });
+                // SAFETY: `MaybeUninit<Row>` has identical layout to `Row`, and all `n` slots were written.
+                return unsafe {
+                    let mut md = std::mem::ManuallyDrop::new(out_buf);
+                    Vec::from_raw_parts(md.as_mut_ptr() as *mut Row, n, md.capacity())
+                };
+            }
+        }
+
+        if width == 2 && self.names.len() == 2 && self.names[0] != self.names[1] {
             let shape = if self.names.as_ref() == ["id", "title"] {
                 Arc::clone(crate::store::shape_id_title())
             } else {
@@ -1194,7 +1583,7 @@ impl RecordBatch {
             let (col0_slice, col1_slice) = self.cols.split_at_mut(1);
             let col0 = &mut col0_slice[0];
             let col1 = &mut col1_slice[0];
-            let mut out = if n >= 1024 {
+            let mut out = if (1024..65_536).contains(&n) {
                 crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
             } else {
                 Vec::with_capacity(n)
@@ -1218,8 +1607,7 @@ impl RecordBatch {
             out.truncate(n);
             return out;
         }
-        if n < 65536
-            && self.cols.len() == 3
+        if width == 3
             && self.names.len() == 3
             && self.names[0] != self.names[1]
             && self.names[1] != self.names[2]
@@ -1239,7 +1627,7 @@ impl RecordBatch {
             let c0 = &mut s0[0];
             let c1 = &mut s1[0];
             let c2 = &mut s2[0];
-            let mut out = if n >= 1024 {
+            let mut out = if (1024..65_536).contains(&n) {
                 crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
             } else {
                 Vec::with_capacity(n)
@@ -1270,12 +1658,7 @@ impl RecordBatch {
             out.truncate(n);
             return out;
         }
-        let width = self.cols.len();
-        if n < 65536
-            && (1..=8).contains(&width)
-            && self.names.len() == width
-            && (0..width).all(|i| (i + 1..width).all(|j| self.names[i] != self.names[j]))
-        {
+        if unique_small_names {
             let shape = Row::shape_of(&self.names);
             let mut inv_slots = [0usize; 8];
             for (pos, target) in shape.names().iter().enumerate() {
@@ -1286,7 +1669,7 @@ impl RecordBatch {
                     .unwrap_or(pos);
             }
             let cols = self.cols.as_mut_slice();
-            let mut out = if n >= 1024 {
+            let mut out = if (1024..65_536).contains(&n) {
                 crate::store::take_general_rows().unwrap_or_else(|| Vec::with_capacity(n))
             } else {
                 Vec::with_capacity(n)
@@ -1310,7 +1693,27 @@ impl RecordBatch {
             out.truncate(n);
             return out;
         }
-        self.to_rows()
+        // Wide (> 8 columns) or duplicate-named fallback: still move `Cells` instead of cloning!
+        let template: Row = self
+            .names
+            .iter()
+            .map(|k| (k.as_str(), Cell::Null))
+            .collect();
+        let slots: Vec<usize> = self
+            .names
+            .iter()
+            .map(|k| template.keys().position(|t| t == k).unwrap_or(0))
+            .collect();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut row = template.clone();
+            let cells = row.cells_mut();
+            for (&slot, col) in slots.iter().zip(self.cols.iter_mut()) {
+                cells[slot] = take_col_cell(col, i);
+            }
+            out.push(row);
+        }
+        out
     }
 
     /// Materialize a slice of rows with zero-copy Cell cloning - avoids per-row allocations
@@ -1319,48 +1722,64 @@ impl RecordBatch {
     }
 
     fn to_rows_batch(&self, start: usize, end: usize) -> Vec<Row> {
-        if start >= end || start >= self.n() {
-            return Vec::new();
-        }
-        let end = end.min(self.n());
-        let n = end - start;
-        if self.names.len() == 2 && self.names[0] != self.names[1] {
-            let shape = Row::shape_of(&self.names);
-            let swap = self.names[0] > self.names[1];
-            let fill = |i: usize| -> Row {
-                let c0 = self.cols[0].get(i);
-                let c1 = self.cols[1].get(i);
-                Row::from_parts(Arc::clone(&shape), if swap { [c1, c0] } else { [c0, c1] })
-            };
-            if n >= 65536 {
+        #[inline]
+        fn fill_rows_range<F: Fn(usize) -> Row + Sync>(
+            start: usize,
+            end: usize,
+            fill: F,
+        ) -> Vec<Row> {
+            let n = end - start;
+            if n >= 65_536 {
                 let threads = std::thread::available_parallelism()
                     .map(|p| p.get())
                     .unwrap_or(1)
                     .min(8)
-                    .min((n + 8191) / 8192);
+                    .min(n.div_ceil(8192));
                 if threads > 1 {
-                    let chunk_size = (n + threads - 1) / threads;
-                    let fill = &fill;
-                    let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
-                        let mut handles = Vec::with_capacity(threads);
-                        for chunk_idx in 0..threads {
-                            let c_start = start + chunk_idx * chunk_size;
-                            if c_start >= end {
-                                break;
-                            }
-                            let c_end = (c_start + chunk_size).min(end);
-                            handles.push(scope.spawn(move || (c_start..c_end).map(fill).collect()));
-                        }
-                        handles.into_iter().map(|h| h.join().unwrap()).collect()
-                    });
-                    let mut out = Vec::with_capacity(n);
-                    for chunk in chunks {
-                        out.extend(chunk);
+                    let chunk_size = n.div_ceil(threads);
+                    let mut out_buf: Vec<std::mem::MaybeUninit<Row>> = Vec::with_capacity(n);
+                    // SAFETY: Every slot in `0..n` is initialized across disjoint `chunks_mut`.
+                    unsafe {
+                        out_buf.set_len(n);
                     }
-                    return out;
+                    let fill_ref = &fill;
+                    std::thread::scope(|scope| {
+                        let mut c_start = start;
+                        for out_chunk in out_buf.chunks_mut(chunk_size) {
+                            let c_len = out_chunk.len();
+                            scope.spawn(move || {
+                                for (local_i, slot) in out_chunk.iter_mut().enumerate() {
+                                    slot.write(fill_ref(c_start + local_i));
+                                }
+                            });
+                            c_start += c_len;
+                        }
+                    });
+                    return unsafe {
+                        let mut md = std::mem::ManuallyDrop::new(out_buf);
+                        Vec::from_raw_parts(md.as_mut_ptr() as *mut Row, n, md.capacity())
+                    };
                 }
             }
-            return (start..end).map(fill).collect();
+            (start..end).map(fill).collect()
+        }
+
+        if start >= end || start >= self.n() {
+            return Vec::new();
+        }
+        let end = end.min(self.n());
+        if self.names.len() == 2 && self.names[0] != self.names[1] {
+            let shape = if self.names.as_ref() == ["id", "title"] {
+                Arc::clone(crate::store::shape_id_title())
+            } else {
+                Row::shape_of(&self.names)
+            };
+            let swap = self.names[0] > self.names[1];
+            return fill_rows_range(start, end, |i| {
+                let c0 = self.cols[0].get(i);
+                let c1 = self.cols[1].get(i);
+                Row::from_parts(Arc::clone(&shape), if swap { [c1, c0] } else { [c0, c1] })
+            });
         }
         let width = self.names.len();
         if (1..=8).contains(&width)
@@ -1376,41 +1795,12 @@ impl RecordBatch {
                     .position(|name| name == target)
                     .unwrap_or(pos);
             }
-            let fill = |i: usize| -> Row {
+            return fill_rows_range(start, end, |i| {
                 Row::from_parts(
                     Arc::clone(&shape),
                     (0..width).map(|pos| self.cols[inv_slots[pos]].get(i)),
                 )
-            };
-            if n >= 65536 {
-                let threads = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(1)
-                    .min(8)
-                    .min((n + 8191) / 8192);
-                if threads > 1 {
-                    let chunk_size = (n + threads - 1) / threads;
-                    let fill = &fill;
-                    let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
-                        let mut handles = Vec::with_capacity(threads);
-                        for chunk_idx in 0..threads {
-                            let c_start = start + chunk_idx * chunk_size;
-                            if c_start >= end {
-                                break;
-                            }
-                            let c_end = (c_start + chunk_size).min(end);
-                            handles.push(scope.spawn(move || (c_start..c_end).map(fill).collect()));
-                        }
-                        handles.into_iter().map(|h| h.join().unwrap()).collect()
-                    });
-                    let mut out = Vec::with_capacity(n);
-                    for chunk in chunks {
-                        out.extend(chunk);
-                    }
-                    return out;
-                }
-            }
-            return (start..end).map(fill).collect();
+            });
         }
         // One template row carries the shape; every output row is a clone of it with its
         // cells overwritten. `slots[c]` is where column `c` lands in field-name order.
@@ -1426,87 +1816,30 @@ impl RecordBatch {
             .collect();
         // Duplicate column names collapse to one field; the last column wins, as with
         // repeated inserts.
-        let fill = |i: usize| -> Row {
+        fill_rows_range(start, end, |i| {
             let mut row = template.clone();
             let cells = row.cells_mut();
             for (&slot, col) in slots.iter().zip(self.cols.iter()) {
                 cells[slot] = col.get(i);
             }
             row
-        };
-
-        if n >= 65536 {
-            let threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .min(8)
-                .min((n + 8191) / 8192);
-            if threads > 1 {
-                let chunk_size = (n + threads - 1) / threads;
-                let fill = &fill;
-                let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for chunk_idx in 0..threads {
-                        let c_start = start + chunk_idx * chunk_size;
-                        if c_start >= end {
-                            break;
-                        }
-                        let c_end = (c_start + chunk_size).min(end);
-                        handles.push(scope.spawn(move || (c_start..c_end).map(fill).collect()));
-                    }
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                let mut out = Vec::with_capacity(n);
-                for chunk in chunks {
-                    out.extend(chunk);
-                }
-                return out;
-            }
-        }
-
-        (start..end).map(fill).collect()
+        })
     }
 
     /// Drain and materialize all rows, consuming the batch efficiently without cloning cells
     pub fn drain_to_rows(&mut self) -> Vec<Row> {
-        let n = self.n();
-        if n == 0 {
+        if self.is_empty() {
             return Vec::new();
         }
-        let cols = std::mem::take(&mut self.cols);
-        self.cols = (0..self.names.len()).map(|_| Column::new()).collect();
-        let mut col_iters: Vec<_> = cols
-            .into_iter()
-            .map(|col| col.into_cells().into_iter())
-            .collect();
-        let mut out = Vec::with_capacity(n);
-        if n >= 2 && self.names.windows(2).all(|w| w[0] < w[1]) {
-            let template: Row = self
-                .names
-                .iter()
-                .map(|k| (k.clone(), Cell::Null))
-                .collect();
-            for _ in 0..n {
-                let mut row = template.clone();
-                for (slot, iter) in row.values_mut().zip(col_iters.iter_mut()) {
-                    if let Some(cell) = iter.next() {
-                        *slot = cell;
-                    }
-                }
-                out.push(row);
-            }
-            return out;
+        let cols = std::mem::replace(
+            &mut self.cols,
+            (0..self.names.len()).map(|_| Column::new()).collect(),
+        );
+        RecordBatch {
+            names: Arc::clone(&self.names),
+            cols,
         }
-        for _ in 0..n {
-            let mut row = crate::store::acquire_row();
-            for (name, iter) in self.names.iter().zip(col_iters.iter_mut()) {
-                if let Some(cell) = iter.next() {
-                    row.insert(name.clone(), cell);
-                }
-            }
-            out.push(row);
-        }
-        out
+        .into_rows()
     }
 
     pub fn truncate(&mut self, n: usize) {
@@ -1567,9 +1900,9 @@ impl RecordBatch {
         if same_shape {
             let names_vec: Vec<String> = rows[0].keys().cloned().collect();
             let mut batch = Self::with_capacity(Arc::<[String]>::from(names_vec), rows.len());
-            for row in rows {
-                for (col, cell) in batch.cols.iter_mut().zip(row.values()) {
-                    col.push(cell.clone_for_borrow());
+            for (col_idx, col) in batch.cols.iter_mut().enumerate() {
+                for row in rows {
+                    col.push(row.cells_slice()[col_idx].clone_for_borrow());
                 }
             }
             return batch;
@@ -1588,9 +1921,10 @@ impl RecordBatch {
         let names_arc: Arc<[String]> = names_vec.into();
         let mut batch = Self::with_capacity(Arc::clone(&names_arc), rows.len());
         for (col, name) in batch.cols.iter_mut().zip(names_arc.iter()) {
+            let mut slot = crate::store::row::FieldSlot::new(name.as_str());
             for row in rows {
-                let cell = row
-                    .get(name.as_str())
+                let cell = slot
+                    .get(row)
                     .map(Cell::clone_for_borrow)
                     .unwrap_or(Cell::Null);
                 col.push(cell);

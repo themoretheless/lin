@@ -7,12 +7,36 @@ use rustc_hash::FxHashMap;
 use crate::ast::{Field, Query, SearchMode, Source, Step};
 use crate::embed;
 use crate::error::Error;
-use crate::store::{Cell, Row, project_fields, row_text};
+use crate::store::row::FieldSlot;
+use crate::store::{Cell, Row, RowProjector, row_text};
 
-use super::eval::{LexQuery, lex_score_prepared, project};
+use super::eval::{LexQuery, lex_score_prepared};
 #[cfg(feature = "gpu")]
 use super::gpu_ops::gpu_rrf_keys;
 use super::{Db, field_names};
+
+#[derive(Copy, Clone, PartialEq)]
+struct MinScoredIdx(f64, usize);
+
+impl Eq for MinScoredIdx {}
+
+impl PartialOrd for MinScoredIdx {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MinScoredIdx {
+    /// Max-heap root is the *worst* retained candidate: lower score first, then larger row index.
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .total_cmp(&self.0)
+            .then_with(|| self.1.cmp(&other.1))
+    }
+}
 
 impl Db {
     /// `col | search lex|hybrid …` — FTS postings → residual score (no full scan).
@@ -101,6 +125,7 @@ impl Db {
             let names = proj.map(field_names);
             let refs: Option<Vec<&str>> =
                 names.as_ref().map(|n| n.iter().map(String::as_str).collect());
+            let mut projector = names.as_ref().map(|n| RowProjector::new(n));
             let mut out = Vec::with_capacity(end);
             for id in &slice[..end] {
                 let row = match &refs {
@@ -108,8 +133,8 @@ impl Db {
                     None => eng.get_by_id(name, id)?,
                 };
                 if let Some(row) = row {
-                    out.push(match &names {
-                        Some(n) => project_fields(&row, n),
+                    out.push(match &mut projector {
+                        Some(p) => p.project(&row),
                         None => row,
                     });
                 }
@@ -117,40 +142,39 @@ impl Db {
             return Ok(Some(out));
         }
 
+        let idxs = self.search_fts_indices_ranked(name, mode, query, rank_limit)?;
+        let start = skip_n.min(idxs.len());
+        let slice = &idxs[start..];
+        let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
+        let target_idxs = &slice[..end];
+
         // Direct projected materialization without intermediate full-Row clones!
         if let Some(fields) = proj {
             let names = field_names(fields);
-            let idxs = self.search_fts_indices_ranked(name, mode, query, rank_limit)?;
+            if name == "docs"
+                && let Some(rows) = self.store.project_docs_hot(target_idxs, &names)
+            {
+                return Ok(Some(rows));
+            }
             let col = self.store.collection(name);
-            let start = skip_n.min(idxs.len());
-            let slice = &idxs[start..];
-            let end = limit.map_or(slice.len(), |n| n.min(slice.len()));
-            let mut out = Vec::with_capacity(end);
-            for &i in &slice[..end] {
+            let mut projector = RowProjector::new(&names);
+            let mut out = Vec::with_capacity(target_idxs.len());
+            for &i in target_idxs {
                 if let Some(row) = col.get(i) {
-                    out.push(project_fields(row, &names));
+                    out.push(projector.project(row));
                 }
             }
             return Ok(Some(out));
         }
 
-        let mut rows = self.search_fts(name, mode, query, rank_limit)?;
-        if skip_n > 0 {
-            if skip_n >= rows.len() {
-                rows.clear();
-            } else {
-                rows.drain(0..skip_n);
+        let col = self.store.collection(name);
+        let mut out = Vec::with_capacity(target_idxs.len());
+        for &i in target_idxs {
+            if let Some(row) = col.get(i) {
+                out.push(row.clone());
             }
         }
-        if let Some(n) = limit
-            && rows.len() > n
-        {
-            rows.truncate(n);
-        }
-        if let Some(fields) = proj {
-            rows = project(&rows, fields);
-        }
-        Ok(Some(rows))
+        Ok(Some(out))
     }
 
     /// Resolve ranked primary-key `id`s for `search vec|lex|hybrid` on a disk-backed
@@ -182,16 +206,11 @@ impl Db {
                 return Ok(Some(Vec::new()));
             };
             let qv = emb.embed(query);
-        self.check_embed_dim(emb.as_ref(), &qv)?;
             self.check_embed_dim(emb.as_ref(), &qv)?;
             if qv.is_empty() || rank_limit == Some(0) {
                 return Ok(Some(Vec::new()));
             }
-            let top_k = match rank_limit {
-                Some(0) => return Ok(Some(Vec::new())),
-                Some(k) => k,
-                None => eng.count_table(name).max(1),
-            };
+            let top_k = rank_limit.unwrap_or_else(|| eng.count_table(name).max(1));
             let hits = eng.search_vectors_out_of_core(
                 name,
                 "embedding",
@@ -203,9 +222,10 @@ impl Db {
                 None,
                 |_| true,
             )?;
+            let mut id_slot = FieldSlot::new("id");
             let ids = hits
                 .into_iter()
-                .filter_map(|(_, row)| row.get("id").and_then(Cell::text_shared))
+                .filter_map(|(_, row)| id_slot.get(&row).and_then(Cell::text_shared))
                 .collect();
             return Ok(Some(ids));
         }
@@ -233,15 +253,15 @@ impl Db {
             let mut vec_leg: Vec<usize> = Vec::new();
             if let Some(emb) = self.embedder.as_ref() {
                 let qv = emb.embed(query);
-        self.check_embed_dim(emb.as_ref(), &qv)?;
                 self.check_embed_dim(emb.as_ref(), &qv)?;
                 if !qv.is_empty() {
                     let top_k = leg_limit.unwrap_or_else(|| eng.count_table(name).max(1));
-                    let pos_of: FxHashMap<&str, usize> = ids
-                        .iter()
-                        .enumerate()
-                        .map(|(i, id)| (id.as_ref(), i))
-                        .collect();
+                    let mut pos_of: FxHashMap<&str, usize> =
+                        FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
+                    for (i, id) in ids.iter().enumerate() {
+                        pos_of.insert(id.as_ref(), i);
+                    }
+                    let mut id_slot = FieldSlot::new("id");
                     for (score, row) in eng.search_vectors_out_of_core(
                         name,
                         "embedding",
@@ -254,9 +274,9 @@ impl Db {
                         |_| true,
                     )? {
                         if f64::from(score) > 0.01
-                            && let Some(&i) = row
-                                .get("id")
-                                .and_then(|c| c.text())
+                            && let Some(&i) = id_slot
+                                .get(&row)
+                                .and_then(Cell::text)
                                 .and_then(|id| pos_of.get(id))
                         {
                             vec_leg.push(i);
@@ -265,7 +285,8 @@ impl Db {
                 }
             }
             const RRF_K: f64 = 60.0;
-            let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
+            let mut scores: FxHashMap<usize, f64> =
+                FxHashMap::with_capacity_and_hasher(lex.len() + vec_leg.len(), Default::default());
             for (rank, (_, i)) in lex.iter().enumerate() {
                 *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
             }
@@ -274,14 +295,21 @@ impl Db {
             }
             let mut merged: Vec<(f64, usize)> =
                 scores.into_iter().map(|(i, score)| (score, i)).collect();
-            merged.sort_by(|a, b| {
+            let cmp_rrf = |a: &(f64, usize), b: &(f64, usize)| {
                 b.0.partial_cmp(&a.0)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.1.cmp(&b.1))
-            });
+            };
             if let Some(limit) = rank_limit {
-                merged.truncate(limit);
+                if limit == 0 {
+                    return Ok(Some(Vec::new()));
+                }
+                if merged.len() > limit {
+                    merged.select_nth_unstable_by(limit - 1, cmp_rrf);
+                    merged.truncate(limit);
+                }
             }
+            merged.sort_unstable_by(cmp_rrf);
             merged.into_iter().map(|(_, i)| i).collect()
         } else {
             lex.into_iter().map(|(_, i)| i).collect()
@@ -291,13 +319,7 @@ impl Db {
         ))
     }
 
-    /// Lexical leg over a cold collection. The posting lists address documents by their
-    /// position in the engine's scan order (the index is built from, or checked against,
-    /// that scan and dropped on any overlay write), so positions map to ids through the
-    /// `id` column alone; candidates are scored from the three text fields the score
-    /// reads, fetched by id. Returns `(score, position)` ranked like the in-memory leg
-    /// (score desc, then position) and cut at `rank_limit`, plus the ids by position
-    /// (always read when `need_ids`). `None` when the index does not line up with the scan.
+    /// Lexical leg over a cold collection.
     fn cold_lex_scored(
         eng: &crate::disk::DiskEngine,
         name: &str,
@@ -305,14 +327,20 @@ impl Db {
         query: &str,
         rank_limit: Option<usize>,
         need_ids: bool,
-    ) -> Result<Option<(Vec<(i64, usize)>, Vec<std::sync::Arc<str>>)>, Error> {
+    ) -> Result<Option<(Vec<(i64, usize)>, Vec<Arc<str>>)>, Error> {
         let candidates = fts.candidate_idxs(query);
-        let mut ids: Vec<std::sync::Arc<str>> = Vec::new();
+        let mut ids: Vec<Arc<str>> = if need_ids || !candidates.is_empty() {
+            Vec::with_capacity(eng.count_table(name))
+        } else {
+            Vec::new()
+        };
         if need_ids || !candidates.is_empty() {
+            let mut id_slot = FieldSlot::new("id");
             eng.scan_projected(name, Some(&["id"]), |row| {
                 ids.push(
-                    row.get("id")
-                        .and_then(crate::store::Cell::text_shared)
+                    id_slot
+                        .get(row)
+                        .and_then(Cell::text_shared)
                         .unwrap_or_default(),
                 );
                 Ok(true)
@@ -333,10 +361,18 @@ impl Db {
                 scored.push((score, i));
             }
         }
-        scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
+        let cmp_lex = |(sa, ia): &(i64, usize), (sb, ib): &(i64, usize)| {
+            sb.cmp(sa).then_with(|| ia.cmp(ib))
+        };
         if let Some(k) = rank_limit {
-            scored.truncate(k);
+            if k == 0 {
+                scored.clear();
+            } else if scored.len() > k {
+                scored.select_nth_unstable_by(k - 1, cmp_lex);
+                scored.truncate(k);
+            }
         }
+        scored.sort_unstable_by(cmp_lex);
         Ok(Some((scored, ids)))
     }
 
@@ -385,8 +421,10 @@ impl Db {
                     }
                     return Ok(ranked);
                 }
-                let mut scores: FxHashMap<usize, f64> = FxHashMap::default();
-                scores.reserve(lex.len() + vec.len());
+                let mut scores: FxHashMap<usize, f64> = FxHashMap::with_capacity_and_hasher(
+                    lex.len() + vec.len(),
+                    Default::default(),
+                );
                 for (rank, (_, i)) in lex.iter().enumerate() {
                     *scores.entry(*i).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
@@ -395,42 +433,24 @@ impl Db {
                 }
                 let mut ranked: Vec<(f64, usize)> =
                     scores.into_iter().map(|(i, score)| (score, i)).collect();
+                let cmp_rrf = |a: &(f64, usize), b: &(f64, usize)| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                };
                 if let Some(limit) = rank_limit {
                     if limit == 0 {
                         return Ok(Vec::new());
                     }
                     if ranked.len() > limit {
-                        ranked.select_nth_unstable_by(limit - 1, |a, b| {
-                            b.0.partial_cmp(&a.0)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then_with(|| a.1.cmp(&b.1))
-                        });
+                        ranked.select_nth_unstable_by(limit - 1, cmp_rrf);
                         ranked.truncate(limit);
                     }
                 }
-                ranked.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                });
+                ranked.sort_unstable_by(cmp_rrf);
                 Ok(ranked.into_iter().map(|(_, i)| i).collect())
             }
         }
-    }
-
-    pub(crate) fn search_fts(
-        &self,
-        collection: &str,
-        mode: SearchMode,
-        query: &str,
-        rank_limit: Option<usize>,
-    ) -> Result<Vec<Row>, Error> {
-        let col = self.store.collection(collection);
-        let idxs = self.search_fts_indices_ranked(collection, mode, query, rank_limit)?;
-        Ok(idxs
-            .into_iter()
-            .filter_map(|i| col.get(i).cloned())
-            .collect())
     }
 
     pub(super) fn search_fts_lex_indices(
@@ -475,7 +495,7 @@ impl Db {
                 // lower score first, then larger row index. This preserves the
                 // old stable ordering (score desc, source row index asc).
                 let mut heap: BinaryHeap<(Reverse<i64>, usize)> =
-                    BinaryHeap::with_capacity(k.saturating_add(1));
+                    BinaryHeap::with_capacity(k.min(idxs.len()).saturating_add(1));
                 for (position, i) in idxs.into_iter().enumerate() {
                     let Some(row) = col.get(i) else { continue };
                     let score = gpu_scores.as_ref().map_or_else(
@@ -485,9 +505,14 @@ impl Db {
                     if score == 0 {
                         continue;
                     }
-                    heap.push((Reverse(score), i));
-                    if heap.len() > k {
-                        heap.pop();
+                    if heap.len() == k {
+                        if let Some(mut worst) = heap.peek_mut() {
+                            if score > worst.0.0 || (score == worst.0.0 && i < worst.1) {
+                                *worst = (Reverse(score), i);
+                            }
+                        }
+                    } else {
+                        heap.push((Reverse(score), i));
                     }
                 }
                 heap.into_iter()
@@ -540,20 +565,67 @@ impl Db {
             }
         }
 
+        #[cfg(feature = "gpu")]
+        let has_gpu = self.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let has_gpu = false;
+
+        // Streaming top-k heap path on CPU for bounded `rank_limit` without allocating
+        // full-table `vectors` and `scored` buffers.
+        if !has_gpu
+            && rows.len() < 16_384
+            && let Some(k) = rank_limit
+            && k <= 512
+        {
+            if k == 0 || rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            let q_norm = qv.iter().map(|&x| (x * x) as f64).sum::<f64>().sqrt();
+            if q_norm <= 1e-18 {
+                return Ok(Vec::new());
+            }
+            let mut emb_slot = FieldSlot::new("embedding");
+            let mut heap: BinaryHeap<MinScoredIdx> = BinaryHeap::with_capacity(k.min(rows.len()));
+            for (i, r) in rows.iter().enumerate() {
+                let Some(v) = emb_slot.get(r).and_then(Cell::as_vec) else {
+                    continue;
+                };
+                let score = crate::embed::cosine_with_q_norm(&qv, q_norm, v);
+                if score <= 0.01 {
+                    continue;
+                }
+                if heap.len() == k {
+                    // Since `i` strictly increases, equal scores always lose tie-break to earlier rows.
+                    if let Some(mut worst) = heap.peek_mut()
+                        && score > worst.0
+                    {
+                        *worst = MinScoredIdx(score, i);
+                    }
+                } else {
+                    heap.push(MinScoredIdx(score, i));
+                }
+            }
+            let mut out: Vec<(f64, usize)> = heap.into_iter().map(|m| (m.0, m.1)).collect();
+            out.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            return Ok(out);
+        }
+
+        let mut emb_slot = FieldSlot::new("embedding");
         let vectors: Vec<(usize, &[f32])> = rows
             .iter()
             .enumerate()
-            .filter_map(|(i, r)| Some((i, r.get("embedding")?.as_vec()?)))
+            .filter_map(|(i, r)| Some((i, emb_slot.get(r)?.as_vec()?)))
             .collect();
         #[cfg(feature = "gpu")]
         let gpu_scores = self
             .gpu
             .as_ref()
             .map(|gpu| {
+                let mut g_slot = FieldSlot::new("embedding");
                 let shared: Vec<Arc<[f32]>> = rows
                     .iter()
-                    .filter_map(|r| match r.get("embedding") {
-                        Some(Cell::Vec(v)) => Some(v.clone()),
+                    .filter_map(|r| match g_slot.get(r) {
+                        Some(Cell::Vec(v)) => Some(Arc::clone(v)),
                         _ => None,
                     })
                     .collect();
@@ -597,24 +669,21 @@ impl Db {
             }
             return Ok(res);
         }
+        let cmp_vec = |a: &(f64, usize), b: &(f64, usize)| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        };
         if let Some(limit) = rank_limit {
             if limit == 0 {
                 return Ok(Vec::new());
             }
             if scored.len() > limit {
-                scored.select_nth_unstable_by(limit - 1, |a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                });
+                scored.select_nth_unstable_by(limit - 1, cmp_vec);
                 scored.truncate(limit);
             }
         }
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        });
+        scored.sort_unstable_by(cmp_vec);
         Ok(scored)
     }
 
@@ -657,6 +726,28 @@ impl Db {
         all
     }
 
+    fn lex_search_indices(&self, rows: &[Row], query: &str) -> Result<Vec<usize>, Error> {
+        let query = LexQuery::new(query);
+        let gpu_scores = self.gpu_lex_scores(rows.iter(), &query)?;
+        #[cfg(feature = "gpu")]
+        if let Some(scores) = &gpu_scores {
+            let positions = self.gpu.as_ref().expect("GPU scores").rank_i64(scores)?;
+            return Ok(positions.into_iter().filter(|&i| scores[i] > 0).collect());
+        }
+        let mut scored: Vec<(i64, usize)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let s = gpu_scores
+                    .as_ref()
+                    .map_or_else(|| lex_score_prepared(r, &query), |scores| scores[i]);
+                if s > 0 { Some((s, i)) } else { None }
+            })
+            .collect();
+        scored.sort_unstable_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
+        Ok(scored.into_iter().map(|(_, i)| i).collect())
+    }
+
     pub(super) fn search_rows(
         &self,
         rows: &[Row],
@@ -672,31 +763,12 @@ impl Db {
             )));
         }
         match mode {
-            SearchMode::Lex => {
-                let query = LexQuery::new(query);
-                let gpu_scores = self.gpu_lex_scores(rows.iter(), &query)?;
-                #[cfg(feature = "gpu")]
-                if let Some(scores) = &gpu_scores {
-                    let positions = self.gpu.as_ref().expect("GPU scores").rank_i64(scores)?;
-                    return Ok(positions
-                        .into_iter()
-                        .filter(|&i| scores[i] > 0)
-                        .map(|i| rows[i].clone())
-                        .collect());
-                }
-                let mut scored: Vec<(i64, usize)> = rows
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, r)| {
-                        let s = gpu_scores
-                            .as_ref()
-                            .map_or_else(|| lex_score_prepared(r, &query), |scores| scores[i]);
-                        if s > 0 { Some((s, i)) } else { None }
-                    })
-                    .collect();
-                scored.sort_by(|(sa, ia), (sb, ib)| sb.cmp(sa).then_with(|| ia.cmp(ib)));
-                Ok(scored.into_iter().map(|(_, i)| rows[i].clone()).collect())
-            }
+            SearchMode::Lex => Ok(self
+                .lex_search_indices(rows, query)?
+                .into_iter()
+                .map(|i| rows[i].clone())
+                .collect()),
+
             SearchMode::Vec => Ok(self
                 .vector_search_indices(rows, query, None)?
                 .into_iter()
@@ -704,53 +776,75 @@ impl Db {
                 .collect()),
 
             SearchMode::Hybrid => {
-                // Reciprocal rank fusion over lex + vec lists.
+                // Zero-Row-clone Reciprocal Rank Fusion over lex + vec indices.
                 const RRF_K: f64 = 60.0;
-                let lex = self.search_rows(rows, SearchMode::Lex, query)?;
-                let vec = self.search_rows(rows, SearchMode::Vec, query)?;
+                let lex_idxs = self.lex_search_indices(rows, query)?;
+                let vec_scored = self.vector_search_indices(rows, query, None)?;
+                let mut id_slot = FieldSlot::new("id");
+                let mut uri_slot = FieldSlot::new("uri");
+
                 #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
-                    let key = |row: &Row| {
-                        row_text(row, "id")
-                            .or_else(|| row_text(row, "uri"))
-                            .unwrap_or("")
-                            .to_owned()
-                    };
-                    let lex_keys: Vec<String> = lex.iter().map(key).collect();
-                    let vec_keys: Vec<String> = vec.iter().map(key).collect();
-                    let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
-                    for (id, row) in lex_keys.iter().zip(&lex).chain(vec_keys.iter().zip(&vec)) {
-                        by_id.entry(id.clone()).or_insert_with(|| row.clone());
+                    let mut lex_keys: Vec<&str> = Vec::with_capacity(lex_idxs.len());
+                    let mut vec_keys: Vec<&str> = Vec::with_capacity(vec_scored.len());
+                    let mut first_idx: FxHashMap<&str, usize> = FxHashMap::with_capacity_and_hasher(
+                        lex_idxs.len() + vec_scored.len(),
+                        Default::default(),
+                    );
+                    for &i in &lex_idxs {
+                        let k = id_slot
+                            .get(&rows[i])
+                            .and_then(Cell::text)
+                            .or_else(|| uri_slot.get(&rows[i]).and_then(Cell::text))
+                            .unwrap_or("");
+                        lex_keys.push(k);
+                        first_idx.entry(k).or_insert(i);
+                    }
+                    for &(_, i) in &vec_scored {
+                        let k = id_slot
+                            .get(&rows[i])
+                            .and_then(Cell::text)
+                            .or_else(|| uri_slot.get(&rows[i]).and_then(Cell::text))
+                            .unwrap_or("");
+                        vec_keys.push(k);
+                        first_idx.entry(k).or_insert(i);
                     }
                     return Ok(gpu_rrf_keys(gpu, &lex_keys, &vec_keys)?
                         .into_iter()
-                        .filter_map(|id| by_id.remove(&id))
+                        .filter_map(|id| first_idx.remove(id).map(|i| rows[i].clone()))
                         .collect());
                 }
-                let mut scores: BTreeMap<String, f64> = BTreeMap::new();
-                let mut by_id: BTreeMap<String, Row> = BTreeMap::new();
-                for (rank, r) in lex.into_iter().enumerate() {
-                    let id = row_text(&r, "id")
-                        .or_else(|| row_text(&r, "uri"))
-                        .unwrap_or("")
-                        .to_string();
-                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-                    by_id.entry(id).or_insert(r);
+
+                let mut by_key: FxHashMap<&str, (f64, usize)> = FxHashMap::with_capacity_and_hasher(
+                    lex_idxs.len() + vec_scored.len(),
+                    Default::default(),
+                );
+                for (rank, &i) in lex_idxs.iter().enumerate() {
+                    let k = id_slot
+                        .get(&rows[i])
+                        .and_then(Cell::text)
+                        .or_else(|| uri_slot.get(&rows[i]).and_then(Cell::text))
+                        .unwrap_or("");
+                    let entry = by_key.entry(k).or_insert((0.0, i));
+                    entry.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
-                for (rank, r) in vec.into_iter().enumerate() {
-                    let id = row_text(&r, "id")
-                        .or_else(|| row_text(&r, "uri"))
-                        .unwrap_or("")
-                        .to_string();
-                    *scores.entry(id.clone()).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
-                    by_id.entry(id).or_insert(r);
+                for (rank, &(_, i)) in vec_scored.iter().enumerate() {
+                    let k = id_slot
+                        .get(&rows[i])
+                        .and_then(Cell::text)
+                        .or_else(|| uri_slot.get(&rows[i]).and_then(Cell::text))
+                        .unwrap_or("");
+                    let entry = by_key.entry(k).or_insert((0.0, i));
+                    entry.0 += 1.0 / (RRF_K + rank as f64 + 1.0);
                 }
-                let mut ranked: Vec<(f64, Row)> = scores
-                    .into_iter()
-                    .filter_map(|(id, s)| by_id.remove(&id).map(|r| (s, r)))
-                    .collect();
-                ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(ranked.into_iter().map(|(_, r)| r).collect())
+                let mut ranked: Vec<(&str, f64, usize)> =
+                    by_key.into_iter().map(|(k, (s, i))| (k, s, i)).collect();
+                ranked.sort_unstable_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(b.0))
+                });
+                Ok(ranked.into_iter().map(|(_, _, i)| rows[i].clone()).collect())
             }
         }
     }
@@ -783,8 +877,9 @@ impl Db {
         }
         embed_rows_slice_with(emb.as_ref(), rows);
         if strict {
+            let mut emb_slot = FieldSlot::new("embedding");
             for row in rows.iter() {
-                if let Some(v) = row.get("embedding").and_then(crate::store::Cell::as_vec)
+                if let Some(v) = emb_slot.get(row).and_then(Cell::as_vec)
                     && v.len() != expected_dim
                 {
                     return Err(Error::runtime(format!(
@@ -797,15 +892,12 @@ impl Db {
             }
         }
         let mut n = 0usize;
+        let mut emb_slot = FieldSlot::new("embedding");
         for row in rows.iter_mut() {
-            if row
-                .get("embedding")
-                .and_then(crate::store::Cell::as_vec)
-                .is_some()
-            {
+            if emb_slot.get(row).and_then(Cell::as_vec).is_some() {
                 n += 1;
             } else {
-                row.insert("embedding", crate::store::Cell::Null);
+                row.insert("embedding", Cell::Null);
             }
         }
         self.store.embed_id = new_id;
@@ -879,8 +971,9 @@ impl Db {
         embed_rows_slice_with(emb.as_ref(), rows);
         if self.strict_embed_dim {
             let expected = emb.dim();
+            let mut emb_slot = FieldSlot::new("embedding");
             for r in rows.iter() {
-                if let Some(v) = r.get("embedding").and_then(crate::store::Cell::as_vec)
+                if let Some(v) = emb_slot.get(r).and_then(Cell::as_vec)
                     && v.len() != expected
                 {
                     return Err(Error::runtime(format!(
@@ -896,77 +989,66 @@ impl Db {
 }
 
 fn embed_rows_slice_with(emb: &dyn embed::Embedder, rows: &mut [Row]) {
+    if rows.is_empty() {
+        return;
+    }
+    let mut emb_slot = FieldSlot::new("embedding");
+    let mut title_slot = FieldSlot::new("title");
+    let mut body_slot = FieldSlot::new("body");
+    let mut snippet_slot = FieldSlot::new("snippet");
 
-        let first_needs = rows.first().is_some_and(|r| {
-            r.get("embedding")
-                .and_then(crate::store::Cell::as_vec)
-                .is_none()
-                && (r
-                    .get("title")
-                    .or_else(|| r.get("body"))
-                    .or_else(|| r.get("snippet"))
-                    .and_then(crate::store::Cell::text)
-                    .is_some_and(|s| !s.is_empty()))
-        });
-        let all_need = first_needs
-            && (rows.len() == 1
-                || rows[1..].iter().all(|r| {
-                    r.get("embedding")
-                        .and_then(crate::store::Cell::as_vec)
-                        .is_none()
-                        && (r
-                            .get("title")
-                            .or_else(|| r.get("body"))
-                            .or_else(|| r.get("snippet"))
-                            .and_then(crate::store::Cell::text)
-                            .is_some_and(|s| !s.is_empty()))
-                }));
-        if all_need && emb.embed_rows_in_place(rows) {
+    let mut needs_embed = |r: &Row| -> bool {
+        emb_slot.get(r).and_then(Cell::as_vec).is_none()
+            && title_slot
+                .get(r)
+                .or_else(|| body_slot.get(r))
+                .or_else(|| snippet_slot.get(r))
+                .and_then(Cell::text)
+                .is_some_and(|s| !s.is_empty())
+    };
+
+    let mut all_need = true;
+    let mut row_idxs: Vec<usize> = Vec::new();
+    for i in 0..rows.len() {
+        if needs_embed(&rows[i]) {
+            if !all_need {
+                row_idxs.push(i);
+            }
+        } else if all_need {
+            all_need = false;
+            row_idxs.reserve(rows.len());
+            row_idxs.extend(0..i);
+        }
+    }
+
+    if all_need && emb.embed_rows_in_place(rows) {
+        return;
+    }
+
+    let row_ptrs: Vec<&Row> = if all_need {
+        row_idxs.extend(0..rows.len());
+        rows.iter().collect()
+    } else {
+        if row_idxs.is_empty() {
             return;
         }
-        let mut row_idxs = Vec::with_capacity(rows.len());
-        let mut row_ptrs = Vec::with_capacity(rows.len());
-        if all_need {
-            row_idxs.extend(0..rows.len());
-            row_ptrs.extend(rows.iter());
+        row_idxs.iter().map(|&i| &rows[i]).collect()
+    };
+
+    let mut vectors = emb.embed_rows(&row_ptrs);
+    if vectors.len() != row_idxs.len() {
+        // Keep third-party embedders with a broken batch implementation
+        // from silently leaving a partially embedded slab.
+        vectors = row_ptrs
+            .iter()
+            .map(|r| emb.embed(&embed::row_embed_text(r)))
+            .collect();
+    }
+    for (i, vector) in row_idxs.into_iter().zip(vectors) {
+        if let Some(cell) = rows[i].get_mut("embedding") {
+            *cell = Cell::Vec(vector);
         } else {
-            for (i, row) in rows.iter().enumerate() {
-                if row
-                    .get("embedding")
-                    .and_then(crate::store::Cell::as_vec)
-                    .is_some()
-                {
-                    continue;
-                }
-                let has_text = row
-                    .get("title")
-                    .or_else(|| row.get("body"))
-                    .or_else(|| row.get("snippet"))
-                    .and_then(crate::store::Cell::text)
-                    .is_some_and(|s| !s.is_empty());
-                if has_text {
-                    row_idxs.push(i);
-                    row_ptrs.push(row);
-                }
-            }
+            rows[i].insert("embedding", Cell::Vec(vector));
         }
-        if row_ptrs.is_empty() {
-            return;
-        }
-        let mut vectors = emb.embed_rows(&row_ptrs);
-        if vectors.len() != row_idxs.len() {
-            // Keep third-party embedders with a broken batch implementation
-            // from silently leaving a partially embedded slab.
-            vectors = row_ptrs
-                .iter()
-                .map(|r| emb.embed(&embed::row_embed_text(r)))
-                .collect();
-        }
-        for (i, vector) in row_idxs.into_iter().zip(vectors) {
-            if let Some(cell) = rows[i].get_mut("embedding") {
-                *cell = crate::store::Cell::Vec(vector);
-            } else {
-                rows[i].insert("embedding", crate::store::Cell::Vec(vector));
-            }
-        }
+    }
 }

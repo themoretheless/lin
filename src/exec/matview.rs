@@ -18,8 +18,8 @@ use crate::store::row::FieldSlot;
 use crate::store::{Cell, Row, Store};
 
 use super::agg::{
-    PartialSummarizeState, apply_coordinator_post_steps, finish_partial_state, fold_summarize_rows,
-    merge_partial_states,
+    PartialSummarizeState, apply_coordinator_post_steps, finish_partial_state_ref,
+    fold_summarize_rows, merge_partial_states,
 };
 
 /// Runtime statistics of a [`MaterializedSummarizeView`].
@@ -208,8 +208,7 @@ impl MaterializedSummarizeView {
                 )?;
                 let partial = rt.partial.as_mut().unwrap();
                 merge_partial_states(partial, delta, self.specs.len(), max_bytes)?;
-                let finished =
-                    finish_partial_state(partial.clone(), &self.by, &self.specs);
+                let finished = finish_partial_state_ref(partial, &self.by, &self.specs);
                 let post = apply_coordinator_post_steps(finished, &self.post_steps, 0, quotas)?;
                 rt.cached_rows = Arc::from(post);
                 rt.cursor_len = rows.len();
@@ -221,7 +220,7 @@ impl MaterializedSummarizeView {
             rt.epoch = cur_epoch;
             Arc::clone(&rt.cached_rows)
         } else {
-            let full = fold_summarize_rows(
+            let mut full = fold_summarize_rows(
                 rows,
                 self.pre_filter.as_ref(),
                 0,
@@ -230,7 +229,7 @@ impl MaterializedSummarizeView {
                 &self.sum_f64_flags,
                 max_bytes,
             )?;
-            let finished = finish_partial_state(full.clone(), &self.by, &self.specs);
+            let finished = finish_partial_state_ref(&mut full, &self.by, &self.specs);
             let post = apply_coordinator_post_steps(finished, &self.post_steps, 0, quotas)?;
             rt.partial = Some(full);
             rt.cached_rows = Arc::from(post);
@@ -243,11 +242,12 @@ impl MaterializedSummarizeView {
         };
         drop(rt);
 
-        let mut out: Vec<Row> = base_rows.iter().cloned().collect();
-        if allow_implicit_take && !self.has_explicit_take && out.len() > 50 {
-            out.truncate(50);
-        }
-        Ok(Some(out))
+        let slice = if allow_implicit_take && !self.has_explicit_take && base_rows.len() > 50 {
+            &base_rows[..50]
+        } else {
+            &base_rows[..]
+        };
+        Ok(Some(slice.to_vec()))
     }
 }
 
@@ -514,7 +514,7 @@ fn eval_bound_i64(v: &Value, now: i64) -> Option<i64> {
     }
 }
 
-fn collect_conjuncts<'a>(p: &'a Pred, out: &mut Vec<&'a Pred>) {
+fn collect_conjuncts<'a>(p: &'a Pred, out: &mut smallvec::SmallVec<[&'a Pred; 8]>) {
     match p {
         Pred::And(a, b) => {
             collect_conjuncts(a, out);
@@ -532,7 +532,7 @@ pub(crate) fn extract_interval_bounds(
     end_field: &str,
     now: i64,
 ) -> Option<(i64, bool, i64, bool)> {
-    let mut leaves = Vec::new();
+    let mut leaves: smallvec::SmallVec<[&Pred; 8]> = smallvec::SmallVec::new();
     collect_conjuncts(pred, &mut leaves);
     let mut upper: Option<(i64, bool)> = None;
     let mut lower: Option<(i64, bool)> = None;

@@ -49,6 +49,52 @@ fn cmp_f64_sort(a: f64, b: f64) -> std::cmp::Ordering {
 }
 
 #[inline]
+fn cmp_col_rows(col: &Column, r1: usize, r2: usize) -> std::cmp::Ordering {
+    match col {
+        Column::Nulls { .. } => std::cmp::Ordering::Equal,
+        Column::Int { vals, valid } | Column::Time { vals, valid } => {
+            if valid.null_count() == 0 {
+                vals[r1].cmp(&vals[r2])
+            } else {
+                match (valid.is_valid(r1), valid.is_valid(r2)) {
+                    (true, true) => vals[r1].cmp(&vals[r2]),
+                    (false, false) => std::cmp::Ordering::Equal,
+                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+                }
+            }
+        }
+        Column::Float { vals, valid } => {
+            if valid.null_count() == 0 {
+                cmp_f64_sort(vals[r1], vals[r2])
+            } else {
+                match (valid.is_valid(r1), valid.is_valid(r2)) {
+                    (true, true) => cmp_f64_sort(vals[r1], vals[r2]),
+                    (false, false) => std::cmp::Ordering::Equal,
+                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+                }
+            }
+        }
+        Column::Bool { vals, valid } => {
+            if valid.null_count() == 0 {
+                vals[r1].cmp(&vals[r2])
+            } else {
+                match (valid.is_valid(r1), valid.is_valid(r2)) {
+                    (true, true) => vals[r1].cmp(&vals[r2]),
+                    (false, false) => std::cmp::Ordering::Equal,
+                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+                }
+            }
+        }
+        Column::Text { .. } | Column::Dict { .. } => match (col.text_at(r1), col.text_at(r2)) {
+            (Some(sa), Some(sb)) => sa.cmp(sb),
+            (None, None) => std::cmp::Ordering::Equal,
+            _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
+        },
+        Column::Cells(c) => super::eval::cmp_sort(&c[r1], &c[r2]),
+    }
+}
+
+#[inline]
 fn sort_indices_cmp(part: &mut [u32], mut cmp: impl FnMut(u32, u32) -> std::cmp::Ordering) {
     if part.len() <= 32 {
         for i in 1..part.len() {
@@ -114,6 +160,99 @@ pub(crate) fn insert_prefixed(row: &mut Row, prefix: &str, key: &str, value: Cel
     });
 }
 
+#[derive(Copy, Clone)]
+enum MergeCellSrc {
+    Left(usize),
+    Right(usize),
+}
+
+struct CachedJoinMerge {
+    left_shape: Arc<crate::store::RowShape>,
+    right_shape: Arc<crate::store::RowShape>,
+    merged_shape: Arc<crate::store::RowShape>,
+    sources: Vec<MergeCellSrc>,
+}
+
+struct JoinRowMerger<'a> {
+    right_col: &'a str,
+    cache: smallvec::SmallVec<[CachedJoinMerge; 2]>,
+    buf: smallvec::SmallVec<[Cell; 8]>,
+}
+
+impl<'a> JoinRowMerger<'a> {
+    #[inline]
+    fn new(right_col: &'a str) -> Self {
+        Self {
+            right_col,
+            cache: smallvec::SmallVec::new(),
+            buf: smallvec::SmallVec::new(),
+        }
+    }
+
+    #[inline]
+    fn merge(&mut self, mut left: Row, right: &Row) -> Row {
+        let (Some(ls), Some(rs)) = (left.shape_arc().cloned(), right.shape_arc()) else {
+            return merge_join_row(left, right, self.right_col);
+        };
+        let pos = if let Some(idx) = self
+            .cache
+            .iter()
+            .position(|c| Arc::ptr_eq(&c.left_shape, &ls) && Arc::ptr_eq(&c.right_shape, rs))
+        {
+            idx
+        } else {
+            let mut map: BTreeMap<String, MergeCellSrc> = BTreeMap::new();
+            for (li, k) in ls.names().iter().enumerate() {
+                map.insert(k.clone(), MergeCellSrc::Left(li));
+            }
+            for (ri, k) in rs.names().iter().enumerate() {
+                let mut pref = String::with_capacity(self.right_col.len() + 1 + k.len());
+                pref.push_str(self.right_col);
+                pref.push('.');
+                pref.push_str(k);
+                map.insert(pref, MergeCellSrc::Right(ri));
+            }
+            let sorted_names: Vec<String> = map.keys().cloned().collect();
+            let sources: Vec<MergeCellSrc> = map.into_values().collect();
+            let merged_shape = Row::shape_of(&sorted_names);
+            self.cache.push(CachedJoinMerge {
+                left_shape: ls,
+                right_shape: Arc::clone(rs),
+                merged_shape,
+                sources,
+            });
+            self.cache.len() - 1
+        };
+        let entry = &self.cache[pos];
+        let right_cells = right.cells_slice();
+        let left_cells = left.cells_mut();
+        self.buf.clear();
+        self.buf.reserve(entry.sources.len());
+        for &src in &entry.sources {
+            match src {
+                MergeCellSrc::Left(li) => {
+                    self.buf
+                        .push(std::mem::replace(&mut left_cells[li], Cell::Null));
+                }
+                MergeCellSrc::Right(ri) => {
+                    self.buf.push(right_cells[ri].clone_for_borrow());
+                }
+            }
+        }
+        left.reset_from_parts(Arc::clone(&entry.merged_shape), self.buf.drain(..));
+        left
+    }
+}
+
+#[inline]
+fn batch_max_needed(skip_n: usize, explicit_take: Option<Option<i64>>) -> Option<usize> {
+    match explicit_take {
+        Some(Some(t)) => Some(skip_n.saturating_add(t.max(0) as usize)),
+        Some(None) => None,
+        None => Some(skip_n.saturating_add(50)),
+    }
+}
+
 pub(crate) fn merge_join_row(mut left: Row, right: &Row, right_col: &str) -> Row {
     for (k, v) in right {
         insert_prefixed(&mut left, right_col, k, v.clone_for_borrow());
@@ -131,19 +270,50 @@ pub(crate) fn push_project_batch_row(batch: &mut RecordBatch, row: &Row, names: 
     }
 }
 
-pub(crate) fn push_join_batch_row(
+#[inline]
+fn push_project_batch_row_slots(
+    batch: &mut RecordBatch,
+    row: &Row,
+    slots: &mut [crate::store::row::FieldSlot<'_>],
+) {
+    for (col_i, slot) in slots.iter_mut().enumerate() {
+        batch.cols[col_i].push(
+            slot.get(row)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null),
+        );
+    }
+}
+
+enum JoinBatchSlot<'a> {
+    Left(crate::store::row::FieldSlot<'a>),
+    Right(usize),
+}
+
+#[inline]
+fn build_join_batch_slots(plan: &[JoinFieldPlan]) -> Vec<JoinBatchSlot<'_>> {
+    plan.iter()
+        .map(|p| match p {
+            JoinFieldPlan::Left(k) => JoinBatchSlot::Left(crate::store::row::FieldSlot::new(k)),
+            JoinFieldPlan::Right { idx, .. } => JoinBatchSlot::Right(*idx),
+        })
+        .collect()
+}
+
+#[inline]
+fn push_join_batch_row_slots(
     batch: &mut RecordBatch,
     left: &Row,
     right: Option<&[Cell]>,
-    plan: &[JoinFieldPlan],
+    slots: &mut [JoinBatchSlot<'_>],
 ) {
-    for (col_i, p) in plan.iter().enumerate() {
-        let cell = match p {
-            JoinFieldPlan::Left(k) => left
-                .get(k)
+    for (col_i, s) in slots.iter_mut().enumerate() {
+        let cell = match s {
+            JoinBatchSlot::Left(slot) => slot
+                .get(left)
                 .map(Cell::clone_for_borrow)
                 .unwrap_or(Cell::Null),
-            JoinFieldPlan::Right { out: _, idx } => right
+            JoinBatchSlot::Right(idx) => right
                 .and_then(|r| r.get(*idx).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null),
         };
@@ -192,32 +362,7 @@ pub(crate) fn pred_total_gt(pred: &Pred) -> Option<f64> {
 }
 
 pub(crate) fn rows_to_rough_batch(rows: &[Row]) -> RecordBatch {
-    if rows.is_empty() {
-        return RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new()));
-    }
-    let names: Vec<String> = if let Some(s0) = rows[0].shape_arc()
-        && rows
-            .iter()
-            .all(|r| r.shape_arc().is_some_and(|rs| Arc::ptr_eq(rs, s0)))
-    {
-        s0.names().to_vec()
-    } else {
-        let mut set = std::collections::BTreeSet::new();
-        for r in rows {
-            for k in r.keys() {
-                set.insert(k.as_str());
-            }
-        }
-        set.into_iter().map(str::to_string).collect()
-    };
-    let names_arc: Arc<[String]> = names.clone().into();
-    let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
-    for row in rows {
-        for (i, name) in names.iter().enumerate() {
-            batch.cols[i].push(row.get(name).cloned().unwrap_or(Cell::Null));
-        }
-    }
-    batch
+    RecordBatch::from_rows(rows)
 }
 
 pub(crate) fn plan_join_fields(
@@ -251,13 +396,18 @@ pub(crate) fn build_right_probe<'a>(
 ) -> FxHashMap<&'a str, Vec<Cell>> {
     let mut probe = FxHashMap::default();
     probe.reserve(rights.len());
+    let mut id_slot = crate::store::row::FieldSlot::new("id");
+    let mut field_slots: Vec<crate::store::row::FieldSlot<'_>> = right_fields
+        .iter()
+        .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+        .collect();
     for r in rights {
-        let Some(id) = r.get("id").and_then(Cell::text) else {
+        let Some(id) = id_slot.get(r).and_then(Cell::text) else {
             continue;
         };
-        let cells = right_fields
-            .iter()
-            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+        let cells = field_slots
+            .iter_mut()
+            .map(|s| s.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null))
             .collect();
         probe.insert(id, cells);
     }
@@ -273,14 +423,14 @@ pub(crate) fn emit_join_row(left: &Row, right: Option<&[Cell]>, plan: &[JoinFiel
                     .get(k)
                     .map(Cell::clone_for_borrow)
                     .unwrap_or(Cell::Null);
-                out.insert(k.clone(), cell);
+                out.insert(k.as_str(), cell);
             }
             JoinFieldPlan::Right { out: k, idx } => {
                 let cell = right
                     .and_then(|r| r.get(*idx))
                     .map(Cell::clone_for_borrow)
                     .unwrap_or(Cell::Null);
-                out.insert(k.clone(), cell);
+                out.insert(k.as_str(), cell);
             }
         }
     }
@@ -294,17 +444,19 @@ pub(crate) fn project_join_fields(
     right_col: &str,
     fields: &[String],
 ) -> Row {
-    let mut out = Row::new();
+    let mut out = acquire_row();
     for f in fields {
         let cell = if let Some(rest) = f.strip_prefix(right_col).and_then(|s| s.strip_prefix('.')) {
             right
                 .and_then(|r| r.get(rest))
-                .cloned()
+                .map(Cell::clone_for_borrow)
                 .unwrap_or(Cell::Null)
         } else {
-            left.get(f).cloned().unwrap_or(Cell::Null)
+            left.get(f)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null)
         };
-        out.insert(f.clone(), cell);
+        out.insert(f.as_str(), cell);
     }
     out
 }
@@ -1134,51 +1286,6 @@ impl Db {
             explain: None,
             ignore_filter: q.ignore_filter,
         };
-#[inline]
-fn cmp_col_rows(col: &Column, r1: usize, r2: usize) -> std::cmp::Ordering {
-    match col {
-        Column::Nulls { .. } => std::cmp::Ordering::Equal,
-        Column::Int { vals, valid } | Column::Time { vals, valid } => {
-            if valid.null_count() == 0 {
-                vals[r1].cmp(&vals[r2])
-            } else {
-                match (valid.is_valid(r1), valid.is_valid(r2)) {
-                    (true, true) => vals[r1].cmp(&vals[r2]),
-                    (false, false) => std::cmp::Ordering::Equal,
-                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
-                }
-            }
-        }
-        Column::Float { vals, valid } => {
-            if valid.null_count() == 0 {
-                cmp_f64_sort(vals[r1], vals[r2])
-            } else {
-                match (valid.is_valid(r1), valid.is_valid(r2)) {
-                    (true, true) => cmp_f64_sort(vals[r1], vals[r2]),
-                    (false, false) => std::cmp::Ordering::Equal,
-                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
-                }
-            }
-        }
-        Column::Bool { vals, valid } => {
-            if valid.null_count() == 0 {
-                vals[r1].cmp(&vals[r2])
-            } else {
-                match (valid.is_valid(r1), valid.is_valid(r2)) {
-                    (true, true) => vals[r1].cmp(&vals[r2]),
-                    (false, false) => std::cmp::Ordering::Equal,
-                    _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
-                }
-            }
-        }
-        Column::Text { .. } | Column::Dict { .. } => match (col.text_at(r1), col.text_at(r2)) {
-            (Some(sa), Some(sb)) => sa.cmp(sb),
-            (None, None) => std::cmp::Ordering::Equal,
-            _ => super::eval::cmp_sort(&col.get(r1), &col.get(r2)),
-        },
-        Column::Cells(c) => super::eval::cmp_sort(&c[r1], &c[r2]),
-    }
-}
 
 #[inline]
 fn mapped_row(seq_rows: Option<&[u32]>, pos: u32) -> usize {
@@ -1742,36 +1849,98 @@ fn partition_into(
 
         // Grouped aggregation between window and projection (`count/sum/min/max/avg ... by k`).
         if let Some(gs) = group_step {
-            let get_col_cell = |f: &Field, pos: usize| -> Option<Cell> {
+            let resolve_src = |f: &Field| -> Option<(&Column, Option<&[u32]>)> {
                 let leaf = f.leaf()?;
                 if let Some(wi) = win_names.iter().position(|w| *w == leaf) {
-                    Some(win_cols[wi].get(pos))
+                    Some((&win_cols[wi], None))
                 } else {
                     let ci = col_of(f)?;
-                    Some(cols[ci].get(mapped_row(seq_rows.as_deref(), pos as u32)))
+                    Some((&cols[ci], seq_rows.as_deref()))
                 }
             };
+            #[inline]
+            fn key_cost(c: &Cell) -> usize {
+                match c {
+                    Cell::Text(s) => s.len() + 32,
+                    _ => 16,
+                }
+            }
             let max_bytes = self.quotas.max_aggregate_bytes;
             let mut grouped: RecordBatch = match gs {
                 Step::Count { by: Some(by) } => {
                     let by_name = by.leaf()?;
-                    let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
-                    let mut state_bytes = 0usize;
-                    for pos in 0..n {
-                        let kcell = get_col_cell(by, pos)?;
-                        if !map.contains_key(&kcell) {
-                            let ksz = match &kcell {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            state_bytes = state_bytes.saturating_add(ksz + 64);
-                            if state_bytes > max_bytes {
-                                return None;
+                    let (kcol, kseq) = resolve_src(by)?;
+                    let mut entries: Vec<(Cell, i64)> = match kcol {
+                        Column::Dict {
+                            values,
+                            codes,
+                            valid,
+                        } => {
+                            let null_bucket = values.len();
+                            let mut counts = vec![0i64; values.len() + 1];
+                            for pos in 0..n {
+                                let idx = mapped_row(kseq, pos as u32);
+                                let b = if valid.is_valid(idx) {
+                                    codes[idx] as usize
+                                } else {
+                                    null_bucket
+                                };
+                                counts[b] += 1;
                             }
+                            let mut state_bytes = 0usize;
+                            let mut out = Vec::new();
+                            for (code, &cnt) in counts.iter().enumerate() {
+                                if cnt == 0 {
+                                    continue;
+                                }
+                                let cell = if code < null_bucket {
+                                    Cell::from_arc_str(&values[code])
+                                } else {
+                                    Cell::Null
+                                };
+                                state_bytes = state_bytes.saturating_add(key_cost(&cell) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                out.push((cell, cnt));
+                            }
+                            out
                         }
-                        *map.entry(kcell).or_insert(0) += 1;
-                    }
-                    let mut entries: Vec<(Cell, i64)> = map.into_iter().collect();
+                        Column::Cells(kcells) => {
+                            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                            let mut state_bytes = 0usize;
+                            for pos in 0..n {
+                                let kref = &kcells[mapped_row(kseq, pos as u32)];
+                                if let Some(cnt) = map.get_mut(kref) {
+                                    *cnt += 1;
+                                } else {
+                                    state_bytes = state_bytes.saturating_add(key_cost(kref) + 64);
+                                    if state_bytes > max_bytes {
+                                        return None;
+                                    }
+                                    map.insert(kref.clone_for_borrow(), 1);
+                                }
+                            }
+                            map.into_iter().collect()
+                        }
+                        _ => {
+                            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+                            let mut state_bytes = 0usize;
+                            for pos in 0..n {
+                                let kcell = kcol.get(mapped_row(kseq, pos as u32));
+                                if let Some(cnt) = map.get_mut(&kcell) {
+                                    *cnt += 1;
+                                } else {
+                                    state_bytes = state_bytes.saturating_add(key_cost(&kcell) + 64);
+                                    if state_bytes > max_bytes {
+                                        return None;
+                                    }
+                                    map.insert(kcell, 1);
+                                }
+                            }
+                            map.into_iter().collect()
+                        }
+                    };
                     entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
                     if by_name == "hits" {
                         RecordBatch {
@@ -1781,15 +1950,15 @@ fn partition_into(
                             )],
                         }
                     } else {
-                        let mut kcol = Column::with_capacity(entries.len());
+                        let mut kcol_out = Column::with_capacity(entries.len());
                         let mut hvals = Vec::with_capacity(entries.len());
                         for (k, c) in entries {
-                            kcol.push(k);
+                            kcol_out.push(k);
                             hvals.push(c);
                         }
                         RecordBatch {
                             names: Arc::from([by_name.to_string(), String::from("hits")]),
-                            cols: vec![kcol, Column::from_ints(hvals)],
+                            cols: vec![kcol_out, Column::from_ints(hvals)],
                         }
                     }
                 }
@@ -1802,35 +1971,55 @@ fn partition_into(
                     if by_name == val_name {
                         return None;
                     }
+                    let (kcol, kseq) = resolve_src(by)?;
+                    let (vcol, vseq) = resolve_src(vf)?;
                     let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> = FxHashMap::default();
                     let mut state_bytes = 0usize;
-                    for pos in 0..n {
-                        let kcell = get_col_cell(by, pos)?;
-                        let vcell = get_col_cell(vf, pos)?;
-                        if !map.contains_key(&kcell) {
-                            let ksz = match &kcell {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            state_bytes = state_bytes.saturating_add(ksz + 64);
-                            if state_bytes > max_bytes {
-                                return None;
+                    if let Column::Cells(kcells) = kcol {
+                        for pos in 0..n {
+                            let kref = &kcells[mapped_row(kseq, pos as u32)];
+                            let vcell = vcol.get(mapped_row(vseq, pos as u32));
+                            if let Some(acc) = map.get_mut(kref) {
+                                acc.add_cell(Some(&vcell));
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(kref) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                let mut acc = crate::exact_sum::ExactSum::default();
+                                acc.add_cell(Some(&vcell));
+                                map.insert(kref.clone_for_borrow(), acc);
                             }
                         }
-                        map.entry(kcell).or_default().add_cell(Some(&vcell));
+                    } else {
+                        for pos in 0..n {
+                            let kcell = kcol.get(mapped_row(kseq, pos as u32));
+                            let vcell = vcol.get(mapped_row(vseq, pos as u32));
+                            if let Some(acc) = map.get_mut(&kcell) {
+                                acc.add_cell(Some(&vcell));
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(&kcell) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                let mut acc = crate::exact_sum::ExactSum::default();
+                                acc.add_cell(Some(&vcell));
+                                map.insert(kcell, acc);
+                            }
+                        }
                     }
                     let mut entries: Vec<(Cell, f64)> =
                         map.into_iter().map(|(k, s)| (k, s.value())).collect();
                     entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
-                    let mut kcol = Column::with_capacity(entries.len());
+                    let mut kcol_out = Column::with_capacity(entries.len());
                     let mut fvals = Vec::with_capacity(entries.len());
                     for (k, v) in entries {
-                        kcol.push(k);
+                        kcol_out.push(k);
                         fvals.push(v);
                     }
                     RecordBatch {
                         names: Arc::from([by_name.to_string(), val_name.to_string()]),
-                        cols: vec![kcol, Column::from_floats(fvals)],
+                        cols: vec![kcol_out, Column::from_floats(fvals)],
                     }
                 }
                 Step::Avg {
@@ -1842,25 +2031,50 @@ fn partition_into(
                     if by_name == val_name {
                         return None;
                     }
+                    let (kcol, kseq) = resolve_src(by)?;
+                    let (vcol, vseq) = resolve_src(vf)?;
                     let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> =
                         FxHashMap::default();
                     let mut state_bytes = 0usize;
-                    for pos in 0..n {
-                        let kcell = get_col_cell(by, pos)?;
-                        let vcell = get_col_cell(vf, pos)?;
-                        if !map.contains_key(&kcell) {
-                            let ksz = match &kcell {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            state_bytes = state_bytes.saturating_add(ksz + 64);
-                            if state_bytes > max_bytes {
-                                return None;
+                    if let Column::Cells(kcells) = kcol {
+                        for pos in 0..n {
+                            let kref = &kcells[mapped_row(kseq, pos as u32)];
+                            let vcell = vcol.get(mapped_row(vseq, pos as u32));
+                            if let Some(entry) = map.get_mut(kref) {
+                                if entry.0.add_numeric(Some(&vcell)) {
+                                    entry.1 += 1;
+                                }
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(kref) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                let mut acc = (crate::exact_sum::ExactSum::default(), 0usize);
+                                if acc.0.add_numeric(Some(&vcell)) {
+                                    acc.1 = 1;
+                                }
+                                map.insert(kref.clone_for_borrow(), acc);
                             }
                         }
-                        let entry = map.entry(kcell).or_default();
-                        if entry.0.add_numeric(Some(&vcell)) {
-                            entry.1 += 1;
+                    } else {
+                        for pos in 0..n {
+                            let kcell = kcol.get(mapped_row(kseq, pos as u32));
+                            let vcell = vcol.get(mapped_row(vseq, pos as u32));
+                            if let Some(entry) = map.get_mut(&kcell) {
+                                if entry.0.add_numeric(Some(&vcell)) {
+                                    entry.1 += 1;
+                                }
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(&kcell) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                let mut acc = (crate::exact_sum::ExactSum::default(), 0usize);
+                                if acc.0.add_numeric(Some(&vcell)) {
+                                    acc.1 = 1;
+                                }
+                                map.insert(kcell, acc);
+                            }
                         }
                     }
                     let mut entries: Vec<(Cell, f64)> = map
@@ -1868,15 +2082,15 @@ fn partition_into(
                         .map(|(k, (s, cnt))| (k, if cnt == 0 { 0.0 } else { s.value() / cnt as f64 }))
                         .collect();
                     entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
-                    let mut kcol = Column::with_capacity(entries.len());
+                    let mut kcol_out = Column::with_capacity(entries.len());
                     let mut fvals = Vec::with_capacity(entries.len());
                     for (k, v) in entries {
-                        kcol.push(k);
+                        kcol_out.push(k);
                         fvals.push(v);
                     }
                     RecordBatch {
                         names: Arc::from([by_name.to_string(), val_name.to_string()]),
-                        cols: vec![kcol, Column::from_floats(fvals)],
+                        cols: vec![kcol_out, Column::from_floats(fvals)],
                     }
                 }
                 Step::Min {
@@ -1888,39 +2102,56 @@ fn partition_into(
                     by: Some(by),
                 } => {
                     let is_max = matches!(gs, Step::Max { .. });
+                    let is_better = |cand: &Cell, prev: &Cell| -> bool {
+                        let ord = super::eval::cmp_sort(cand, prev);
+                        if is_max { ord.is_gt() } else { ord.is_lt() }
+                    };
                     let by_name = by.leaf()?;
                     let val_name = vf.leaf()?;
                     if by_name == val_name {
                         return None;
                     }
+                    let (kcol, kseq) = resolve_src(by)?;
+                    let (vcol, vseq) = resolve_src(vf)?;
                     let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
                     let mut state_bytes = 0usize;
-                    for pos in 0..n {
-                        let kcell = get_col_cell(by, pos)?;
-                        let vcell = get_col_cell(vf, pos)?;
-                        if !map.contains_key(&kcell) {
-                            let ksz = match &kcell {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            state_bytes = state_bytes.saturating_add(ksz + 64);
-                            if state_bytes > max_bytes {
-                                return None;
+                    if let Column::Cells(kcells) = kcol {
+                        for pos in 0..n {
+                            let kref = &kcells[mapped_row(kseq, pos as u32)];
+                            let vcell = vcol.get(mapped_row(vseq, pos as u32));
+                            if let Some(slot) = map.get_mut(kref) {
+                                if !matches!(vcell, Cell::Null)
+                                    && slot.as_ref().is_none_or(|prev| is_better(&vcell, prev))
+                                {
+                                    *slot = Some(vcell);
+                                }
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(kref) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                let init = (!matches!(vcell, Cell::Null)).then_some(vcell);
+                                map.insert(kref.clone_for_borrow(), init);
                             }
                         }
-                        let slot = map.entry(kcell).or_insert(None);
-                        if !matches!(vcell, Cell::Null) {
-                            *slot = Some(match slot.take() {
-                                None => vcell,
-                                Some(prev) => {
-                                    let better = if is_max {
-                                        super::eval::cmp_sort(&vcell, &prev).is_gt()
-                                    } else {
-                                        super::eval::cmp_sort(&vcell, &prev).is_lt()
-                                    };
-                                    if better { vcell } else { prev }
+                    } else {
+                        for pos in 0..n {
+                            let kcell = kcol.get(mapped_row(kseq, pos as u32));
+                            let vcell = vcol.get(mapped_row(vseq, pos as u32));
+                            if let Some(slot) = map.get_mut(&kcell) {
+                                if !matches!(vcell, Cell::Null)
+                                    && slot.as_ref().is_none_or(|prev| is_better(&vcell, prev))
+                                {
+                                    *slot = Some(vcell);
                                 }
-                            });
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(&kcell) + 64);
+                                if state_bytes > max_bytes {
+                                    return None;
+                                }
+                                let init = (!matches!(vcell, Cell::Null)).then_some(vcell);
+                                map.insert(kcell, init);
+                            }
                         }
                     }
                     let mut entries: Vec<(Cell, Cell)> = map
@@ -1928,15 +2159,15 @@ fn partition_into(
                         .map(|(k, opt)| (k, opt.unwrap_or(Cell::Null)))
                         .collect();
                     entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
-                    let mut kcol = Column::with_capacity(entries.len());
-                    let mut vcol = Column::with_capacity(entries.len());
+                    let mut kcol_out = Column::with_capacity(entries.len());
+                    let mut vcol_out = Column::with_capacity(entries.len());
                     for (k, v) in entries {
-                        kcol.push(k);
-                        vcol.push(v);
+                        kcol_out.push(k);
+                        vcol_out.push(v);
                     }
                     RecordBatch {
                         names: Arc::from([by_name.to_string(), val_name.to_string()]),
-                        cols: vec![kcol, vcol],
+                        cols: vec![kcol_out, vcol_out],
                     }
                 }
                 _ => return None,
@@ -2299,13 +2530,10 @@ fn partition_into(
         if batch.names.len() != base_names.len() {
             return None;
         }
-        let cols: Vec<Vec<Cell>> = batch
-            .cols
-            .into_iter()
-            .map(crate::batch::Column::into_cells)
-            .collect();
+        let mut cols: Vec<Column> = batch.cols;
+        let n = cols.first().map_or(0, Column::len);
         let col_of = |name: &str| base_names.iter().position(|b| b == name);
-        let mut order: Vec<usize> = (0..cols.first().map_or(0, Vec::len)).collect();
+        let mut order: Vec<u32> = (0..n as u32).collect();
         let last_sort = sorts.len() - 1;
         for (k, (field, desc)) in sorts.iter().enumerate() {
             // Only the last sort sees the `take` ahead (an intervening sort ends the
@@ -2315,26 +2543,173 @@ fn partition_into(
                 _ => None,
             };
             let c = col_of(&field.as_str())?;
-            let keys: Vec<Cell> = order.iter().map(|&i| cols[c][i].clone_for_borrow()).collect();
-            order = sort_positions_top_k(&keys, *desc, top_k)
-                .into_iter()
-                .map(|p| order[p])
-                .collect();
+            let m = order.len();
+            if m <= 32 {
+                let keys: Vec<Cell> = order.iter().map(|&i| cols[c].get(i as usize)).collect();
+                order = sort_positions_top_k(&keys, *desc, top_k)
+                    .into_iter()
+                    .map(|p| order[p])
+                    .collect();
+                continue;
+            }
+            if top_k == Some(0) {
+                order.clear();
+                break;
+            }
+            let desc = *desc;
+            macro_rules! finish_decorated {
+                ($dec:ident, $cmp:expr) => {{
+                    if let Some(limit) = top_k
+                        && limit < $dec.len()
+                    {
+                        $dec.select_nth_unstable_by(limit - 1, $cmp);
+                        $dec.truncate(limit);
+                    }
+                    $dec.sort_unstable_by($cmp);
+                    if k == 0 {
+                        order.clear();
+                        order.extend($dec.into_iter().map(|(_, p)| p));
+                    } else {
+                        let prev = order;
+                        order = $dec.into_iter().map(|(_, p)| prev[p as usize]).collect();
+                    }
+                }};
+            }
+            match &cols[c] {
+                Column::Nulls { .. } => {
+                    if let Some(limit) = top_k
+                        && limit < order.len()
+                    {
+                        order.truncate(limit);
+                    }
+                }
+                Column::Int { vals, valid } | Column::Time { vals, valid }
+                    if valid.null_count() == 0 =>
+                {
+                    let mut dec: Vec<(i64, u32)> = order
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &r)| (vals[r as usize], p as u32))
+                        .collect();
+                    let cmp = |a: &(i64, u32), b: &(i64, u32)| {
+                        let ord = if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) };
+                        ord.then_with(|| a.1.cmp(&b.1))
+                    };
+                    finish_decorated!(dec, cmp);
+                }
+                Column::Float { vals, valid } if valid.null_count() == 0 => {
+                    let mut dec: Vec<(f64, u32)> = order
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &r)| (vals[r as usize], p as u32))
+                        .collect();
+                    let cmp = |a: &(f64, u32), b: &(f64, u32)| {
+                        let ord = if desc {
+                            cmp_f64_sort(b.0, a.0)
+                        } else {
+                            cmp_f64_sort(a.0, b.0)
+                        };
+                        ord.then_with(|| a.1.cmp(&b.1))
+                    };
+                    finish_decorated!(dec, cmp);
+                }
+                Column::Dict {
+                    values,
+                    codes,
+                    valid,
+                } => {
+                    let mut d_ord: Vec<u32> = (0..values.len() as u32).collect();
+                    d_ord.sort_unstable_by(|&a, &b| values[a as usize].cmp(&values[b as usize]));
+                    let mut rank = vec![0u32; values.len()];
+                    if !d_ord.is_empty() {
+                        let mut cur_rank = 1u32;
+                        rank[d_ord[0] as usize] = cur_rank;
+                        for idx_d in 1..d_ord.len() {
+                            if values[d_ord[idx_d - 1] as usize] != values[d_ord[idx_d] as usize] {
+                                cur_rank += 1;
+                            }
+                            rank[d_ord[idx_d] as usize] = cur_rank;
+                        }
+                    }
+                    let has_nulls = valid.null_count() > 0;
+                    let mut dec: Vec<(u32, u32)> = order
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &r)| {
+                            let ri = r as usize;
+                            let rk = if has_nulls && !valid.is_valid(ri) {
+                                0
+                            } else {
+                                rank[codes[ri] as usize]
+                            };
+                            (rk, p as u32)
+                        })
+                        .collect();
+                    let cmp = |a: &(u32, u32), b: &(u32, u32)| {
+                        let ord = if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) };
+                        ord.then_with(|| a.1.cmp(&b.1))
+                    };
+                    finish_decorated!(dec, cmp);
+                }
+                Column::Cells(cells) => {
+                    let mut dec: Vec<(&Cell, u32)> = order
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &r)| (&cells[r as usize], p as u32))
+                        .collect();
+                    let cmp = |a: &(&Cell, u32), b: &(&Cell, u32)| {
+                        let ord = match (a.0.text(), b.0.text()) {
+                            (Some(sa), Some(sb)) => sa.cmp(sb),
+                            _ => super::eval::cmp_sort(a.0, b.0),
+                        };
+                        let ord = if desc { ord.reverse() } else { ord };
+                        ord.then_with(|| a.1.cmp(&b.1))
+                    };
+                    finish_decorated!(dec, cmp);
+                }
+                col => {
+                    let mut dec: Vec<(u32, u32)> = order
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &r)| (r, p as u32))
+                        .collect();
+                    let cmp = |a: &(u32, u32), b: &(u32, u32)| {
+                        let ord = cmp_col_rows(col, a.0 as usize, b.0 as usize);
+                        let ord = if desc { ord.reverse() } else { ord };
+                        ord.then_with(|| a.1.cmp(&b.1))
+                    };
+                    finish_decorated!(dec, cmp);
+                }
+            }
         }
         let start = skip_n.min(order.len());
         let mut slice = &order[start..];
         if let Some(t) = take {
             slice = &slice[..slice.len().min(t.max(0) as usize)];
         }
-        let names_arc: Arc<[String]> = names.clone().into();
-        let mut out = RecordBatch::with_capacity(names_arc, slice.len());
-        for (ci, name) in names.iter().enumerate() {
+        let mut col_rem: smallvec::SmallVec<[usize; 8]> =
+            smallvec::SmallVec::from_elem(0, cols.len());
+        let mut proj_src: smallvec::SmallVec<[usize; 8]> =
+            smallvec::SmallVec::with_capacity(names.len());
+        for name in &names {
             let c = col_of(name)?;
-            for &row in slice {
-                out.cols[ci].push(cols[c][row].clone_for_borrow());
+            col_rem[c] += 1;
+            proj_src.push(c);
+        }
+        let mut out_cols: Vec<Column> = Vec::with_capacity(names.len());
+        for c in proj_src {
+            col_rem[c] -= 1;
+            if col_rem[c] == 0 {
+                let col = std::mem::replace(&mut cols[c], Column::new());
+                out_cols.push(col.gather_unique_owned(slice));
+            } else {
+                out_cols.push(cols[c].gather(slice));
             }
         }
-        Some(out)
+        Some(RecordBatch {
+            names: names.into(),
+            cols: out_cols,
+        })
     }
 
     /// `filter? | join | count|sum|min|max|avg … (by …)? | take all?` with only the
@@ -2413,6 +2788,13 @@ fn partition_into(
         };
         let max_bytes = self.quotas.max_aggregate_bytes;
         let spill = self.quotas.spill_enabled;
+        #[inline]
+        fn key_cost(c: &Cell) -> usize {
+            match c {
+                Cell::Text(s) => s.len() + 32,
+                _ => 16,
+            }
+        }
         // Counting needs no rows: the group map is filled straight from the key column,
         // with the same key handling, state accounting and output as `agg_count`. Past
         // the state quota the row path below takes over (it spills or reports the quota).
@@ -2424,20 +2806,74 @@ fn partition_into(
                 let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
                 let mut state_bytes = 0usize;
                 let mut within_quota = true;
-                for i in 0..col.len() {
-                    let cell = col.get(i);
-                    if !map.contains_key(&cell) {
-                        let key_size = match &cell {
-                            Cell::Text(s) => s.len() + 32,
-                            _ => 16,
-                        };
-                        state_bytes = state_bytes.saturating_add(key_size + 64);
-                        if state_bytes > max_bytes {
-                            within_quota = false;
-                            break;
+                match col {
+                    Column::Dict {
+                        values,
+                        codes,
+                        valid,
+                    } => {
+                        let null_bucket = values.len();
+                        let mut counts = vec![0i64; values.len() + 1];
+                        if valid.null_count() == 0 {
+                            for &c in codes {
+                                counts[c as usize] += 1;
+                            }
+                        } else {
+                            for (i, &c) in codes.iter().enumerate() {
+                                let b = if valid.is_valid(i) {
+                                    c as usize
+                                } else {
+                                    null_bucket
+                                };
+                                counts[b] += 1;
+                            }
+                        }
+                        for (code, &cnt) in counts.iter().enumerate() {
+                            if cnt == 0 {
+                                continue;
+                            }
+                            let cell = if code < null_bucket {
+                                Cell::from_arc_str(&values[code])
+                            } else {
+                                Cell::Null
+                            };
+                            state_bytes = state_bytes.saturating_add(key_cost(&cell) + 64);
+                            if state_bytes > max_bytes {
+                                within_quota = false;
+                                break;
+                            }
+                            map.insert(cell, cnt);
                         }
                     }
-                    *map.entry(cell).or_insert(0) += 1;
+                    Column::Cells(cells) => {
+                        for kref in cells {
+                            if let Some(cnt) = map.get_mut(kref) {
+                                *cnt += 1;
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(kref) + 64);
+                                if state_bytes > max_bytes {
+                                    within_quota = false;
+                                    break;
+                                }
+                                map.insert(kref.clone_for_borrow(), 1);
+                            }
+                        }
+                    }
+                    _ => {
+                        for i in 0..col.len() {
+                            let cell = col.get(i);
+                            if let Some(cnt) = map.get_mut(&cell) {
+                                *cnt += 1;
+                            } else {
+                                state_bytes = state_bytes.saturating_add(key_cost(&cell) + 64);
+                                if state_bytes > max_bytes {
+                                    within_quota = false;
+                                    break;
+                                }
+                                map.insert(cell, 1);
+                            }
+                        }
+                    }
                 }
                 if within_quota {
                     return Ok(Some(super::agg::count_cell_map_to_rows(&by.as_str(), map)));
@@ -2460,16 +2896,35 @@ fn partition_into(
                 let vcol = &batch.cols[vi];
                 match by {
                     None => {
-                        let mut best: Option<Cell> = None;
-                        for i in 0..vcol.len() {
-                            let c = vcol.get(i);
-                            if !matches!(c, Cell::Null) && best.as_ref().is_none_or(|p| is_better(&c, p)) {
-                                best = Some(c);
+                        let best: Option<Cell> = match vcol {
+                            Column::Cells(cells) => {
+                                let mut best_ref: Option<&Cell> = None;
+                                for c in cells {
+                                    if !matches!(c, Cell::Null)
+                                        && best_ref.is_none_or(|p| is_better(c, p))
+                                    {
+                                        best_ref = Some(c);
+                                    }
+                                }
+                                best_ref.map(Cell::clone_for_borrow)
                             }
-                        }
-                        let mut row = crate::store::acquire_row();
-                        row.insert(fk, best.unwrap_or(Cell::Null));
-                        return Ok(Some(vec![row]));
+                            _ => {
+                                let mut best: Option<Cell> = None;
+                                for i in 0..vcol.len() {
+                                    let c = vcol.get(i);
+                                    if !matches!(c, Cell::Null)
+                                        && best.as_ref().is_none_or(|p| is_better(&c, p))
+                                    {
+                                        best = Some(c);
+                                    }
+                                }
+                                best
+                            }
+                        };
+                        return Ok(Some(vec![super::agg::single_cell_row(
+                            &fk,
+                            best.unwrap_or(Cell::Null),
+                        )]));
                     }
                     Some(by) => {
                         let bk = by.as_str();
@@ -2478,41 +2933,104 @@ fn partition_into(
                             let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
                             let mut state_bytes = 0usize;
                             let mut within_quota = true;
-                            for i in 0..kcol.len() {
-                                let key = kcol.get(i);
-                                if !map.contains_key(&key) {
-                                    let key_size = match &key {
-                                        Cell::Text(s) => s.len() + 32,
-                                        _ => 16,
-                                    };
-                                    state_bytes = state_bytes.saturating_add(key_size + 64);
-                                    if state_bytes > max_bytes {
-                                        within_quota = false;
-                                        break;
+                            match kcol {
+                                Column::Dict {
+                                    values,
+                                    codes,
+                                    valid,
+                                } => {
+                                    let null_bucket = values.len();
+                                    let mut seen = vec![false; values.len() + 1];
+                                    let mut bests: Vec<Option<Cell>> =
+                                        vec![None; values.len() + 1];
+                                    for i in 0..codes.len() {
+                                        let b = if valid.is_valid(i) {
+                                            codes[i] as usize
+                                        } else {
+                                            null_bucket
+                                        };
+                                        seen[b] = true;
+                                        let v = vcol.get(i);
+                                        if !matches!(v, Cell::Null)
+                                            && bests[b].as_ref().is_none_or(|p| is_better(&v, p))
+                                        {
+                                            bests[b] = Some(v);
+                                        }
+                                    }
+                                    for (code, val_opt) in bests.into_iter().enumerate() {
+                                        if !seen[code] {
+                                            continue;
+                                        }
+                                        let kcell = if code < null_bucket {
+                                            Cell::from_arc_str(&values[code])
+                                        } else {
+                                            Cell::Null
+                                        };
+                                        state_bytes =
+                                            state_bytes.saturating_add(key_cost(&kcell) + 64);
+                                        if state_bytes > max_bytes {
+                                            within_quota = false;
+                                            break;
+                                        }
+                                        map.insert(kcell, val_opt);
                                     }
                                 }
-                                let v = vcol.get(i);
-                                let entry = map.entry(key).or_insert(None);
-                                if !matches!(v, Cell::Null)
-                                    && entry.as_ref().is_none_or(|p| is_better(&v, p))
-                                {
-                                    *entry = Some(v);
+                                Column::Cells(kcells) => {
+                                    for (i, kref) in kcells.iter().enumerate() {
+                                        let v = vcol.get(i);
+                                        if let Some(entry) = map.get_mut(kref) {
+                                            if !matches!(v, Cell::Null)
+                                                && entry.as_ref().is_none_or(|p| is_better(&v, p))
+                                            {
+                                                *entry = Some(v);
+                                            }
+                                        } else {
+                                            state_bytes =
+                                                state_bytes.saturating_add(key_cost(kref) + 64);
+                                            if state_bytes > max_bytes {
+                                                within_quota = false;
+                                                break;
+                                            }
+                                            let init = (!matches!(v, Cell::Null)).then_some(v);
+                                            map.insert(kref.clone_for_borrow(), init);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    for i in 0..kcol.len() {
+                                        let key = kcol.get(i);
+                                        let v = vcol.get(i);
+                                        if let Some(entry) = map.get_mut(&key) {
+                                            if !matches!(v, Cell::Null)
+                                                && entry.as_ref().is_none_or(|p| is_better(&v, p))
+                                            {
+                                                *entry = Some(v);
+                                            }
+                                        } else {
+                                            state_bytes =
+                                                state_bytes.saturating_add(key_cost(&key) + 64);
+                                            if state_bytes > max_bytes {
+                                                within_quota = false;
+                                                break;
+                                            }
+                                            let init = (!matches!(v, Cell::Null)).then_some(v);
+                                            map.insert(key, init);
+                                        }
+                                    }
                                 }
                             }
                             if within_quota {
-                                let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
-                                entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
-                                return Ok(Some(
-                                    entries
-                                        .into_iter()
-                                        .map(|(g, v)| {
-                                            let mut row = crate::store::acquire_row();
-                                            row.insert(bk.clone(), g);
-                                            row.insert(fk.clone(), v.unwrap_or(Cell::Null));
-                                            row
-                                        })
-                                        .collect(),
-                                ));
+                                let mut entries: Vec<(Cell, Option<Cell>)> =
+                                    map.into_iter().collect();
+                                entries.sort_unstable_by(|(a, _), (b, _)| {
+                                    super::eval::cmp_sort(a, b)
+                                });
+                                return Ok(Some(super::agg::pair_entries_to_rows(
+                                    &bk,
+                                    &fk,
+                                    entries,
+                                    |v| v.unwrap_or(Cell::Null),
+                                )));
                             }
                         }
                     }
@@ -2552,130 +3070,399 @@ fn partition_into(
                             while start < n {
                                 let end = (start + chunk).min(n);
                                 let mut part = crate::exact_sum::ExactSum::default();
-                                for i in start..end {
-                                    part.add_cell(Some(&vcol.get(i)));
+                                match vcol {
+                                    Column::Float { vals, valid } if valid.null_count() == 0 => {
+                                        part.add_f64_slice(&vals[start..end]);
+                                    }
+                                    Column::Int { vals, valid } if valid.null_count() == 0 => {
+                                        part.add_i64_slice(&vals[start..end]);
+                                    }
+                                    Column::Cells(cells) => {
+                                        for c in &cells[start..end] {
+                                            part.add_cell(Some(c));
+                                        }
+                                    }
+                                    _ => {
+                                        for i in start..end {
+                                            part.add_cell(Some(&vcol.get(i)));
+                                        }
+                                    }
                                 }
                                 total.merge(part);
                                 start = end;
                             }
                             total.value()
                         } else {
-                            let (mut sum, mut count) = (crate::exact_sum::ExactSum::default(), 0usize);
+                            let (mut sum, mut count) =
+                                (crate::exact_sum::ExactSum::default(), 0usize);
                             let mut start = 0;
                             while start < n {
                                 let end = (start + chunk).min(n);
-                                let (mut s, mut c) = (crate::exact_sum::ExactSum::default(), 0usize);
-                                for i in start..end {
-                                    if let Some(v) = vcol.get(i).as_f64() {
-                                        s.add_f64(v);
-                                        c += 1;
+                                let (mut s, mut c) =
+                                    (crate::exact_sum::ExactSum::default(), 0usize);
+                                match vcol {
+                                    Column::Float { vals, valid } if valid.null_count() == 0 => {
+                                        s.add_f64_slice(&vals[start..end]);
+                                        c = end - start;
+                                    }
+                                    Column::Int { vals, valid } if valid.null_count() == 0 => {
+                                        for &v in &vals[start..end] {
+                                            s.add_f64(v as f64);
+                                        }
+                                        c = end - start;
+                                    }
+                                    Column::Cells(cells) => {
+                                        for cell in &cells[start..end] {
+                                            if let Some(v) = cell.as_f64() {
+                                                s.add_f64(v);
+                                                c += 1;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        for i in start..end {
+                                            if let Some(v) = vcol.get(i).as_f64() {
+                                                s.add_f64(v);
+                                                c += 1;
+                                            }
+                                        }
                                     }
                                 }
                                 sum.merge(s);
                                 count += c;
                                 start = end;
                             }
-                            if count == 0 { 0.0 } else { sum.value() / (count as f64) }
+                            if count == 0 {
+                                0.0
+                            } else {
+                                sum.value() / (count as f64)
+                            }
                         };
-                        let mut row = crate::store::acquire_row();
-                        row.insert(fk, Cell::Float(value));
-                        return Ok(Some(vec![row]));
+                        return Ok(Some(vec![super::agg::single_cell_row(
+                            &fk,
+                            Cell::Float(value),
+                        )]));
                     }
                     (Some(by), Some(kcol)) => {
                         let bk = by.as_str();
-                        let key_cost = |c: &Cell| match c {
-                            Cell::Text(s) => s.len() + 32,
-                            _ => 16,
-                        };
                         let mut state_bytes = 0usize;
                         let mut within_quota = true;
+                        let single_chunk = n <= chunk;
                         let out: Option<Vec<(Cell, f64)>> = if is_sum {
                             let mut map: FxHashMap<Cell, crate::exact_sum::ExactSum> =
                                 FxHashMap::default();
-                            let mut start = 0;
-                            'sum_chunks: while start < n {
-                                let end = (start + chunk).min(n);
-                                let mut part: FxHashMap<Cell, crate::exact_sum::ExactSum> =
-                                    FxHashMap::default();
-                                for i in start..end {
-                                    part.entry(kcol.get(i)).or_default().add_cell(Some(&vcol.get(i)));
-                                }
-                                for (k, v) in part {
-                                    match map.get_mut(&k) {
-                                        Some(acc) => acc.merge(v),
-                                        None => {
-                                            state_bytes = state_bytes.saturating_add(key_cost(&k) + 64);
+                            if single_chunk {
+                                match kcol {
+                                    Column::Dict {
+                                        values,
+                                        codes,
+                                        valid,
+                                    } => {
+                                        let null_bucket = values.len();
+                                        let mut seen = vec![false; values.len() + 1];
+                                        let mut sums = vec![
+                                            crate::exact_sum::ExactSum::default();
+                                            values.len() + 1
+                                        ];
+                                        for i in 0..codes.len() {
+                                            let b = if valid.is_valid(i) {
+                                                codes[i] as usize
+                                            } else {
+                                                null_bucket
+                                            };
+                                            seen[b] = true;
+                                            sums[b].add_cell(Some(&vcol.get(i)));
+                                        }
+                                        for (code, s) in sums.into_iter().enumerate() {
+                                            if !seen[code] {
+                                                continue;
+                                            }
+                                            let kcell = if code < null_bucket {
+                                                Cell::from_arc_str(&values[code])
+                                            } else {
+                                                Cell::Null
+                                            };
+                                            state_bytes = state_bytes
+                                                .saturating_add(key_cost(&kcell) + 64);
                                             if state_bytes > max_bytes {
                                                 within_quota = false;
-                                                break 'sum_chunks;
+                                                break;
                                             }
-                                            map.insert(k, v);
+                                            map.insert(kcell, s);
+                                        }
+                                    }
+                                    Column::Cells(kcells) => {
+                                        for (i, kref) in kcells.iter().enumerate() {
+                                            let v = vcol.get(i);
+                                            if let Some(acc) = map.get_mut(kref) {
+                                                acc.add_cell(Some(&v));
+                                            } else {
+                                                state_bytes = state_bytes
+                                                    .saturating_add(key_cost(kref) + 64);
+                                                if state_bytes > max_bytes {
+                                                    within_quota = false;
+                                                    break;
+                                                }
+                                                let mut acc =
+                                                    crate::exact_sum::ExactSum::default();
+                                                acc.add_cell(Some(&v));
+                                                map.insert(kref.clone_for_borrow(), acc);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        for i in 0..n {
+                                            let k = kcol.get(i);
+                                            let v = vcol.get(i);
+                                            if let Some(acc) = map.get_mut(&k) {
+                                                acc.add_cell(Some(&v));
+                                            } else {
+                                                state_bytes = state_bytes
+                                                    .saturating_add(key_cost(&k) + 64);
+                                                if state_bytes > max_bytes {
+                                                    within_quota = false;
+                                                    break;
+                                                }
+                                                let mut acc =
+                                                    crate::exact_sum::ExactSum::default();
+                                                acc.add_cell(Some(&v));
+                                                map.insert(k, acc);
+                                            }
                                         }
                                     }
                                 }
-                                start = end;
+                            } else {
+                                let mut start = 0;
+                                'sum_chunks: while start < n {
+                                    let end = (start + chunk).min(n);
+                                    let mut part: FxHashMap<Cell, crate::exact_sum::ExactSum> =
+                                        FxHashMap::default();
+                                    if let Column::Cells(kcells) = kcol {
+                                        for (i, kref) in
+                                            kcells[start..end].iter().enumerate()
+                                        {
+                                            let v = vcol.get(start + i);
+                                            if let Some(acc) = part.get_mut(kref) {
+                                                acc.add_cell(Some(&v));
+                                            } else {
+                                                let mut acc =
+                                                    crate::exact_sum::ExactSum::default();
+                                                acc.add_cell(Some(&v));
+                                                part.insert(kref.clone_for_borrow(), acc);
+                                            }
+                                        }
+                                    } else {
+                                        for i in start..end {
+                                            part.entry(kcol.get(i))
+                                                .or_default()
+                                                .add_cell(Some(&vcol.get(i)));
+                                        }
+                                    }
+                                    for (k, v) in part {
+                                        match map.get_mut(&k) {
+                                            Some(acc) => acc.merge(v),
+                                            None => {
+                                                state_bytes = state_bytes
+                                                    .saturating_add(key_cost(&k) + 64);
+                                                if state_bytes > max_bytes {
+                                                    within_quota = false;
+                                                    break 'sum_chunks;
+                                                }
+                                                map.insert(k, v);
+                                            }
+                                        }
+                                    }
+                                    start = end;
+                                }
                             }
                             within_quota
                                 .then(|| map.into_iter().map(|(k, v)| (k, v.value())).collect())
                         } else {
-                            let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
-                            let mut start = 0;
-                            'chunks: while start < n {
-                                let end = (start + chunk).min(n);
-                                let mut part: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
-                                for i in start..end {
-                                    let acc = part.entry(kcol.get(i)).or_default();
-                                    if let Some(v) = vcol.get(i).as_f64() {
-                                        acc.0.add_f64(v);
-                                        acc.1 += 1;
-                                    }
-                                }
-                                // Merge in chunk order, as the row path merges its chunk
-                                // partials: per group, partial sums are added chunk by chunk.
-                                for (k, v) in part {
-                                    match map.get_mut(&k) {
-                                        Some(acc) => {
-                                            acc.0.merge(v.0);
-                                            acc.1 += v.1;
+                            let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> =
+                                FxHashMap::default();
+                            if single_chunk {
+                                match kcol {
+                                    Column::Dict {
+                                        values,
+                                        codes,
+                                        valid,
+                                    } => {
+                                        let null_bucket = values.len();
+                                        let mut seen = vec![false; values.len() + 1];
+                                        let mut accs = vec![
+                                            (crate::exact_sum::ExactSum::default(), 0usize);
+                                            values.len() + 1
+                                        ];
+                                        for i in 0..codes.len() {
+                                            let b = if valid.is_valid(i) {
+                                                codes[i] as usize
+                                            } else {
+                                                null_bucket
+                                            };
+                                            seen[b] = true;
+                                            if let Some(v) = vcol.get(i).as_f64() {
+                                                accs[b].0.add_f64(v);
+                                                accs[b].1 += 1;
+                                            }
                                         }
-                                        None => {
-                                            state_bytes = state_bytes.saturating_add(key_cost(&k) + 64);
+                                        for (code, acc) in accs.into_iter().enumerate() {
+                                            if !seen[code] {
+                                                continue;
+                                            }
+                                            let kcell = if code < null_bucket {
+                                                Cell::from_arc_str(&values[code])
+                                            } else {
+                                                Cell::Null
+                                            };
+                                            state_bytes = state_bytes
+                                                .saturating_add(key_cost(&kcell) + 64);
                                             if state_bytes > max_bytes {
                                                 within_quota = false;
-                                                break 'chunks;
+                                                break;
                                             }
-                                            map.insert(k, v);
+                                            map.insert(kcell, acc);
+                                        }
+                                    }
+                                    Column::Cells(kcells) => {
+                                        for (i, kref) in kcells.iter().enumerate() {
+                                            let vf_opt = vcol.get(i).as_f64();
+                                            if let Some(acc) = map.get_mut(kref) {
+                                                if let Some(v) = vf_opt {
+                                                    acc.0.add_f64(v);
+                                                    acc.1 += 1;
+                                                }
+                                            } else {
+                                                state_bytes = state_bytes
+                                                    .saturating_add(key_cost(kref) + 64);
+                                                if state_bytes > max_bytes {
+                                                    within_quota = false;
+                                                    break;
+                                                }
+                                                let mut acc = (
+                                                    crate::exact_sum::ExactSum::default(),
+                                                    0usize,
+                                                );
+                                                if let Some(v) = vf_opt {
+                                                    acc.0.add_f64(v);
+                                                    acc.1 = 1;
+                                                }
+                                                map.insert(kref.clone_for_borrow(), acc);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        for i in 0..n {
+                                            let k = kcol.get(i);
+                                            let vf_opt = vcol.get(i).as_f64();
+                                            if let Some(acc) = map.get_mut(&k) {
+                                                if let Some(v) = vf_opt {
+                                                    acc.0.add_f64(v);
+                                                    acc.1 += 1;
+                                                }
+                                            } else {
+                                                state_bytes = state_bytes
+                                                    .saturating_add(key_cost(&k) + 64);
+                                                if state_bytes > max_bytes {
+                                                    within_quota = false;
+                                                    break;
+                                                }
+                                                let mut acc = (
+                                                    crate::exact_sum::ExactSum::default(),
+                                                    0usize,
+                                                );
+                                                if let Some(v) = vf_opt {
+                                                    acc.0.add_f64(v);
+                                                    acc.1 = 1;
+                                                }
+                                                map.insert(k, acc);
+                                            }
                                         }
                                     }
                                 }
-                                start = end;
+                            } else {
+                                let mut start = 0;
+                                'chunks: while start < n {
+                                    let end = (start + chunk).min(n);
+                                    let mut part: FxHashMap<
+                                        Cell,
+                                        (crate::exact_sum::ExactSum, usize),
+                                    > = FxHashMap::default();
+                                    if let Column::Cells(kcells) = kcol {
+                                        for (i, kref) in
+                                            kcells[start..end].iter().enumerate()
+                                        {
+                                            let vf_opt = vcol.get(start + i).as_f64();
+                                            if let Some(acc) = part.get_mut(kref) {
+                                                if let Some(v) = vf_opt {
+                                                    acc.0.add_f64(v);
+                                                    acc.1 += 1;
+                                                }
+                                            } else {
+                                                let mut acc = (
+                                                    crate::exact_sum::ExactSum::default(),
+                                                    0usize,
+                                                );
+                                                if let Some(v) = vf_opt {
+                                                    acc.0.add_f64(v);
+                                                    acc.1 = 1;
+                                                }
+                                                part.insert(kref.clone_for_borrow(), acc);
+                                            }
+                                        }
+                                    } else {
+                                        for i in start..end {
+                                            let acc = part.entry(kcol.get(i)).or_default();
+                                            if let Some(v) = vcol.get(i).as_f64() {
+                                                acc.0.add_f64(v);
+                                                acc.1 += 1;
+                                            }
+                                        }
+                                    }
+                                    // Merge in chunk order, as the row path merges its chunk
+                                    // partials: per group, partial sums are added chunk by chunk.
+                                    for (k, v) in part {
+                                        match map.get_mut(&k) {
+                                            Some(acc) => {
+                                                acc.0.merge(v.0);
+                                                acc.1 += v.1;
+                                            }
+                                            None => {
+                                                state_bytes = state_bytes
+                                                    .saturating_add(key_cost(&k) + 64);
+                                                if state_bytes > max_bytes {
+                                                    within_quota = false;
+                                                    break 'chunks;
+                                                }
+                                                map.insert(k, v);
+                                            }
+                                        }
+                                    }
+                                    start = end;
+                                }
                             }
                             within_quota.then(|| {
                                 map.into_iter()
-                                    .map(|(k, (s, c))| (k, if c == 0 { 0.0 } else { s.value() / (c as f64) }))
+                                    .map(|(k, (s, c))| {
+                                        (k, if c == 0 { 0.0 } else { s.value() / (c as f64) })
+                                    })
                                     .collect()
                             })
                         };
                         if let Some(mut entries) = out {
                             entries.sort_unstable_by(|(a, _), (b, _)| super::eval::cmp_sort(a, b));
-                            return Ok(Some(
-                                entries
-                                    .into_iter()
-                                    .map(|(g, v)| {
-                                        let mut row = crate::store::acquire_row();
-                                        row.insert(bk.clone(), g);
-                                        row.insert(fk.clone(), Cell::Float(v));
-                                        row
-                                    })
-                                    .collect(),
-                            ));
+                            return Ok(Some(super::agg::pair_entries_to_rows(
+                                &bk,
+                                &fk,
+                                entries,
+                                Cell::Float,
+                            )));
                         }
                     }
                     _ => {}
                 }
             }
         }
-        let rows = batch.to_rows();
+        let rows = batch.into_rows();
         let out = match agg {
             Step::Count { by: Some(by) } => super::agg::agg_count(&rows, by, max_bytes, spill)?,
             Step::Count { by: None } => vec![super::agg::hits_row(rows.len() as i64)],
@@ -2763,14 +3550,11 @@ fn partition_into(
         if names.is_empty() {
             return None;
         }
+        let max_needed = batch_max_needed(skip_n, explicit_take);
         if self.store.is_disk_backed(name)
             && let Some(eng) = self.store.disk_engine_read()
         {
-            let fetch_limit = match explicit_take {
-                Some(Some(n)) => Some(skip_n.saturating_add(n.max(0) as usize)),
-                Some(None) => None,
-                None => Some(skip_n.saturating_add(50)),
-            };
+            let fetch_limit = max_needed;
             let proj_refs: Vec<&str> = names.iter().map(String::as_str).collect();
             let names_arc: Arc<[String]> = names.clone().into();
             // Without a usable index the scan streams cells straight into the batch's
@@ -2805,13 +3589,23 @@ fn partition_into(
                 .query_filter(name, filter, fetch_limit, Some(&proj_refs), now)
                 .ok()?;
             let mut batch = RecordBatch::with_capacity(names_arc, rows.len());
+            let mut proj_slots: Vec<crate::store::row::FieldSlot<'_>> = names
+                .iter()
+                .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+                .collect();
             for row in &rows {
-                push_project_batch_row(&mut batch, row, &names);
+                push_project_batch_row_slots(&mut batch, row, &mut proj_slots);
             }
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);
         }
 
+        let names_arc: Arc<[String]> = names.clone().into();
+        if max_needed == Some(0) {
+            return Some(RecordBatch::empty(names_arc));
+        }
+
+        let col_rows = self.store.collection(name);
         let (source, need_filter) = {
             if let Some(pred) = filter {
                 if let Some((uses, covered)) =
@@ -2822,34 +3616,34 @@ fn partition_into(
                 } else if let Some(idxs) = self.mirror_select(name, pred, now) {
                     (JoinLeftSource::Idxs(idxs), false)
                 } else {
-                    (
-                        JoinLeftSource::Scan {
-                            len: self.store.collection(name).len(),
-                        },
-                        true,
-                    )
+                    (JoinLeftSource::Scan { len: col_rows.len() }, true)
                 }
             } else {
-                (
-                    JoinLeftSource::Scan {
-                        len: self.store.collection(name).len(),
-                    },
-                    false,
-                )
+                (JoinLeftSource::Scan { len: col_rows.len() }, false)
             }
         };
 
-        let left_len = match &source {
+        let raw_left_len = match &source {
             JoinLeftSource::Idxs(i) => i.len(),
             JoinLeftSource::Scan { len } => *len,
         };
-        let names_arc: Arc<[String]> = names.clone().into();
+        let left_len = if !need_filter {
+            max_needed.map_or(raw_left_len, |lim| lim.min(raw_left_len))
+        } else {
+            raw_left_len
+        };
         if !need_filter
             && let Some(mirror) = self.get_or_build_mirror(name)
         {
-            let idx_slice = match &source {
-                JoinLeftSource::Idxs(idxs) => Some(idxs.as_slice()),
-                JoinLeftSource::Scan { .. } => None,
+            let prefix_idxs: Option<Vec<usize>> = match (&source, max_needed) {
+                (JoinLeftSource::Scan { len }, Some(lim)) if lim < *len && lim <= 4096 => {
+                    Some((0..lim).collect())
+                }
+                _ => None,
+            };
+            let idx_slice: Option<&[usize]> = match &source {
+                JoinLeftSource::Idxs(idxs) => Some(&idxs[..left_len]),
+                JoinLeftSource::Scan { .. } => prefix_idxs.as_deref(),
             };
             if let Some(mut batch) = mirror.project_batch(&names, idx_slice) {
                 finish_batch(&mut batch, skip_n, explicit_take);
@@ -2861,10 +3655,10 @@ fn partition_into(
             && skip_n == 0
             && matches!(explicit_take, Some(None))
             && name == "orders"
-            && self.store.orders_id.len() == left_len
-            && self.store.orders_user_id.len() == left_len
-            && self.store.orders_total.len() == left_len
-            && self.store.orders_total_tag.len() == left_len
+            && self.store.orders_id.len() == raw_left_len
+            && self.store.orders_user_id.len() == raw_left_len
+            && self.store.orders_total.len() == raw_left_len
+            && self.store.orders_total_tag.len() == raw_left_len
             && names.iter().all(|f| matches!(f.as_str(), "id" | "user_id" | "total"))
             && (!names.iter().any(|f| f == "id")
                 || self.store.orders_id.iter().all(|s| !s.is_empty()))
@@ -2896,7 +3690,7 @@ fn partition_into(
             });
         }
 
-        if left_len >= 65_536 {
+        if left_len >= 65_536 && max_needed.is_none_or(|lim| lim >= 4096) {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
@@ -2919,12 +3713,16 @@ fn partition_into(
                             let mut local_batch =
                                 RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
                             let mut slots = filter.map(super::eval::PredSlots::new);
+                            let mut proj_slots: Vec<crate::store::row::FieldSlot<'_>> = names_ref
+                                .iter()
+                                .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+                                .collect();
                             for pos in c_start..c_end {
                                 let idx = match source_ref {
                                     JoinLeftSource::Idxs(idxs) => idxs[pos],
                                     JoinLeftSource::Scan { .. } => pos,
                                 };
-                                let Some(row) = self.store.get_by_idx(name, idx) else {
+                                let Some(row) = col_rows.get(idx) else {
                                     continue;
                                 };
                                 if need_filter
@@ -2933,7 +3731,11 @@ fn partition_into(
                                 {
                                     continue;
                                 }
-                                push_project_batch_row(&mut local_batch, row, names_ref);
+                                push_project_batch_row_slots(
+                                    &mut local_batch,
+                                    row,
+                                    &mut proj_slots,
+                                );
                             }
                             local_batch
                         }));
@@ -2955,29 +3757,22 @@ fn partition_into(
             }
         }
 
-        let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let init_cap = max_needed.map_or(left_len, |lim| lim.min(left_len));
+        let mut batch = RecordBatch::with_capacity(names_arc, init_cap);
         let mut slots = filter.map(super::eval::PredSlots::new);
+        let mut proj_slots: Vec<crate::store::row::FieldSlot<'_>> = names
+            .iter()
+            .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+            .collect();
         let mut pos = 0usize;
-        loop {
+        let mut emitted = 0usize;
+        while pos < left_len {
             let idx = match &source {
-                JoinLeftSource::Idxs(idxs) => {
-                    if pos >= idxs.len() {
-                        break;
-                    }
-                    let i = idxs[pos];
-                    pos += 1;
-                    i
-                }
-                JoinLeftSource::Scan { len } => {
-                    if pos >= *len {
-                        break;
-                    }
-                    let i = pos;
-                    pos += 1;
-                    i
-                }
+                JoinLeftSource::Idxs(idxs) => idxs[pos],
+                JoinLeftSource::Scan { .. } => pos,
             };
-            let Some(row) = self.store.get_by_idx(name, idx) else {
+            pos += 1;
+            let Some(row) = col_rows.get(idx) else {
                 continue;
             };
             if need_filter
@@ -2986,7 +3781,11 @@ fn partition_into(
             {
                 continue;
             }
-            push_project_batch_row(&mut batch, row, &names);
+            push_project_batch_row_slots(&mut batch, row, &mut proj_slots);
+            emitted += 1;
+            if max_needed.is_some_and(|lim| emitted >= lim) {
+                break;
+            }
         }
 
         finish_batch(&mut batch, skip_n, explicit_take);
@@ -3098,7 +3897,14 @@ fn partition_into(
             );
         }
 
+        let max_needed = batch_max_needed(skip_n, explicit_take);
+        let names_arc: Arc<[String]> = names.clone().into();
+        if max_needed == Some(0) {
+            return Some(RecordBatch::empty(names_arc));
+        }
+
         let (right_fields, plan) = plan_join_fields(right_col, &names);
+        let left_rows_col = self.store.collection(left_name);
         let rights = self.store.collection(right_col);
 
         let (source, need_filter) = {
@@ -3113,7 +3919,7 @@ fn partition_into(
                 } else {
                     (
                         JoinLeftSource::Scan {
-                            len: self.store.collection(left_name).len(),
+                            len: left_rows_col.len(),
                         },
                         true,
                     )
@@ -3121,7 +3927,7 @@ fn partition_into(
             } else {
                 (
                     JoinLeftSource::Scan {
-                        len: self.store.collection(left_name).len(),
+                        len: left_rows_col.len(),
                     },
                     false,
                 )
@@ -3133,13 +3939,20 @@ fn partition_into(
             JoinLeftSource::Scan { len } => *len,
         };
 
-        let store_has_all_ids = self
-            .store
-            .by_id
-            .get(right_col)
-            .is_some_and(|m| m.len() == rights.len());
+        let right_by_id = self.store.by_id.get(right_col);
+        let store_has_all_ids = right_by_id.is_some_and(|m| m.len() == rights.len());
+        let fast_right_by_id = if right_col != "docs" && store_has_all_ids {
+            right_by_id
+        } else {
+            None
+        };
 
-        let use_direct_lookup = store_has_all_ids && left_len < rights.len();
+        let est_probes = match max_needed {
+            Some(lim) if !need_filter && left_join => lim.min(left_len),
+            Some(lim) if !need_filter => lim.saturating_mul(2).min(left_len),
+            _ => left_len,
+        };
+        let use_direct_lookup = store_has_all_ids && est_probes < rights.len();
         let probe = if use_direct_lookup {
             None
         } else if store_has_all_ids || left_len * 4 >= rights.len() {
@@ -3147,27 +3960,33 @@ fn partition_into(
         } else {
             let mut needed: FxHashSet<&str> = FxHashSet::default();
             let mut slots = filter.map(super::eval::PredSlots::new);
+            let mut on_slot = crate::store::row::FieldSlot::new(on);
             for i in 0..left_len {
                 let idx = match &source {
                     JoinLeftSource::Idxs(idxs) => idxs[i],
                     JoinLeftSource::Scan { .. } => i,
                 };
-                if let Some(row) = self.store.get_by_idx(left_name, idx)
+                if let Some(row) = left_rows_col.get(idx)
                     && (!need_filter || slots.as_mut().is_none_or(|s| s.eval(row, now)))
-                    && let Some(k) = row.get(on).and_then(Cell::text)
+                    && let Some(k) = on_slot.get(row).and_then(Cell::text)
                 {
                     needed.insert(k);
                 }
             }
             let mut p = FxHashMap::default();
             p.reserve(needed.len());
+            let mut id_slot = crate::store::row::FieldSlot::new("id");
+            let mut rf_slots: Vec<crate::store::row::FieldSlot<'_>> = right_fields
+                .iter()
+                .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+                .collect();
             for r in rights {
-                if let Some(id) = r.get("id").and_then(Cell::text)
+                if let Some(id) = id_slot.get(r).and_then(Cell::text)
                     && needed.contains(id)
                 {
-                    let cells = right_fields
-                        .iter()
-                        .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                    let cells = rf_slots
+                        .iter_mut()
+                        .map(|s| s.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null))
                         .collect();
                     p.insert(id, cells);
                 }
@@ -3175,31 +3994,25 @@ fn partition_into(
             Some(p)
         };
 
-        let names_arc: Arc<[String]> = names.clone().into();
-        let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let init_cap = max_needed.map_or(left_len, |lim| lim.min(left_len));
+        let mut batch = RecordBatch::with_capacity(names_arc, init_cap);
         let mut cell_buf: smallvec::SmallVec<[Cell; 8]> = smallvec::SmallVec::new();
         let mut slots = filter.map(super::eval::PredSlots::new);
+        let mut on_slot = crate::store::row::FieldSlot::new(on);
+        let mut join_slots = build_join_batch_slots(&plan);
+        let mut rf_slots: Vec<crate::store::row::FieldSlot<'_>> = right_fields
+            .iter()
+            .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+            .collect();
         let mut pos = 0usize;
-        loop {
+        let mut emitted = 0usize;
+        while pos < left_len {
             let idx = match &source {
-                JoinLeftSource::Idxs(idxs) => {
-                    if pos >= idxs.len() {
-                        break;
-                    }
-                    let i = idxs[pos];
-                    pos += 1;
-                    i
-                }
-                JoinLeftSource::Scan { len } => {
-                    if pos >= *len {
-                        break;
-                    }
-                    let i = pos;
-                    pos += 1;
-                    i
-                }
+                JoinLeftSource::Idxs(idxs) => idxs[pos],
+                JoinLeftSource::Scan { .. } => pos,
             };
-            let Some(left_row) = self.store.get_by_idx(left_name, idx) else {
+            pos += 1;
+            let Some(left_row) = left_rows_col.get(idx) else {
                 continue;
             };
             if need_filter
@@ -3210,31 +4023,43 @@ fn partition_into(
             }
 
             if let Some(ref probe_map) = probe {
-                let right_cells = left_row
-                    .get(on)
+                let right_cells = on_slot
+                    .get(left_row)
                     .and_then(Cell::text)
                     .and_then(|k| probe_map.get(k).map(|v| v.as_slice()));
                 if right_cells.is_none() && !left_join {
                     continue;
                 }
-                push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+                push_join_batch_row_slots(&mut batch, left_row, right_cells, &mut join_slots);
             } else {
-                let right_row = left_row
-                    .get(on)
-                    .and_then(Cell::text)
-                    .and_then(|k| self.store.get_by_id(right_col, k));
+                let right_row = on_slot.get(left_row).and_then(Cell::text).and_then(|k| {
+                    if let Some(m) = fast_right_by_id {
+                        m.get(k).and_then(|&ri| rights.get(ri))
+                    } else {
+                        self.store.get_by_id(right_col, k)
+                    }
+                });
                 if right_row.is_none() && !left_join {
                     continue;
                 }
                 if let Some(r) = right_row {
                     cell_buf.clear();
-                    for f in &right_fields {
-                        cell_buf.push(r.get(f).cloned().unwrap_or(Cell::Null));
+                    for s in &mut rf_slots {
+                        cell_buf.push(s.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null));
                     }
-                    push_join_batch_row(&mut batch, left_row, Some(&cell_buf), &plan);
+                    push_join_batch_row_slots(
+                        &mut batch,
+                        left_row,
+                        Some(&cell_buf),
+                        &mut join_slots,
+                    );
                 } else {
-                    push_join_batch_row(&mut batch, left_row, None, &plan);
+                    push_join_batch_row_slots(&mut batch, left_row, None, &mut join_slots);
                 }
+            }
+            emitted += 1;
+            if max_needed.is_some_and(|lim| emitted >= lim) {
+                break;
             }
         }
 
@@ -3259,23 +4084,31 @@ fn partition_into(
         explicit_take: Option<Option<i64>>,
         now: i64,
     ) -> Option<RecordBatch> {
+        let max_needed = batch_max_needed(skip_n, explicit_take);
+        let names_arc: Arc<[String]> = names.to_vec().into();
+        if max_needed == Some(0) {
+            return Some(RecordBatch::empty(names_arc));
+        }
+
         let (right_fields, plan) = plan_join_fields(right_col, names);
         let eng = self.store.disk_engine_read()?;
 
         let right_on_disk = self.store.is_disk_backed(right_col);
         let right_refs: Vec<&str> = right_fields.iter().map(String::as_str).collect();
-        let names_arc: Arc<[String]> = names.to_vec().into();
         let preloaded = if right_on_disk {
             eng.get_or_preload_join_dim(right_col, &right_refs)
         } else {
             None
         };
 
+        let mut rf_slots: Vec<crate::store::row::FieldSlot<'_>> = right_fields
+            .iter()
+            .map(|f| crate::store::row::FieldSlot::new(f.as_str()))
+            .collect();
+
         let mut left_owned: Option<Vec<Row>> = None;
         if self.store.is_disk_backed(left_name) {
-            let est_cap = explicit_take
-                .and_then(|o| o)
-                .map(|t| skip_n.saturating_add(t.max(0) as usize))
+            let est_cap = max_needed
                 .unwrap_or_else(|| eng.count_table(left_name))
                 .clamp(64, 65_536);
             if let Some(ref pre) = preloaded {
@@ -3342,12 +4175,13 @@ fn partition_into(
                 FxHashMap::default();
             let mut failed = false;
             if right_on_disk && preloaded.is_none() {
-                const STREAM_CHUNK: usize = 4096;
+                let chunk_cap = max_needed.map_or(4096, |lim| lim.clamp(64, 4096));
                 let mut buffered: Vec<smallvec::SmallVec<[Cell; 8]>> =
-                    Vec::with_capacity(STREAM_CHUNK);
+                    Vec::with_capacity(chunk_cap);
                 let mut flush_chunk =
                     |buf: &mut Vec<smallvec::SmallVec<[Cell; 8]>>,
-                     batch: &mut RecordBatch|
+                     batch: &mut RecordBatch,
+                     rf_slots: &mut [crate::store::row::FieldSlot<'_>]|
                      -> bool {
                         let missing: Vec<&str> = buf
                             .iter()
@@ -3355,17 +4189,24 @@ fn partition_into(
                             .filter(|k| !memo.contains_key(*k))
                             .collect();
                         if !missing.is_empty() {
-                            let fetched =
-                                match eng.get_many_projected_by_id(right_col, missing.iter().copied(), &right_refs) {
-                                    Ok(m) => m,
-                                    Err(_) => return false,
-                                };
+                            let fetched = match eng.get_many_projected_by_id(
+                                right_col,
+                                missing.iter().copied(),
+                                &right_refs,
+                            ) {
+                                Ok(m) => m,
+                                Err(_) => return false,
+                            };
                             for k in missing {
                                 if !memo.contains_key(k) {
                                     let val = fetched.get(k).map(|r| {
-                                        right_fields
-                                            .iter()
-                                            .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                                        rf_slots
+                                            .iter_mut()
+                                            .map(|s| {
+                                                s.get(r)
+                                                    .map(Cell::clone_for_borrow)
+                                                    .unwrap_or(Cell::Null)
+                                            })
                                             .collect()
                                     });
                                     memo.insert(k.to_string(), val);
@@ -3385,30 +4226,41 @@ fn partition_into(
                                         if can_take_left {
                                             std::mem::replace(&mut cells[*i], Cell::Null)
                                         } else {
-                                            cells[*i].clone()
+                                            cells[*i].clone_for_borrow()
                                         }
                                     }
                                     Err(idx) => right_cells
-                                        .and_then(|r| r.get(*idx).cloned())
+                                        .and_then(|r| r.get(*idx).map(Cell::clone_for_borrow))
                                         .unwrap_or(Cell::Null),
                                 };
                                 batch.cols[col_i].push(cell);
+                            }
+                            if max_needed.is_some_and(|lim| batch.n() >= lim) {
+                                break;
                             }
                         }
                         true
                     };
                 let streamed = eng
                     .scan_cells(left_name, filter, &cols, now, |_, cells| {
-                        buffered.push(cells.iter().cloned().collect());
-                        if buffered.len() >= STREAM_CHUNK && !flush_chunk(&mut buffered, &mut batch)
-                        {
-                            failed = true;
-                            return false;
+                        buffered.push(cells.drain(..).collect());
+                        if buffered.len() >= chunk_cap {
+                            if !flush_chunk(&mut buffered, &mut batch, &mut rf_slots) {
+                                failed = true;
+                                return false;
+                            }
+                            if max_needed.is_some_and(|lim| batch.n() >= lim) {
+                                return false;
+                            }
                         }
                         true
                     })
                     .ok()?;
-                if !failed && streamed && !buffered.is_empty() && !flush_chunk(&mut buffered, &mut batch)
+                if !failed
+                    && streamed
+                    && !buffered.is_empty()
+                    && max_needed.is_none_or(|lim| batch.n() < lim)
+                    && !flush_chunk(&mut buffered, &mut batch, &mut rf_slots)
                 {
                     failed = true;
                 }
@@ -3429,14 +4281,16 @@ fn partition_into(
                                     pre.get(k).map(|v| v.as_slice())
                                 } else {
                                     if !memo.contains_key(k) {
-                                        let found = self.store.get_by_id(right_col, k).cloned();
+                                        let found = self.store.get_by_id(right_col, k);
                                         memo.insert(
                                             k.to_string(),
                                             found.map(|r| {
-                                                right_fields
-                                                    .iter()
-                                                    .map(|f| {
-                                                        r.get(f).cloned().unwrap_or(Cell::Null)
+                                                rf_slots
+                                                    .iter_mut()
+                                                    .map(|s| {
+                                                        s.get(r)
+                                                            .map(Cell::clone_for_borrow)
+                                                            .unwrap_or(Cell::Null)
                                                     })
                                                     .collect()
                                             }),
@@ -3455,16 +4309,16 @@ fn partition_into(
                                     if can_take_left {
                                         std::mem::replace(&mut cells[*i], Cell::Null)
                                     } else {
-                                        cells[*i].clone()
+                                        cells[*i].clone_for_borrow()
                                     }
                                 }
                                 Err(idx) => right_cells
-                                    .and_then(|r| r.get(*idx).cloned())
+                                    .and_then(|r| r.get(*idx).map(Cell::clone_for_borrow))
                                     .unwrap_or(Cell::Null),
                             };
                             batch.cols[col_i].push(cell);
                         }
-                        true
+                        max_needed.is_none_or(|lim| batch.n() < lim)
                     })
                     .ok()?;
                 if failed {
@@ -3489,9 +4343,11 @@ fn partition_into(
         let left_rows = left_owned.as_deref().unwrap_or(left_mem);
         // Rows from the engine scan are already filtered.
         let row_filter = if left_owned.is_some() { None } else { filter };
+        let mut join_slots = build_join_batch_slots(&plan);
+        let init_cap = max_needed.map_or(left_rows.len(), |lim| lim.min(left_rows.len()));
 
         if let Some(ref pre) = preloaded {
-            let mut batch = RecordBatch::with_capacity(names_arc, left_rows.len());
+            let mut batch = RecordBatch::with_capacity(names_arc, init_cap);
             let mut slots = row_filter.map(super::eval::PredSlots::new);
             let mut on_slot = crate::store::row::FieldSlot::new(on);
             for left_row in left_rows {
@@ -3507,7 +4363,10 @@ fn partition_into(
                 if right_cells.is_none() && !left_join {
                     continue;
                 }
-                push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+                push_join_batch_row_slots(&mut batch, left_row, right_cells, &mut join_slots);
+                if max_needed.is_some_and(|lim| batch.n() >= lim) {
+                    break;
+                }
             }
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);
@@ -3528,6 +4387,9 @@ fn partition_into(
                     continue;
                 }
                 matched.push((left_row, key));
+                if left_join && max_needed.is_some_and(|lim| matched.len() >= lim) {
+                    break;
+                }
             }
             let fetched = eng
                 .get_many_projected_by_id(
@@ -3541,19 +4403,25 @@ fn partition_into(
             for (k, r) in fetched {
                 memo.insert(
                     k,
-                    right_fields
-                        .iter()
-                        .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                    rf_slots
+                        .iter_mut()
+                        .map(|s| s.get(&r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null))
                         .collect(),
                 );
             }
-            let mut batch = RecordBatch::with_capacity(names_arc, matched.len());
+            let mut batch = RecordBatch::with_capacity(
+                names_arc,
+                max_needed.map_or(matched.len(), |lim| lim.min(matched.len())),
+            );
             for (left_row, key) in matched {
                 let right_cells = key.and_then(|k| memo.get(k).map(|v| v.as_slice()));
                 if right_cells.is_none() && !left_join {
                     continue;
                 }
-                push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+                push_join_batch_row_slots(&mut batch, left_row, right_cells, &mut join_slots);
+                if max_needed.is_some_and(|lim| batch.n() >= lim) {
+                    break;
+                }
             }
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);
@@ -3561,7 +4429,7 @@ fn partition_into(
 
         let mut memo: FxHashMap<&str, Option<smallvec::SmallVec<[Cell; 8]>>> = FxHashMap::default();
 
-        let mut batch = RecordBatch::with_capacity(names_arc, left_rows.len());
+        let mut batch = RecordBatch::with_capacity(names_arc, init_cap);
         let mut slots = row_filter.map(super::eval::PredSlots::new);
         let mut on_slot = crate::store::row::FieldSlot::new(on);
         for left_row in left_rows {
@@ -3574,13 +4442,17 @@ fn partition_into(
                 None => None,
                 Some(k) => {
                     if !memo.contains_key(k) {
-                        let found = self.store.get_by_id(right_col, k).cloned();
+                        let found = self.store.get_by_id(right_col, k);
                         memo.insert(
                             k,
                             found.map(|r| {
-                                right_fields
-                                    .iter()
-                                    .map(|f| r.get(f).cloned().unwrap_or(Cell::Null))
+                                rf_slots
+                                    .iter_mut()
+                                    .map(|s| {
+                                        s.get(r)
+                                            .map(Cell::clone_for_borrow)
+                                            .unwrap_or(Cell::Null)
+                                    })
                                     .collect()
                             }),
                         );
@@ -3591,7 +4463,10 @@ fn partition_into(
             if right_cells.is_none() && !left_join {
                 continue;
             }
-            push_join_batch_row(&mut batch, left_row, right_cells, &plan);
+            push_join_batch_row_slots(&mut batch, left_row, right_cells, &mut join_slots);
+            if max_needed.is_some_and(|lim| batch.n() >= lim) {
+                break;
+            }
         }
         finish_batch(&mut batch, skip_n, explicit_take);
         Some(batch)
@@ -3607,6 +4482,12 @@ fn partition_into(
         explicit_take: Option<Option<i64>>,
         now: i64,
     ) -> Option<RecordBatch> {
+        let max_needed = batch_max_needed(skip_n, explicit_take);
+        let names_arc: Arc<[String]> = names.to_vec().into();
+        if max_needed == Some(0) {
+            return Some(RecordBatch::empty(names_arc));
+        }
+
         let (right_fields, plan) = plan_join_fields("users", names);
         let users_id = self.store.users_id();
         let users_email = self.store.users_email();
@@ -3653,8 +4534,6 @@ fn partition_into(
             (JoinLeftSource::Scan { len: n }, false)
         };
 
-        let names_arc: Arc<[String]> = names.to_vec().into();
-
         let fast_id_email_total = plan.len() == 3
             && matches!(plan[0], JoinFieldPlan::Left(ref k) if k == "id")
             && matches!(
@@ -3669,7 +4548,11 @@ fn partition_into(
             JoinLeftSource::Scan { len } => *len,
         };
 
-        if left_len >= super::agg::PAR_AGG_MIN_ROWS {
+        let use_parallel = left_len >= super::agg::PAR_AGG_MIN_ROWS
+            && max_needed
+                .is_none_or(|lim| lim >= 4096 || total_gt.is_some() || need_row_filter);
+
+        if use_parallel {
             let threads = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
@@ -3677,6 +4560,170 @@ fn partition_into(
                 .min(left_len.div_ceil(super::agg::PAR_AGG_CHUNK_ROWS.max(8192)));
             if threads > 1 {
                 let chunk_size = left_len.div_ceil(threads);
+                if fast_id_email_total {
+                    enum WorkerTotalCol {
+                        Int(Vec<i64>),
+                        Float(Vec<f64>),
+                        Cells(Vec<Cell>),
+                    }
+                    let uniform_tag = if !orders_total_tag.is_empty() {
+                        let t0 = orders_total_tag[0];
+                        if (t0 == 0 || t0 == 1) && orders_total_tag.iter().all(|&t| t == t0) {
+                            Some(t0)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let parts: Vec<(Vec<Cell>, Vec<Cell>, WorkerTotalCol)> =
+                        std::thread::scope(|scope| {
+                            let mut handles = Vec::with_capacity(threads);
+                            for chunk_idx in 0..threads {
+                                let c_start = chunk_idx * chunk_size;
+                                if c_start >= left_len {
+                                    break;
+                                }
+                                let c_end = (c_start + chunk_size).min(left_len);
+                                let source_ref = &source;
+                                let lookup_user_ref = &lookup_user;
+                                handles.push(scope.spawn(move || {
+                                    let cap = c_end - c_start;
+                                    let mut c0 = Vec::with_capacity(cap);
+                                    let mut c1 = Vec::with_capacity(cap);
+                                    let mut c2 = match uniform_tag {
+                                        Some(0) => WorkerTotalCol::Int(Vec::with_capacity(cap)),
+                                        Some(1) => WorkerTotalCol::Float(Vec::with_capacity(cap)),
+                                        _ => WorkerTotalCol::Cells(Vec::with_capacity(cap)),
+                                    };
+                                    let mut slots = filter.map(super::eval::PredSlots::new);
+                                    let mut total_slot =
+                                        crate::store::row::FieldSlot::new("total");
+                                    for pos in c_start..c_end {
+                                        let idx = match source_ref {
+                                            JoinLeftSource::Idxs(idxs) => idxs[pos],
+                                            JoinLeftSource::Scan { .. } => pos,
+                                        };
+                                        if idx >= n {
+                                            continue;
+                                        }
+                                        if let Some(min) = total_gt {
+                                            if orders_total[idx] <= min {
+                                                continue;
+                                            }
+                                        } else if need_row_filter
+                                            && let Some(slots) = slots.as_mut()
+                                        {
+                                            let Some(left_row) = orders_rows.get(idx) else {
+                                                continue;
+                                            };
+                                            if !slots.eval(left_row, now) {
+                                                continue;
+                                            }
+                                        }
+                                        let uid = orders_uid[idx].as_ref();
+                                        let Some(ui) = lookup_user_ref(uid) else {
+                                            if left_join {
+                                                c0.push(Cell::from_arc_str(&orders_id[idx]));
+                                                c1.push(Cell::Null);
+                                                match &mut c2 {
+                                                    WorkerTotalCol::Int(v) => {
+                                                        v.push(orders_total[idx] as i64)
+                                                    }
+                                                    WorkerTotalCol::Float(v) => {
+                                                        v.push(orders_total[idx])
+                                                    }
+                                                    WorkerTotalCol::Cells(v) => {
+                                                        v.push(order_total_cell(
+                                                            &mut total_slot,
+                                                            orders_rows,
+                                                            orders_total,
+                                                            orders_total_tag,
+                                                            idx,
+                                                        ))
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        };
+                                        c0.push(Cell::from_arc_str(&orders_id[idx]));
+                                        c1.push(Cell::from_arc_str(&users_email[ui]));
+                                        match &mut c2 {
+                                            WorkerTotalCol::Int(v) => {
+                                                v.push(orders_total[idx] as i64)
+                                            }
+                                            WorkerTotalCol::Float(v) => v.push(orders_total[idx]),
+                                            WorkerTotalCol::Cells(v) => v.push(order_total_cell(
+                                                &mut total_slot,
+                                                orders_rows,
+                                                orders_total,
+                                                orders_total_tag,
+                                                idx,
+                                            )),
+                                        }
+                                    }
+                                    (c0, c1, c2)
+                                }));
+                            }
+                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                        });
+                    let total_rows: usize = parts.iter().map(|(c0, _, _)| c0.len()).sum();
+                    if total_rows == 0 {
+                        return Some(RecordBatch::empty(names_arc));
+                    }
+                    let mut out0 = Vec::with_capacity(total_rows);
+                    let mut out1 = Vec::with_capacity(total_rows);
+                    let out2 = match uniform_tag {
+                        Some(0) => {
+                            let mut vals = Vec::with_capacity(total_rows);
+                            for (mut c0, mut c1, c2) in parts {
+                                out0.append(&mut c0);
+                                out1.append(&mut c1);
+                                if let WorkerTotalCol::Int(mut v) = c2 {
+                                    vals.append(&mut v);
+                                }
+                            }
+                            Column::Int {
+                                vals,
+                                valid: crate::batch::Validity::all_valid(total_rows),
+                            }
+                        }
+                        Some(1) => {
+                            let mut vals = Vec::with_capacity(total_rows);
+                            for (mut c0, mut c1, c2) in parts {
+                                out0.append(&mut c0);
+                                out1.append(&mut c1);
+                                if let WorkerTotalCol::Float(mut v) = c2 {
+                                    vals.append(&mut v);
+                                }
+                            }
+                            Column::Float {
+                                vals,
+                                valid: crate::batch::Validity::all_valid(total_rows),
+                            }
+                        }
+                        _ => {
+                            let mut col = Column::with_capacity(total_rows);
+                            for (mut c0, mut c1, c2) in parts {
+                                out0.append(&mut c0);
+                                out1.append(&mut c1);
+                                if let WorkerTotalCol::Cells(v) = c2 {
+                                    for cell in v {
+                                        col.push(cell);
+                                    }
+                                }
+                            }
+                            col
+                        }
+                    };
+                    let mut batch = RecordBatch {
+                        names: names_arc,
+                        cols: vec![Column::Cells(out0), Column::Cells(out1), out2],
+                    };
+                    finish_batch(&mut batch, skip_n, explicit_take);
+                    return Some(batch);
+                }
+
                 let thread_batches: Vec<RecordBatch> = std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
                     for chunk_idx in 0..threads {
@@ -3695,123 +4742,65 @@ fn partition_into(
                                 RecordBatch::with_capacity(names_arc_clone, c_end - c_start);
                             let mut slots = filter.map(super::eval::PredSlots::new);
                             let mut total_slot = crate::store::row::FieldSlot::new("total");
-                            if fast_id_email_total {
-                                for pos in c_start..c_end {
-                                    let idx = match source_ref {
-                                        JoinLeftSource::Idxs(idxs) => idxs[pos],
-                                        JoinLeftSource::Scan { .. } => pos,
-                                    };
-                                    if idx >= n {
+                            for pos in c_start..c_end {
+                                let idx = match source_ref {
+                                    JoinLeftSource::Idxs(idxs) => idxs[pos],
+                                    JoinLeftSource::Scan { .. } => pos,
+                                };
+                                if idx >= n {
+                                    continue;
+                                }
+                                if let Some(min) = total_gt {
+                                    if orders_total[idx] <= min {
                                         continue;
                                     }
-                                    if let Some(min) = total_gt {
-                                        if orders_total[idx] <= min {
-                                            continue;
-                                        }
-                                    } else if need_row_filter && let Some(slots) = slots.as_mut() {
-                                        let Some(left_row) = self.store.get_by_idx("orders", idx)
-                                        else {
-                                            continue;
-                                        };
-                                        if !slots.eval(left_row, now) {
-                                            continue;
-                                        }
+                                } else if need_row_filter && let Some(slots) = slots.as_mut() {
+                                    let Some(left_row) = orders_rows.get(idx) else {
+                                        continue;
+                                    };
+                                    if !slots.eval(left_row, now) {
+                                        continue;
                                     }
-                                    let uid = orders_uid[idx].as_ref();
-                                    let Some(ui) = lookup_user_ref(uid) else {
-                                        if left_join {
-                                            local_batch.cols[0]
-                                                .push(Cell::Text(Arc::clone(&orders_id[idx])));
-                                            local_batch.cols[1].push(Cell::Null);
-                                            local_batch.cols[2].push(order_total_cell(
+                                }
+                                let uid = orders_uid[idx].as_ref();
+                                let right_i = lookup_user_ref(uid);
+                                if right_i.is_none() && !left_join {
+                                    continue;
+                                }
+                                for (col_i, p) in plan_ref.iter().enumerate() {
+                                    let cell = match p {
+                                        JoinFieldPlan::Left(k) => match k.as_str() {
+                                            "id" => Cell::from_arc_str(&orders_id[idx]),
+                                            "user_id" => Cell::from_arc_str(&orders_uid[idx]),
+                                            "total" => order_total_cell(
                                                 &mut total_slot,
                                                 orders_rows,
                                                 orders_total,
                                                 orders_total_tag,
                                                 idx,
-                                            ));
-                                        }
-                                        continue;
-                                    };
-                                    local_batch.cols[0]
-                                        .push(Cell::Text(Arc::clone(&orders_id[idx])));
-                                    local_batch.cols[1]
-                                        .push(Cell::Text(Arc::clone(&users_email[ui])));
-                                    local_batch.cols[2].push(order_total_cell(
-                                        &mut total_slot,
-                                        orders_rows,
-                                        orders_total,
-                                        orders_total_tag,
-                                        idx,
-                                    ));
-                                }
-                            } else {
-                                for pos in c_start..c_end {
-                                    let idx = match source_ref {
-                                        JoinLeftSource::Idxs(idxs) => idxs[pos],
-                                        JoinLeftSource::Scan { .. } => pos,
-                                    };
-                                    if idx >= n {
-                                        continue;
-                                    }
-                                    if let Some(min) = total_gt {
-                                        if orders_total[idx] <= min {
-                                            continue;
-                                        }
-                                    } else if need_row_filter && let Some(slots) = slots.as_mut() {
-                                        let Some(left_row) = self.store.get_by_idx("orders", idx)
-                                        else {
-                                            continue;
-                                        };
-                                        if !slots.eval(left_row, now) {
-                                            continue;
-                                        }
-                                    }
-                                    let uid = orders_uid[idx].as_ref();
-                                    let right_i = lookup_user_ref(uid);
-                                    if right_i.is_none() && !left_join {
-                                        continue;
-                                    }
-                                    for (col_i, p) in plan_ref.iter().enumerate() {
-                                        let cell = match p {
-                                            JoinFieldPlan::Left(k) => match k.as_str() {
-                                                "id" => Cell::Text(Arc::clone(&orders_id[idx])),
-                                                "user_id" => {
-                                                    Cell::Text(Arc::clone(&orders_uid[idx]))
-                                                }
-                                                "total" => order_total_cell(
-                                                    &mut total_slot,
-                                                    orders_rows,
-                                                    orders_total,
-                                                    orders_total_tag,
-                                                    idx,
-                                                ),
-                                                _ => self
-                                                    .store
-                                                    .get_by_idx("orders", idx)
-                                                    .and_then(|r| r.get(k).cloned())
-                                                    .unwrap_or(Cell::Null),
-                                            },
-                                            JoinFieldPlan::Right { out: _, idx: r_idx } => {
-                                                match right_i {
-                                                    Some(ui) => match right_fields_ref
-                                                        .get(*r_idx)
-                                                        .map(String::as_str)
-                                                    {
-                                                        Some("id") => {
-                                                            Cell::Text(Arc::clone(&users_id[ui]))
-                                                        }
-                                                        Some("email") => {
-                                                            Cell::Text(Arc::clone(&users_email[ui]))
-                                                        }
-                                                        _ => Cell::Null,
-                                                    },
-                                                    None => Cell::Null,
-                                                }
+                                            ),
+                                            _ => orders_rows
+                                                .get(idx)
+                                                .and_then(|r| r.get(k).map(Cell::clone_for_borrow))
+                                                .unwrap_or(Cell::Null),
+                                        },
+                                        JoinFieldPlan::Right { out: _, idx: r_idx } => {
+                                            match right_i {
+                                                Some(ui) => match right_fields_ref
+                                                    .get(*r_idx)
+                                                    .map(String::as_str)
+                                                {
+                                                    Some("id") => Cell::from_arc_str(&users_id[ui]),
+                                                    Some("email") => {
+                                                        Cell::from_arc_str(&users_email[ui])
+                                                    }
+                                                    _ => Cell::Null,
+                                                },
+                                                None => Cell::Null,
                                             }
-                                        };
-                                        local_batch.cols[col_i].push(cell);
-                                    }
+                                        }
+                                    };
+                                    local_batch.cols[col_i].push(cell);
                                 }
                             }
                             local_batch
@@ -3834,7 +4823,7 @@ fn partition_into(
             }
         }
 
-        let mut batch = RecordBatch::with_capacity(names_arc, left_len);
+        let init_cap = max_needed.map_or(left_len, |lim| lim.min(left_len));
         let mut slots = filter.map(super::eval::PredSlots::new);
         let mut total_slot = crate::store::row::FieldSlot::new("total");
         let mut pos = 0usize;
@@ -3842,11 +4831,22 @@ fn partition_into(
             enum TotalCol {
                 Int(Vec<i64>),
                 Float(Vec<f64>),
-                Cells,
+                Cells(Column),
             }
-            let uniform_tag = if !left_join && !orders_total_tag.is_empty() {
+            let uniform_tag = if !orders_total_tag.is_empty() {
                 let t0 = orders_total_tag[0];
-                if (t0 == 0 || t0 == 1) && orders_total_tag.iter().all(|&t| t == t0) {
+                let check_len = if matches!(source, JoinLeftSource::Scan { .. })
+                    && total_gt.is_none()
+                    && !need_row_filter
+                    && left_join
+                {
+                    init_cap.min(orders_total_tag.len())
+                } else {
+                    orders_total_tag.len()
+                };
+                if (t0 == 0 || t0 == 1)
+                    && orders_total_tag[..check_len].iter().all(|&t| t == t0)
+                {
                     Some(t0)
                 } else {
                     None
@@ -3854,32 +4854,19 @@ fn partition_into(
             } else {
                 None
             };
-            let mut col0 = Vec::with_capacity(left_len);
-            let mut col1 = Vec::with_capacity(left_len);
+            let mut col0 = Vec::with_capacity(init_cap);
+            let mut col1 = Vec::with_capacity(init_cap);
             let mut total_col = match uniform_tag {
-                Some(0) => TotalCol::Int(Vec::with_capacity(left_len)),
-                Some(1) => TotalCol::Float(Vec::with_capacity(left_len)),
-                _ => TotalCol::Cells,
+                Some(0) => TotalCol::Int(Vec::with_capacity(init_cap)),
+                Some(1) => TotalCol::Float(Vec::with_capacity(init_cap)),
+                _ => TotalCol::Cells(Column::with_capacity(init_cap)),
             };
-            loop {
+            while pos < left_len {
                 let idx = match &source {
-                    JoinLeftSource::Idxs(idxs) => {
-                        if pos >= idxs.len() {
-                            break;
-                        }
-                        let i = idxs[pos];
-                        pos += 1;
-                        i
-                    }
-                    JoinLeftSource::Scan { len } => {
-                        if pos >= *len {
-                            break;
-                        }
-                        let i = pos;
-                        pos += 1;
-                        i
-                    }
+                    JoinLeftSource::Idxs(idxs) => idxs[pos],
+                    JoinLeftSource::Scan { .. } => pos,
                 };
+                pos += 1;
                 if idx >= n {
                     continue;
                 }
@@ -3888,7 +4875,7 @@ fn partition_into(
                         continue;
                     }
                 } else if need_row_filter && let Some(slots) = slots.as_mut() {
-                    let Some(left_row) = self.store.get_by_idx("orders", idx) else {
+                    let Some(left_row) = orders_rows.get(idx) else {
                         continue;
                     };
                     if !slots.eval(left_row, now) {
@@ -3898,12 +4885,12 @@ fn partition_into(
                 let uid = orders_uid[idx].as_ref();
                 let Some(ui) = lookup_user(uid) else {
                     if left_join {
-                        col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
+                        col0.push(Cell::from_arc_str(&orders_id[idx]));
                         col1.push(Cell::Null);
                         match &mut total_col {
                             TotalCol::Int(vals) => vals.push(orders_total[idx] as i64),
                             TotalCol::Float(vals) => vals.push(orders_total[idx]),
-                            TotalCol::Cells => batch.cols[2].push(order_total_cell(
+                            TotalCol::Cells(col) => col.push(order_total_cell(
                                 &mut total_slot,
                                 orders_rows,
                                 orders_total,
@@ -3911,15 +4898,18 @@ fn partition_into(
                                 idx,
                             )),
                         }
+                        if max_needed.is_some_and(|lim| col0.len() >= lim) {
+                            break;
+                        }
                     }
                     continue;
                 };
-                col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
-                col1.push(Cell::Text(Arc::clone(&users_email[ui])));
+                col0.push(Cell::from_arc_str(&orders_id[idx]));
+                col1.push(Cell::from_arc_str(&users_email[ui]));
                 match &mut total_col {
                     TotalCol::Int(vals) => vals.push(orders_total[idx] as i64),
                     TotalCol::Float(vals) => vals.push(orders_total[idx]),
-                    TotalCol::Cells => batch.cols[2].push(order_total_cell(
+                    TotalCol::Cells(col) => col.push(order_total_cell(
                         &mut total_slot,
                         orders_rows,
                         orders_total,
@@ -3927,50 +4917,45 @@ fn partition_into(
                         idx,
                     )),
                 }
-            }
-            if !col0.is_empty() {
-                let n_out = col0.len();
-                batch.cols[0] = crate::batch::Column::Cells(col0);
-                batch.cols[1] = crate::batch::Column::Cells(col1);
-                match total_col {
-                    TotalCol::Int(vals) => {
-                        batch.cols[2] = crate::batch::Column::Int {
-                            vals,
-                            valid: crate::batch::Validity::all_valid(n_out),
-                        };
-                    }
-                    TotalCol::Float(vals) => {
-                        batch.cols[2] = crate::batch::Column::Float {
-                            vals,
-                            valid: crate::batch::Validity::all_valid(n_out),
-                        };
-                    }
-                    TotalCol::Cells => {}
+                if max_needed.is_some_and(|lim| col0.len() >= lim) {
+                    break;
                 }
             }
+            if col0.is_empty() {
+                return Some(RecordBatch::empty(names_arc));
+            }
+            let n_out = col0.len();
+            let c2 = match total_col {
+                TotalCol::Int(vals) => crate::batch::Column::Int {
+                    vals,
+                    valid: crate::batch::Validity::all_valid(n_out),
+                },
+                TotalCol::Float(vals) => crate::batch::Column::Float {
+                    vals,
+                    valid: crate::batch::Validity::all_valid(n_out),
+                },
+                TotalCol::Cells(col) => col,
+            };
+            let mut batch = RecordBatch {
+                names: names_arc,
+                cols: vec![
+                    crate::batch::Column::Cells(col0),
+                    crate::batch::Column::Cells(col1),
+                    c2,
+                ],
+            };
             finish_batch(&mut batch, skip_n, explicit_take);
             return Some(batch);
         }
 
-        loop {
+        let mut batch = RecordBatch::with_capacity(names_arc, init_cap);
+        let mut emitted = 0usize;
+        while pos < left_len {
             let idx = match &source {
-                JoinLeftSource::Idxs(idxs) => {
-                    if pos >= idxs.len() {
-                        break;
-                    }
-                    let i = idxs[pos];
-                    pos += 1;
-                    i
-                }
-                JoinLeftSource::Scan { len } => {
-                    if pos >= *len {
-                        break;
-                    }
-                    let i = pos;
-                    pos += 1;
-                    i
-                }
+                JoinLeftSource::Idxs(idxs) => idxs[pos],
+                JoinLeftSource::Scan { .. } => pos,
             };
+            pos += 1;
             if idx >= n {
                 continue;
             }
@@ -3979,7 +4964,7 @@ fn partition_into(
                     continue;
                 }
             } else if need_row_filter && let Some(slots) = slots.as_mut() {
-                let Some(left_row) = self.store.get_by_idx("orders", idx) else {
+                let Some(left_row) = orders_rows.get(idx) else {
                     continue;
                 };
                 if !slots.eval(left_row, now) {
@@ -3996,8 +4981,8 @@ fn partition_into(
             for (col_i, p) in plan.iter().enumerate() {
                 let cell = match p {
                     JoinFieldPlan::Left(k) => match k.as_str() {
-                        "id" => Cell::Text(Arc::clone(&orders_id[idx])),
-                        "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
+                        "id" => Cell::from_arc_str(&orders_id[idx]),
+                        "user_id" => Cell::from_arc_str(&orders_uid[idx]),
                         "total" => order_total_cell(
                             &mut total_slot,
                             orders_rows,
@@ -4005,10 +4990,9 @@ fn partition_into(
                             orders_total_tag,
                             idx,
                         ),
-                        _ => self
-                            .store
-                            .get_by_idx("orders", idx)
-                            .and_then(|r| r.get(k).cloned())
+                        _ => orders_rows
+                            .get(idx)
+                            .and_then(|r| r.get(k).map(Cell::clone_for_borrow))
                             .unwrap_or(Cell::Null),
                     },
                     JoinFieldPlan::Right { out: _, idx: ri } => {
@@ -4018,13 +5002,17 @@ fn partition_into(
                         };
                         let fname = right_fields.get(*ri).map(|s| s.as_str()).unwrap_or("");
                         match fname {
-                            "id" => Cell::Text(Arc::clone(&users_id[ui])),
-                            "email" => Cell::Text(Arc::clone(&users_email[ui])),
+                            "id" => Cell::from_arc_str(&users_id[ui]),
+                            "email" => Cell::from_arc_str(&users_email[ui]),
                             _ => Cell::Null,
                         }
                     }
                 };
                 batch.cols[col_i].push(cell);
+            }
+            emitted += 1;
+            if max_needed.is_some_and(|lim| emitted >= lim) {
+                break;
             }
         }
 
@@ -4050,6 +5038,9 @@ fn partition_into(
             return Ok(Vec::new());
         }
 
+        let mut on_slot = crate::store::row::FieldSlot::new(on);
+        let mut merger = JoinRowMerger::new(right_col);
+
         // Cold right side: probe the disk engine instead of materializing the whole
         // collection in memory.
         if self.store.is_disk_backed(right_col)
@@ -4069,14 +5060,14 @@ fn partition_into(
                 // on disk.
                 let keys: Vec<Arc<str>> = left
                     .iter()
-                    .filter_map(|l| l.get(on).and_then(Cell::text).map(Arc::from))
+                    .filter_map(|l| on_slot.get(l).and_then(Cell::text).map(Arc::from))
                     .collect();
                 let found = eng.get_many_by_id(right_col, keys.iter().map(|k| &**k))?;
                 let mut out = Vec::with_capacity(left.len());
                 for l in left {
-                    let right = l.get(on).and_then(Cell::text).and_then(|k| found.get(k));
+                    let right = on_slot.get(&l).and_then(Cell::text).and_then(|k| found.get(k));
                     match right {
-                        Some(r) => out.push(merge_join_row(l, r, right_col)),
+                        Some(r) => out.push(merger.merge(l, r)),
                         None if left_join => out.push(l),
                         None => {}
                     }
@@ -4087,14 +5078,15 @@ fn partition_into(
             // Non-id key: one streaming pass keeps only the right rows some left row needs.
             let needed_keys: FxHashSet<String> = left
                 .iter()
-                .filter_map(|l| l.get(on).and_then(cell_key))
+                .filter_map(|l| on_slot.get(l).and_then(cell_key))
                 .collect();
             if needed_keys.is_empty() {
                 return Ok(if left_join { left } else { Vec::new() });
             }
             let mut idx: FxHashMap<String, Vec<Row>> = FxHashMap::default();
+            let mut to_slot = crate::store::row::FieldSlot::new(to_field);
             let mut keep = |r: &Row| {
-                if let Some(k) = cell_key_ref(r.get(to_field).unwrap_or(&Cell::Null))
+                if let Some(k) = cell_key_ref(to_slot.get(r).unwrap_or(&Cell::Null))
                     && needed_keys.contains(k.as_ref())
                 {
                     match idx.get_mut(k.as_ref()) {
@@ -4110,7 +5102,7 @@ fn partition_into(
             // matching rows are materialized.
             const MAX_PUSHED_KEYS: usize = 4096;
             let text_keys: Option<Vec<crate::ast::Value>> = (needed_keys.len() <= MAX_PUSHED_KEYS
-                && left.iter().all(|l| match l.get(on) {
+                && left.iter().all(|l| match on_slot.get(l) {
                     None | Some(Cell::Null | Cell::Text(_) | Cell::SmallText(_)) => true,
                     Some(_) => false,
                 }))
@@ -4139,8 +5131,8 @@ fn partition_into(
             }
             let mut out = Vec::with_capacity(left.len());
             for mut l in left {
-                let hits = l
-                    .get(on)
+                let hits = on_slot
+                    .get(&l)
                     .and_then(cell_key_ref)
                     .and_then(|k| idx.get(k.as_ref()));
                 match hits {
@@ -4151,7 +5143,7 @@ fn partition_into(
                             } else {
                                 l.clone()
                             };
-                            out.push(merge_join_row(base, r, right_col));
+                            out.push(merger.merge(base, r));
                             over_quota(out.len())?;
                         }
                     }
@@ -4164,20 +5156,21 @@ fn partition_into(
 
         if to_field == "id" {
             let right = self.store.collection(right_col);
-            let store_has_all_ids = self
-                .store
-                .by_id
-                .get(right_col)
-                .is_some_and(|m| m.len() == right.len());
+            let right_by_id = self.store.by_id.get(right_col);
+            let store_has_all_ids = right_by_id.is_some_and(|m| m.len() == right.len());
             if store_has_all_ids {
+                let fast_right_by_id = (right_col != "docs").then_some(right_by_id).flatten();
                 let mut out = Vec::with_capacity(left.len());
                 for l in left {
-                    let right = l
-                        .get(on)
-                        .and_then(Cell::text)
-                        .and_then(|k| self.store.get_by_id(right_col, k));
-                    match right {
-                        Some(r) => out.push(merge_join_row(l, r, right_col)),
+                    let right_row = on_slot.get(&l).and_then(Cell::text).and_then(|k| {
+                        if let Some(m) = fast_right_by_id {
+                            m.get(k).and_then(|&ri| right.get(ri))
+                        } else {
+                            self.store.get_by_id(right_col, k)
+                        }
+                    });
+                    match right_row {
+                        Some(r) => out.push(merger.merge(l, r)),
                         None if left_join => out.push(l),
                         None => {}
                     }
@@ -4195,7 +5188,7 @@ fn partition_into(
             let needed: Option<FxHashSet<&str>> = if left.len() * 4 < right.len() {
                 Some(
                     left.iter()
-                        .filter_map(|l| l.get(on).and_then(Cell::text))
+                        .filter_map(|l| on_slot.get(l).and_then(Cell::text))
                         .collect(),
                 )
             } else {
@@ -4203,10 +5196,11 @@ fn partition_into(
             };
 
             let mut by_id: FxHashMap<&str, &Row> = FxHashMap::default();
+            let mut id_slot = crate::store::row::FieldSlot::new("id");
             if let Some(ref needed_set) = needed {
                 by_id.reserve(needed_set.len());
                 for r in right {
-                    if let Some(id) = r.get("id").and_then(Cell::text)
+                    if let Some(id) = id_slot.get(r).and_then(Cell::text)
                         && needed_set.contains(id)
                     {
                         by_id.insert(id, r);
@@ -4215,7 +5209,7 @@ fn partition_into(
             } else {
                 by_id.reserve(right.len());
                 for r in right {
-                    if let Some(id) = r.get("id").and_then(Cell::text) {
+                    if let Some(id) = id_slot.get(r).and_then(Cell::text) {
                         by_id.insert(id, r);
                     }
                 }
@@ -4223,12 +5217,12 @@ fn partition_into(
 
             let mut out = Vec::with_capacity(left.len());
             for l in left {
-                let right = l
-                    .get(on)
+                let right_row = on_slot
+                    .get(&l)
                     .and_then(Cell::text)
                     .and_then(|k| by_id.get(k).copied());
-                match right {
-                    Some(r) => out.push(merge_join_row(l, r, right_col)),
+                match right_row {
+                    Some(r) => out.push(merger.merge(l, r)),
                     None if left_join => out.push(l),
                     None => {}
                 }
@@ -4239,7 +5233,7 @@ fn partition_into(
         let right = self.store.collection(right_col);
         let needed_keys: FxHashSet<String> = left
             .iter()
-            .filter_map(|l| l.get(on).and_then(cell_key))
+            .filter_map(|l| on_slot.get(l).and_then(cell_key))
             .collect();
         if needed_keys.is_empty() {
             return Ok(if left_join { left } else { Vec::new() });
@@ -4247,8 +5241,9 @@ fn partition_into(
 
         let mut idx: FxHashMap<String, Vec<&Row>> = FxHashMap::default();
         idx.reserve(needed_keys.len());
+        let mut to_slot = crate::store::row::FieldSlot::new(to_field);
         for r in right {
-            if let Some(k) = cell_key_ref(r.get(to_field).unwrap_or(&Cell::Null))
+            if let Some(k) = cell_key_ref(to_slot.get(r).unwrap_or(&Cell::Null))
                 && needed_keys.contains(k.as_ref())
             {
                 match idx.get_mut(k.as_ref()) {
@@ -4261,8 +5256,8 @@ fn partition_into(
         }
         let mut out = Vec::with_capacity(left.len());
         for mut l in left {
-            let hits = l
-                .get(on)
+            let hits = on_slot
+                .get(&l)
                 .and_then(cell_key_ref)
                 .and_then(|k| idx.get(k.as_ref()));
             if let Some(rs) = hits {
@@ -4272,7 +5267,7 @@ fn partition_into(
                     } else {
                         l.clone()
                     };
-                    out.push(merge_join_row(base, r, right_col));
+                    out.push(merger.merge(base, r));
                     if out.len() > self.quotas.max_join_expansion {
                         return Err(Error::runtime(format!(
                             "Cartesian join expansion {} exceeds max_join_expansion quota {}",
@@ -4319,15 +5314,23 @@ pub(crate) fn sort_positions_top_k(keys: &[Cell], desc: bool, top_k: Option<usiz
     use super::eval::cmp_sort;
     let n = keys.len();
     if n <= 32 {
+        static IK_SHAPE: std::sync::OnceLock<Arc<crate::store::RowShape>> =
+            std::sync::OnceLock::new();
+        let shape = IK_SHAPE.get_or_init(|| Row::shape_of(&["i", "k"]));
         let mut rows: Vec<Row> = keys
             .iter()
             .enumerate()
-            .map(|(i, k)| Row::from([("k", k.clone_for_borrow()), ("i", Cell::Int(i as i64))]))
+            .map(|(i, k)| {
+                Row::from_parts(
+                    Arc::clone(shape),
+                    [Cell::Int(i as i64), k.clone_for_borrow()],
+                )
+            })
             .collect();
         super::eval::sort_rows_top_k(&mut rows, &Field::name("k"), desc, top_k);
         return rows
             .iter()
-            .map(|r| match r.get("i") {
+            .map(|r| match r.cells_slice().first() {
                 Some(Cell::Int(i)) => *i as usize,
                 _ => unreachable!("position column"),
             })
@@ -4336,13 +5339,13 @@ pub(crate) fn sort_positions_top_k(keys: &[Cell], desc: bool, top_k: Option<usiz
     if top_k == Some(0) {
         return Vec::new();
     }
-    let mut decorated: Vec<(Cell, usize)> = keys
+    let mut decorated: Vec<(&Cell, usize)> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| (k.clone_for_borrow(), i))
+        .map(|(i, k)| (k, i))
         .collect();
-    let cmp_keys = |a: &(Cell, usize), b: &(Cell, usize)| {
-        let ord = cmp_sort(&a.0, &b.0);
+    let cmp_keys = |a: &(&Cell, usize), b: &(&Cell, usize)| {
+        let ord = cmp_sort(a.0, b.0);
         let ord = if desc { ord.reverse() } else { ord };
         ord.then_with(|| a.1.cmp(&b.1))
     };
@@ -4352,7 +5355,7 @@ pub(crate) fn sort_positions_top_k(keys: &[Cell], desc: bool, top_k: Option<usiz
         decorated.select_nth_unstable_by(limit - 1, cmp_keys);
         decorated.truncate(limit);
     }
-    decorated.sort_by(cmp_keys);
+    decorated.sort_unstable_by(cmp_keys);
     decorated.into_iter().map(|(_, i)| i).collect()
 }
 

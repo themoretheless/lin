@@ -19,6 +19,43 @@ use crate::store::row::FieldSlot;
 use super::prepared::{AggKind, AggPlan, AggTail};
 
 static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NULL_CELL: Cell = Cell::Null;
+
+#[inline]
+pub(crate) fn single_cell_row(field: &str, val: Cell) -> Row {
+    let shape = Row::shape_of(&[field]);
+    Row::from_parts(shape, [val])
+}
+
+pub(crate) fn pair_entries_to_rows<V>(
+    k0: &str,
+    k1: &str,
+    entries: Vec<(Cell, V)>,
+    mut to_cell: impl FnMut(V) -> Cell,
+) -> Vec<Row> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    if k0 != k1 {
+        let shape = Row::shape_of(&[k0, k1]);
+        let swap = k0 > k1;
+        return entries
+            .into_iter()
+            .map(|(c0, v)| {
+                let c1 = to_cell(v);
+                Row::from_parts(
+                    Arc::clone(&shape),
+                    if swap { [c1, c0] } else { [c0, c1] },
+                )
+            })
+            .collect();
+    }
+    let shape = Row::shape_of(&[k1]);
+    entries
+        .into_iter()
+        .map(|(_, v)| Row::from_parts(Arc::clone(&shape), [to_cell(v)]))
+        .collect()
+}
 
 fn cell_hash(cell: &Cell) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -158,25 +195,21 @@ pub(crate) fn spill_agg_count<'a>(
     by: &Field,
 ) -> Result<Vec<Row>, Error> {
     let k = by.as_str();
+    let mut k_slot = FieldSlot::new(&k);
     let entries = spill_partition_aggregate(
         "count",
         rows,
         |r| {
-            let cell = r.get(&k).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let cell = k_slot
+                .get(r)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
             (cell, ())
         },
         || 0i64,
         |acc, ()| *acc += 1,
     )?;
-    Ok(entries
-        .into_iter()
-        .map(|(cell, n)| {
-            let mut row = crate::store::acquire_row();
-            row.insert(k.clone(), cell);
-            row.insert("hits", Cell::Int(n));
-            row
-        })
-        .collect())
+    Ok(pair_entries_to_rows(&k, "hits", entries, Cell::Int))
 }
 
 pub(crate) fn spill_agg_sum<'a>(
@@ -186,32 +219,32 @@ pub(crate) fn spill_agg_sum<'a>(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let bk = by.map(Field::as_str);
+    let mut k_slot = bk.as_deref().map(FieldSlot::new);
+    let mut v_slot = FieldSlot::new(&fk);
     let entries = spill_partition_aggregate(
         "sum",
         rows,
         |r| {
-            let cell = bk
-                .as_ref()
-                .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
+            let cell = k_slot
+                .as_mut()
+                .and_then(|s| s.get(r).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null);
             let mut n = crate::exact_sum::ExactSum::default();
-            n.add_cell(r.get(&fk));
+            n.add_cell(v_slot.get(r));
             (cell, n)
         },
         crate::exact_sum::ExactSum::default,
         |acc, n| acc.merge(n),
     )?;
-    let group_col = bk.as_deref().unwrap_or("");
+    if let Some(ref group_col) = bk {
+        return Ok(pair_entries_to_rows(group_col, &fk, entries, |n| {
+            Cell::Float(n.value())
+        }));
+    }
+    let shape = Row::shape_of(&[fk.as_str()]);
     Ok(entries
         .into_iter()
-        .map(|(cell, n)| {
-            let mut row = crate::store::acquire_row();
-            if by.is_some() {
-                row.insert(group_col.to_string(), cell);
-            }
-            row.insert(fk.clone(), Cell::Float(n.value()));
-            row
-        })
+        .map(|(_, n)| Row::from_parts(Arc::clone(&shape), [Cell::Float(n.value())]))
         .collect())
 }
 
@@ -223,16 +256,18 @@ pub(crate) fn spill_agg_min_max<'a>(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let bk = by.map(Field::as_str);
+    let mut k_slot = bk.as_deref().map(FieldSlot::new);
+    let mut v_slot = FieldSlot::new(&fk);
     let entries = spill_partition_aggregate(
         "minmax",
         rows,
         |r| {
-            let cell = bk
-                .as_ref()
-                .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
+            let cell = k_slot
+                .as_mut()
+                .and_then(|s| s.get(r).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null);
-            let f_val = r
-                .get(&fk)
+            let f_val = v_slot
+                .get(r)
                 .filter(|c| !matches!(c, Cell::Null))
                 .map(Cell::clone_for_borrow);
             (cell, f_val)
@@ -240,31 +275,31 @@ pub(crate) fn spill_agg_min_max<'a>(
         || None::<Cell>,
         |entry, val| {
             if let Some(c) = val {
-                *entry = Some(match entry.take() {
-                    None => c,
+                let replace = match entry.as_ref() {
+                    None => true,
                     Some(prev) => {
-                        let is_better = if is_max {
-                            cmp_sort(&c, &prev).is_gt()
+                        if is_max {
+                            cmp_sort(&c, prev).is_gt()
                         } else {
-                            cmp_sort(&c, &prev).is_lt()
-                        };
-                        if is_better { c } else { prev }
+                            cmp_sort(&c, prev).is_lt()
+                        }
                     }
-                });
+                };
+                if replace {
+                    *entry = Some(c);
+                }
             }
         },
     )?;
-    let group_col = bk.as_deref().unwrap_or("");
+    if let Some(ref group_col) = bk {
+        return Ok(pair_entries_to_rows(group_col, &fk, entries, |val| {
+            val.unwrap_or(Cell::Null)
+        }));
+    }
+    let shape = Row::shape_of(&[fk.as_str()]);
     Ok(entries
         .into_iter()
-        .map(|(gcell, val)| {
-            let mut row = crate::store::acquire_row();
-            if by.is_some() {
-                row.insert(group_col.to_string(), gcell);
-            }
-            row.insert(fk.clone(), val.unwrap_or(Cell::Null));
-            row
-        })
+        .map(|(_, val)| Row::from_parts(Arc::clone(&shape), [val.unwrap_or(Cell::Null)]))
         .collect())
 }
 
@@ -275,15 +310,17 @@ pub(crate) fn spill_agg_avg<'a>(
 ) -> Result<Vec<Row>, Error> {
     let fk = field.as_str();
     let bk = by.map(Field::as_str);
+    let mut k_slot = bk.as_deref().map(FieldSlot::new);
+    let mut v_slot = FieldSlot::new(&fk);
     let entries = spill_partition_aggregate(
         "avg",
         rows,
         |r| {
-            let cell = bk
-                .as_ref()
-                .and_then(|k| r.get(k).map(Cell::clone_for_borrow))
+            let cell = k_slot
+                .as_mut()
+                .and_then(|s| s.get(r).map(Cell::clone_for_borrow))
                 .unwrap_or(Cell::Null);
-            let v_opt = r.get(&fk).and_then(Cell::as_f64);
+            let v_opt = v_slot.get(r).and_then(Cell::as_f64);
             (cell, v_opt)
         },
         || (crate::exact_sum::ExactSum::default(), 0usize),
@@ -294,17 +331,24 @@ pub(crate) fn spill_agg_avg<'a>(
             }
         },
     )?;
-    let group_col = bk.as_deref().unwrap_or("");
+    if let Some(ref group_col) = bk {
+        return Ok(pair_entries_to_rows(
+            group_col,
+            &fk,
+            entries,
+            |(sum, count)| Cell::Float(if count > 0 { sum.value() / count as f64 } else { 0.0 }),
+        ));
+    }
+    let shape = Row::shape_of(&[fk.as_str()]);
     Ok(entries
         .into_iter()
-        .map(|(cell, (sum, count))| {
-            let mut row = crate::store::acquire_row();
-            if by.is_some() {
-                row.insert(group_col.to_string(), cell);
-            }
-            let avg = if count > 0 { sum.value() / count as f64 } else { 0.0 };
-            row.insert(fk.clone(), Cell::Float(avg));
-            row
+        .map(|(_, (sum, count))| {
+            let avg = if count > 0 {
+                sum.value() / count as f64
+            } else {
+                0.0
+            };
+            Row::from_parts(Arc::clone(&shape), [Cell::Float(avg)])
         })
         .collect())
 }
@@ -347,9 +391,15 @@ fn chunked_group_fold<V: Send + Default>(
             if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
                 continue;
             }
-            let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
+            let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
             let v = value_slot.as_mut().and_then(|s| s.get(r));
-            add(map.entry(cell).or_default(), v);
+            if let Some(acc) = map.get_mut(key_ref) {
+                add(acc, v);
+            } else {
+                let mut acc = V::default();
+                add(&mut acc, v);
+                map.insert(key_ref.clone_for_borrow(), acc);
+            }
         }
         map
     };
@@ -464,23 +514,19 @@ fn scoped_par_count_by(
                     if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
                         continue;
                     }
-                    let cell = key_slot
-                        .get(r)
-                        .map(Cell::clone_for_borrow)
-                        .unwrap_or(Cell::Null);
-                    match map.entry(cell) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => *e.get_mut() += 1,
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            let key_size = match e.key() {
-                                Cell::Text(s) => s.len() + 32,
-                                _ => 16,
-                            };
-                            local_bytes = local_bytes.saturating_add(key_size + 64);
-                            if local_bytes > max_bytes {
-                                return None;
-                            }
-                            e.insert(1);
+                    let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+                    if let Some(cnt) = map.get_mut(key_ref) {
+                        *cnt += 1;
+                    } else {
+                        let key_size = match key_ref {
+                            Cell::Text(s) => s.len() + 32,
+                            _ => 16,
+                        };
+                        local_bytes = local_bytes.saturating_add(key_size + 64);
+                        if local_bytes > max_bytes {
+                            return None;
                         }
+                        map.insert(key_ref.clone_for_borrow(), 1);
                     }
                 }
                 Some(map)
@@ -532,9 +578,11 @@ pub(crate) fn agg_count_filtered(
         if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-        if !map.contains_key(&cell) {
-            let key_size = match &cell {
+        let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+        if let Some(cnt) = map.get_mut(key_ref) {
+            *cnt += 1;
+        } else {
+            let key_size = match key_ref {
                 Cell::Text(s) => s.len() + 32,
                 _ => 16,
             };
@@ -551,8 +599,8 @@ pub(crate) fn agg_count_filtered(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
             }
+            map.insert(key_ref.clone_for_borrow(), 1);
         }
-        *map.entry(cell).or_insert(0) += 1;
     }
     Ok(count_cell_map_to_rows(&k, map))
 }
@@ -598,7 +646,7 @@ pub(crate) fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>,
         return map
             .into_iter()
             .map(|(g, n)| {
-                let cell = Cell::Text(g);
+                let cell = Cell::from_arc_str(&g);
                 let hits = Cell::Int(n);
                 Row::from_parts(
                     std::sync::Arc::clone(&shape),
@@ -607,13 +655,9 @@ pub(crate) fn count_arc_map_to_rows(by: &str, map: BTreeMap<std::sync::Arc<str>,
             })
             .collect();
     }
+    let shape = Arc::clone(hits_shape());
     map.into_iter()
-        .map(|(g, n)| {
-            let mut row = crate::store::acquire_row();
-            row.insert(by, Cell::Text(g));
-            row.insert("hits", Cell::Int(n));
-            row
-        })
+        .map(|(_, n)| Row::from_parts(Arc::clone(&shape), [Cell::Int(n)]))
         .collect()
 }
 
@@ -724,17 +768,43 @@ fn disk_cmp_rhs_compatible(kind: crate::disk::DiskColKind, rhs: &Cell) -> bool {
     }
 }
 
+#[inline]
+fn hits_shape() -> &'static Arc<crate::store::RowShape> {
+    static SHAPE: std::sync::OnceLock<Arc<crate::store::RowShape>> = std::sync::OnceLock::new();
+    SHAPE.get_or_init(|| Row::shape_of(&["hits"]))
+}
+
+#[inline]
 pub(crate) fn hits_row(n: i64) -> Row {
-    let mut row = crate::store::acquire_row();
-    row.insert("hits", Cell::Int(n));
-    row
+    Row::from_parts(Arc::clone(hits_shape()), [Cell::Int(n)])
 }
 
 pub(crate) fn count_row(by: &str, value: &str, n: i64) -> Row {
-    let mut row = crate::store::acquire_row();
-    row.insert(by.to_string(), Cell::text_arc(value));
-    row.insert("hits", Cell::Int(n));
-    row
+    static HITS_WING: std::sync::OnceLock<Arc<crate::store::RowShape>> = std::sync::OnceLock::new();
+    static HITS_LAYER: std::sync::OnceLock<Arc<crate::store::RowShape>> =
+        std::sync::OnceLock::new();
+    static HITS_USER_ID: std::sync::OnceLock<Arc<crate::store::RowShape>> =
+        std::sync::OnceLock::new();
+
+    if by == "hits" {
+        return hits_row(n);
+    }
+    let val_cell = Cell::from_text(value);
+    let hits_cell = Cell::Int(n);
+    let shape = match by {
+        "wing" => Arc::clone(HITS_WING.get_or_init(|| Row::shape_of(&["hits", "wing"]))),
+        "layer" => Arc::clone(HITS_LAYER.get_or_init(|| Row::shape_of(&["hits", "layer"]))),
+        "user_id" => Arc::clone(HITS_USER_ID.get_or_init(|| Row::shape_of(&["hits", "user_id"]))),
+        _ => Row::shape_of(&[by, "hits"]),
+    };
+    Row::from_parts(
+        shape,
+        if by > "hits" {
+            [hits_cell, val_cell]
+        } else {
+            [val_cell, hits_cell]
+        },
+    )
 }
 
 pub(crate) fn eq_value_for_field<'a>(pred: &'a Pred, field: &str) -> Option<&'a str> {
@@ -810,23 +880,13 @@ pub(crate) fn agg_sum_filtered(
         } else {
             sum_rows(rows)
         };
-        let mut row = crate::store::acquire_row();
-        row.insert(fk, Cell::Float(total.value()));
-        return Ok(vec![row]);
+        return Ok(vec![single_cell_row(&fk, Cell::Float(total.value()))]);
     };
     let bk = by.as_str();
     let sum_rows_out = |map: FxHashMap<Cell, crate::exact_sum::ExactSum>| -> Vec<Row> {
         let mut entries: Vec<(Cell, crate::exact_sum::ExactSum)> = map.into_iter().collect();
         entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-        entries
-            .into_iter()
-            .map(|(cell, n)| {
-                let mut row = crate::store::acquire_row();
-                row.insert(bk.clone(), cell);
-                row.insert(fk.clone(), Cell::Float(n.value()));
-                row
-            })
-            .collect()
+        pair_entries_to_rows(&bk, &fk, entries, |n| Cell::Float(n.value()))
     };
     if rows.len() >= PAR_AGG_MIN_ROWS
         && let Some(map) = chunked_group_fold::<crate::exact_sum::ExactSum>(
@@ -851,9 +911,12 @@ pub(crate) fn agg_sum_filtered(
         if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-        if !map.contains_key(&cell) {
-            let key_size = match &cell {
+        let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+        let val = value_slot.get(r);
+        if let Some(acc) = map.get_mut(key_ref) {
+            acc.add_cell(val);
+        } else {
+            let key_size = match key_ref {
                 Cell::Text(s) => s.len() + 32,
                 _ => 16,
             };
@@ -871,8 +934,10 @@ pub(crate) fn agg_sum_filtered(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
             }
+            let mut acc = crate::exact_sum::ExactSum::default();
+            acc.add_cell(val);
+            map.insert(key_ref.clone_for_borrow(), acc);
         }
-        map.entry(cell).or_default().add_cell(value_slot.get(r));
     }
     Ok(sum_rows_out(map))
 }
@@ -951,9 +1016,7 @@ pub(crate) fn agg_extremum_filtered(
         };
         #[cfg(not(feature = "parallel"))]
         let best = best_of(rows);
-        let mut row = crate::store::acquire_row();
-        row.insert(fk, best.unwrap_or(Cell::Null));
-        return Ok(vec![row]);
+        return Ok(vec![single_cell_row(&fk, best.unwrap_or(Cell::Null))]);
     };
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, Option<Cell>> = FxHashMap::default();
@@ -997,9 +1060,16 @@ pub(crate) fn agg_extremum_filtered(
         if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-        if !map.contains_key(&cell) {
-            let key_size = match &cell {
+        let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+        let f_val = value_slot.get(r).filter(|c| !matches!(c, Cell::Null));
+        if let Some(entry) = map.get_mut(key_ref) {
+            if let Some(c) = f_val
+                && entry.as_ref().is_none_or(|prev| is_better(c, prev))
+            {
+                *entry = Some(c.clone_for_borrow());
+            }
+        } else {
+            let key_size = match key_ref {
                 Cell::Text(s) => s.len() + 32,
                 _ => 16,
             };
@@ -1018,33 +1088,17 @@ pub(crate) fn agg_extremum_filtered(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
             }
-        }
-        let f_val = value_slot.get(r).filter(|c| !matches!(c, Cell::Null));
-        let entry = map.entry(cell).or_insert(None);
-        if let Some(c) = f_val {
-            *entry = Some(match entry.take() {
-                None => c.clone_for_borrow(),
-                Some(prev) => {
-                    if is_better(c, &prev) {
-                        c.clone_for_borrow()
-                    } else {
-                        prev
-                    }
-                }
-            });
+            map.insert(
+                key_ref.clone_for_borrow(),
+                f_val.map(Cell::clone_for_borrow),
+            );
         }
     }
     let mut entries: Vec<(Cell, Option<Cell>)> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    Ok(entries
-        .into_iter()
-        .map(|(gcell, val)| {
-            let mut row = crate::store::acquire_row();
-            row.insert(bk.clone(), gcell);
-            row.insert(fk.clone(), val.unwrap_or(Cell::Null));
-            row
-        })
-        .collect())
+    Ok(pair_entries_to_rows(&bk, &fk, entries, |val| {
+        val.unwrap_or(Cell::Null)
+    }))
 }
 
 pub(crate) fn agg_avg(
@@ -1111,9 +1165,7 @@ pub(crate) fn agg_avg_filtered(
         } else {
             sum.value() / (count as f64)
         };
-        let mut row = crate::store::acquire_row();
-        row.insert(fk, Cell::Float(avg));
-        return Ok(vec![row]);
+        return Ok(vec![single_cell_row(&fk, Cell::Float(avg))]);
     };
     let bk = by.as_str();
     let mut map: FxHashMap<Cell, (crate::exact_sum::ExactSum, usize)> = FxHashMap::default();
@@ -1148,9 +1200,14 @@ pub(crate) fn agg_avg_filtered(
         if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
             continue;
         }
-        let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-        if !map.contains_key(&cell) {
-            let key_size = match &cell {
+        let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+        let value = value_slot.get(r);
+        if let Some(entry) = map.get_mut(key_ref) {
+            if entry.0.add_numeric(value) {
+                entry.1 += 1;
+            }
+        } else {
+            let key_size = match key_ref {
                 Cell::Text(s) => s.len() + 32,
                 _ => 16,
             };
@@ -1168,29 +1225,22 @@ pub(crate) fn agg_avg_filtered(
                     "aggregate state bytes {state_bytes} exceeds max_aggregate_bytes quota {max_bytes}"
                 )));
             }
-        }
-        let value = value_slot.get(r);
-        let entry = map.entry(cell).or_default();
-        if entry.0.add_numeric(value) {
-            entry.1 += 1;
+            let mut acc = (crate::exact_sum::ExactSum::default(), 0usize);
+            if acc.0.add_numeric(value) {
+                acc.1 = 1;
+            }
+            map.insert(key_ref.clone_for_borrow(), acc);
         }
     }
     let mut entries: Vec<(Cell, (crate::exact_sum::ExactSum, usize))> = map.into_iter().collect();
     entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
-    Ok(entries
-        .into_iter()
-        .map(|(gcell, (sum, count))| {
-            let avg = if count == 0 {
-                0.0
-            } else {
-                sum.value() / (count as f64)
-            };
-            let mut row = crate::store::acquire_row();
-            row.insert(bk.clone(), gcell);
-            row.insert(fk.clone(), Cell::Float(avg));
-            row
+    Ok(pair_entries_to_rows(&bk, &fk, entries, |(sum, count)| {
+        Cell::Float(if count == 0 {
+            0.0
+        } else {
+            sum.value() / (count as f64)
         })
-        .collect())
+    }))
 }
 
 /// Join key of a cell without allocating for text (ints keep joining to equal text).
@@ -1378,7 +1428,11 @@ impl Db {
                     slot1_cnt += 1;
                 } else {
                     let map = overflow.get_or_insert_with(FxHashMap::default);
-                    *map.entry(Arc::clone(w_arc)).or_insert(0) += 1;
+                    if let Some(cnt) = map.get_mut(w) {
+                        *cnt += 1;
+                    } else {
+                        map.insert(Arc::clone(w_arc), 1);
+                    }
                 }
             }
         }
@@ -1680,11 +1734,13 @@ impl Db {
             && let Some(pred) = &plan.filter
             && let Some(value) = eq_value_for_field(pred, &by.as_str())
         {
-            let cached_or_fresh = plan.index_plan.clone().or_else(|| {
+            let fresh_idx = if plan.index_plan.is_none() {
                 crate::index::pick_index_with_coverage(&self.catalog, &plan.collection, pred)
-            });
-            if let Some((uses, true)) = cached_or_fresh
-                && let Some(n) = self.store.index_seek_count(&plan.collection, &uses, now)
+            } else {
+                None
+            };
+            if let Some((uses, true)) = plan.index_plan.as_ref().or(fresh_idx.as_ref())
+                && let Some(n) = self.store.index_seek_count(&plan.collection, uses, now)
             {
                 if n == 0 {
                     return Ok(Vec::new());
@@ -1701,13 +1757,86 @@ impl Db {
         }
         // 1. SoA paths for orders
         if plan.collection == "orders" && self.store.orders_soa_ready() {
+            let max_bytes = self.quotas.max_aggregate_bytes;
             match &plan.kind {
+                AggKind::Count { by: Some(by_field) }
+                    if by_field.leaf() == Some("user_id") && plan.filter.is_none() =>
+                {
+                    let out_key = by_field.as_str();
+                    if let Some(live_idx) = self.store.indexes.values().find(|idx| {
+                        idx.def.collection == "orders"
+                            && idx.def.pred.is_none()
+                            && idx.def.fields.len() == 1
+                            && idx.def.fields[0] == "user_id"
+                    }) {
+                        let mut entries: Vec<(Cell, i64)> =
+                            Vec::with_capacity(live_idx.forward.len());
+                        let mut state_bytes = 0usize;
+                        let mut ok_quota = true;
+                        for (key, list) in &live_idx.forward {
+                            let c = list.len() as i64;
+                            if c == 0 {
+                                continue;
+                            }
+                            let uid_cell = match key.0.first() {
+                                Some(crate::index::IndexPart::Text(s)) => {
+                                    state_bytes = state_bytes.saturating_add(s.len() + 32 + 64);
+                                    Cell::from_arc_str(s)
+                                }
+                                Some(crate::index::IndexPart::SmallText(s)) => {
+                                    state_bytes = state_bytes.saturating_add(16 + 64);
+                                    Cell::SmallText(*s)
+                                }
+                                _ => continue,
+                            };
+                            if state_bytes > max_bytes {
+                                ok_quota = false;
+                                break;
+                            }
+                            entries.push((uid_cell, c));
+                        }
+                        if ok_quota {
+                            return Ok(pair_entries_to_rows(&out_key, "hits", entries, Cell::Int));
+                        }
+                    } else {
+                        let uids = self.store.orders_user_id();
+                        let mut map: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+                        map.reserve((uids.len() / 8).clamp(64, 4096));
+                        let mut state_bytes = 0usize;
+                        let mut ok_quota = true;
+                        for uid in uids {
+                            if let Some(cnt) = map.get_mut(uid.as_ref()) {
+                                *cnt += 1;
+                            } else {
+                                let ksz = if uid.len() <= 22 { 16 } else { uid.len() + 32 };
+                                state_bytes = state_bytes.saturating_add(ksz + 64);
+                                if state_bytes > max_bytes {
+                                    ok_quota = false;
+                                    break;
+                                }
+                                map.insert(Arc::clone(uid), 1);
+                            }
+                        }
+                        if ok_quota {
+                            let mut entries: Vec<(Arc<str>, i64)> = map.into_iter().collect();
+                            entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                            let cell_entries: Vec<(Cell, i64)> = entries
+                                .into_iter()
+                                .map(|(uid, c)| (Cell::from_arc_str(&uid), c))
+                                .collect();
+                            return Ok(pair_entries_to_rows(
+                                &out_key,
+                                "hits",
+                                cell_entries,
+                                Cell::Int,
+                            ));
+                        }
+                    }
+                }
                 AggKind::Sum { field, by } if field.leaf() == Some("total") => {
                     if by.is_none() && plan.filter.is_none() {
                         let total: f64 = self.store.orders_total().iter().sum();
-                        let mut row = crate::store::acquire_row();
-                        row.insert("total", Cell::Float(total));
-                        return Ok(vec![row]);
+                        return Ok(vec![single_cell_row("total", Cell::Float(total))]);
                     }
                     if let Some(by_field) = by
                         && by_field.leaf() == Some("user_id")
@@ -1720,14 +1849,16 @@ impl Db {
                                     && idx.def.fields[0] == "user_id"
                             }) {
                                 let totals = self.store.orders_total();
-                                let mut out = Vec::with_capacity(live_idx.forward.len());
+                                let single_col = live_idx.def.fields.len() == 1;
+                                let mut entries: Vec<(Cell, f64)> =
+                                    Vec::with_capacity(live_idx.forward.len());
                                 for (key, list) in &live_idx.forward {
                                     let uid_cell = match key.0.first() {
                                         Some(crate::index::IndexPart::Text(s)) => {
-                                            Cell::Text(Arc::clone(s))
+                                            Cell::from_arc_str(s)
                                         }
                                         Some(crate::index::IndexPart::SmallText(s)) => {
-                                            Cell::text_arc(s.as_str())
+                                            Cell::SmallText(*s)
                                         }
                                         _ => continue,
                                     };
@@ -1744,12 +1875,21 @@ impl Db {
                                             });
                                         }
                                     }
-                                    let mut row = crate::store::acquire_row();
-                                    row.insert("user_id", uid_cell);
-                                    row.insert("total", Cell::Float(sum));
-                                    out.push(row);
+                                    if !single_col
+                                        && let Some((last_k, last_sum)) = entries.last_mut()
+                                        && *last_k == uid_cell
+                                    {
+                                        *last_sum += sum;
+                                    } else {
+                                        entries.push((uid_cell, sum));
+                                    }
                                 }
-                                return Ok(out);
+                                return Ok(pair_entries_to_rows(
+                                    "user_id",
+                                    "total",
+                                    entries,
+                                    Cell::Float,
+                                ));
                             }
                             let uids = self.store.orders_user_id();
                             let totals = self.store.orders_total();
@@ -1765,15 +1905,16 @@ impl Db {
                             }
                             let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
                             entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                            return Ok(entries
+                            let cell_entries: Vec<(Cell, f64)> = entries
                                 .into_iter()
-                                .map(|(uid, tot)| {
-                                    let mut row = crate::store::acquire_row();
-                                    row.insert("user_id", Cell::Text(uid));
-                                    row.insert("total", Cell::Float(tot));
-                                    row
-                                })
-                                .collect());
+                                .map(|(uid, tot)| (Cell::from_arc_str(&uid), tot))
+                                .collect();
+                            return Ok(pair_entries_to_rows(
+                                "user_id",
+                                "total",
+                                cell_entries,
+                                Cell::Float,
+                            ));
                         } else if let Some(Pred::Cmp {
                             field: filt_field,
                             op: CmpOp::Gt,
@@ -1802,15 +1943,16 @@ impl Db {
                                 }
                                 let mut entries: Vec<(Arc<str>, f64)> = map.into_iter().collect();
                                 entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                                return Ok(entries
+                                let cell_entries: Vec<(Cell, f64)> = entries
                                     .into_iter()
-                                    .map(|(uid, tot)| {
-                                        let mut row = crate::store::acquire_row();
-                                        row.insert("user_id", Cell::Text(uid));
-                                        row.insert("total", Cell::Float(tot));
-                                        row
-                                    })
-                                    .collect());
+                                    .map(|(uid, tot)| (Cell::from_arc_str(&uid), tot))
+                                    .collect();
+                                return Ok(pair_entries_to_rows(
+                                    "user_id",
+                                    "total",
+                                    cell_entries,
+                                    Cell::Float,
+                                ));
                             }
                         }
                     }
@@ -1824,79 +1966,100 @@ impl Db {
                     } else {
                         totals.iter().sum::<f64>() / totals.len() as f64
                     };
-                    let mut row = crate::store::acquire_row();
-                    row.insert("total", Cell::Float(avg));
-                    return Ok(vec![row]);
+                    return Ok(vec![single_cell_row("total", Cell::Float(avg))]);
                 }
                 _ => {}
             }
         }
 
-        // 2. SoA paths for docs
+        // 2. SoA paths for docs (`wing` and `layer`)
         if plan.collection == "docs"
             && !self.store.is_disk_backed("docs")
-            && self.store.docs_wing().len() == self.store.collection("docs").len()
+            && plan.filter.is_none()
+            && let AggKind::Count { by: Some(by_field) } = &plan.kind
+            && let Some(col_leaf @ ("wing" | "layer")) = by_field.leaf()
         {
-            if let AggKind::Count { by: Some(by_field) } = &plan.kind
-                && by_field.leaf() == Some("wing")
-                && plan.filter.is_none()
-            {
-                let wings = self.store.docs_wing();
-                if let Some((indices, dict)) = wings.as_indices() {
-                    let mut counts0 = [0i64; 256];
-                    let mut counts1 = [0i64; 256];
-                    let mut counts2 = [0i64; 256];
-                    let mut counts3 = [0i64; 256];
-                    let chunks = indices.chunks_exact(4);
-                    let rem = chunks.remainder();
-                    for c in chunks {
-                        counts0[c[0] as usize] += 1;
-                        counts1[c[1] as usize] += 1;
-                        counts2[c[2] as usize] += 1;
-                        counts3[c[3] as usize] += 1;
-                    }
-                    for &b in rem {
-                        counts0[b as usize] += 1;
-                    }
-                    let mut entries: Vec<(Arc<str>, i64)> = Vec::with_capacity(dict.len());
-                    for (idx, arc) in dict.iter().enumerate() {
-                        let c = counts0[idx] + counts1[idx] + counts2[idx] + counts3[idx];
-                        if c > 0 {
-                            entries.push((Arc::clone(arc), c));
+            let docs_len = self.store.collection("docs").len();
+            let dict_col = if col_leaf == "wing" {
+                self.store.docs_wing()
+            } else {
+                self.store.docs_layer()
+            };
+            if dict_col.len() == docs_len {
+                let entries: Vec<(Arc<str>, i64)> =
+                    if let Some((indices, dict)) = dict_col.as_indices() {
+                        let mut counts0 = [0i64; 256];
+                        let mut counts1 = [0i64; 256];
+                        let mut counts2 = [0i64; 256];
+                        let mut counts3 = [0i64; 256];
+                        let chunks = indices.chunks_exact(4);
+                        let rem = chunks.remainder();
+                        for c in chunks {
+                            counts0[c[0] as usize] += 1;
+                            counts1[c[1] as usize] += 1;
+                            counts2[c[2] as usize] += 1;
+                            counts3[c[3] as usize] += 1;
                         }
-                    }
-                    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                    return Ok(entries
+                        for &b in rem {
+                            counts0[b as usize] += 1;
+                        }
+                        let mut v: Vec<(Arc<str>, i64)> = Vec::with_capacity(dict.len());
+                        for (idx, arc) in dict.iter().enumerate() {
+                            let c = counts0[idx] + counts1[idx] + counts2[idx] + counts3[idx];
+                            if c > 0 {
+                                v.push((Arc::clone(arc), c));
+                            }
+                        }
+                        v.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                        v
+                    } else {
+                        let col_vec = dict_col.to_vec();
+                        let (s0, s1, overflow) = Self::count_arc_slice_low_cardinality(&col_vec);
+                        let mut combined: FxHashMap<Arc<str>, i64> = overflow.unwrap_or_default();
+                        if let Some((k, v)) = s0 {
+                            *combined.entry(k).or_insert(0) += v;
+                        }
+                        if let Some((k, v)) = s1 {
+                            *combined.entry(k).or_insert(0) += v;
+                        }
+                        let mut v: Vec<(Arc<str>, i64)> = combined.into_iter().collect();
+                        v.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                        v
+                    };
+                let state_bytes: usize = entries
+                    .iter()
+                    .map(|(arc, _)| (if arc.len() <= 22 { 16 } else { arc.len() + 32 }) + 64)
+                    .sum();
+                if state_bytes <= self.quotas.max_aggregate_bytes {
+                    let cell_entries: Vec<(Cell, i64)> = entries
                         .into_iter()
-                        .map(|(w, count)| {
-                            let mut row = crate::store::acquire_row();
-                            row.insert("wing", Cell::Text(w));
-                            row.insert("hits", Cell::Int(count));
-                            row
-                        })
-                        .collect());
-                } else {
-                    let wings_vec = wings.to_vec();
-                    let (s0, s1, overflow) = Self::count_arc_slice_low_cardinality(&wings_vec);
-                    let mut combined: FxHashMap<Arc<str>, i64> = overflow.unwrap_or_default();
-                    if let Some((k, v)) = s0 {
-                        *combined.entry(k).or_insert(0) += v;
-                    }
-                    if let Some((k, v)) = s1 {
-                        *combined.entry(k).or_insert(0) += v;
-                    }
-                    let mut entries: Vec<(Arc<str>, i64)> = combined.into_iter().collect();
-                    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-                    return Ok(entries
-                        .into_iter()
-                        .map(|(w, count)| {
-                            let mut row = crate::store::acquire_row();
-                            row.insert("wing", Cell::Text(w));
-                            row.insert("hits", Cell::Int(count));
-                            row
-                        })
-                        .collect());
+                        .map(|(arc, count)| (Cell::from_arc_str(&arc), count))
+                        .collect();
+                    return Ok(pair_entries_to_rows(
+                        col_leaf,
+                        "hits",
+                        cell_entries,
+                        Cell::Int,
+                    ));
                 }
+            }
+        }
+
+        // 2b. Declared ColMirror dictionary-code histogram counting for general collections
+        if let AggKind::Count { by: Some(by_field) } = &plan.kind
+            && let Some(by_leaf) = by_field.leaf()
+            && let Some(mirror) = self.get_or_build_mirror(&plan.collection)
+            && let Some(map) = mirror.group_count(by_leaf, plan.filter.as_ref(), now)
+        {
+            let state_bytes: usize = map
+                .keys()
+                .map(|c| match c {
+                    Cell::Text(s) => s.len() + 32 + 64,
+                    _ => 16 + 64,
+                })
+                .sum();
+            if state_bytes <= self.quotas.max_aggregate_bytes {
+                return Ok(count_cell_map_to_rows(&by_field.as_str(), map));
             }
         }
 
@@ -1925,9 +2088,7 @@ impl Db {
                             total.add_cell(cell);
                         }
                     }
-                    let mut row = crate::store::acquire_row();
-                    row.insert(fk, Cell::Float(total.value()));
-                    return Ok(vec![row]);
+                    return Ok(vec![single_cell_row(&fk, Cell::Float(total.value()))]);
                 }
                 AggKind::Avg { field, by: None } => {
                     let fk = field.as_str();
@@ -1949,9 +2110,7 @@ impl Db {
                     } else {
                         sum.value() / (count as f64)
                     };
-                    let mut row = crate::store::acquire_row();
-                    row.insert(fk, Cell::Float(avg));
-                    return Ok(vec![row]);
+                    return Ok(vec![single_cell_row(&fk, Cell::Float(avg))]);
                 }
                 AggKind::Min { field, by: None } | AggKind::Max { field, by: None } => {
                     let is_max = matches!(plan.kind, AggKind::Max { .. });
@@ -1965,23 +2124,18 @@ impl Db {
                                 None => r.get(&fk),
                             }
                             .filter(|c| !matches!(c, Cell::Null))
-                        {
-                            best = Some(match best {
-                                None => c.clone_for_borrow(),
-                                Some(prev) => {
-                                    let better = if is_max {
-                                        cmp_sort(c, &prev).is_gt()
-                                    } else {
-                                        cmp_sort(c, &prev).is_lt()
-                                    };
-                                    if better { c.clone_for_borrow() } else { prev }
+                            && best.as_ref().is_none_or(|prev| {
+                                if is_max {
+                                    cmp_sort(c, prev).is_gt()
+                                } else {
+                                    cmp_sort(c, prev).is_lt()
                                 }
-                            });
+                            })
+                        {
+                            best = Some(c.clone_for_borrow());
                         }
                     }
-                    let mut row = crate::store::acquire_row();
-                    row.insert(fk, best.unwrap_or(Cell::Null));
-                    return Ok(vec![row]);
+                    return Ok(vec![single_cell_row(&fk, best.unwrap_or(Cell::Null))]);
                 }
                 _ => {}
             }
@@ -2132,13 +2286,15 @@ impl Db {
                     return Some(vec![hits_row(rows.len() as i64)]);
                 };
                 let by_key = by_field.as_str();
+                let mut key_slot = FieldSlot::new(&by_key);
                 let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
                 for r in &rows {
-                    let cell = r
-                        .get(&by_key)
-                        .map(Cell::clone_for_borrow)
-                        .unwrap_or(Cell::Null);
-                    *map.entry(cell).or_insert(0) += 1;
+                    let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+                    if let Some(cnt) = map.get_mut(key_ref) {
+                        *cnt += 1;
+                    } else {
+                        map.insert(key_ref.clone_for_borrow(), 1);
+                    }
                 }
                 return Some(count_cell_map_to_rows(&by_key, map));
             }
@@ -2200,37 +2356,48 @@ impl Db {
                 return Some(vec![count_row(&by_key, v, n as i64)]);
             }
             let idxs = self.store.index_seek(name, uses, now)?;
+            let col_rows = self.store.collection(name);
+            let mut key_slot = FieldSlot::new(&by_key);
             let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
             for i in idxs {
-                let Some(row) = self.store.get_by_idx(name, i) else {
+                let Some(row) = col_rows.get(i) else {
                     continue;
                 };
-                let cell = row
-                    .get(&by_key)
-                    .map(Cell::clone_for_borrow)
-                    .unwrap_or(Cell::Null);
-                *map.entry(cell).or_insert(0) += 1;
+                let key_ref = key_slot.get(row).unwrap_or(&NULL_CELL);
+                if let Some(cnt) = map.get_mut(key_ref) {
+                    *cnt += 1;
+                } else {
+                    map.insert(key_ref.clone_for_borrow(), 1);
+                }
             }
             return Some(count_cell_map_to_rows(&by_key, map));
         }
 
-        if let Some(idxs) = self.mirror_select(name, pred, now) {
-            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
-            let mut key_slot = FieldSlot::new(&by_key);
-            for i in idxs {
-                let Some(row) = self.store.get_by_idx(name, i) else {
-                    continue;
-                };
-                let cell = key_slot
-                    .get(row)
-                    .map(Cell::clone_for_borrow)
-                    .unwrap_or(Cell::Null);
-                *map.entry(cell).or_insert(0) += 1;
-            }
+        if let Some(by_leaf) = by_field.leaf()
+            && let Some(mirror) = self.get_or_build_mirror(name)
+            && let Some(map) = mirror.group_count(by_leaf, Some(pred), now)
+        {
             return Some(count_cell_map_to_rows(&by_key, map));
         }
 
         let col = self.store.collection(name);
+        if let Some(idxs) = self.mirror_select(name, pred, now) {
+            let mut map: FxHashMap<Cell, i64> = FxHashMap::default();
+            let mut key_slot = FieldSlot::new(&by_key);
+            for i in idxs {
+                let Some(row) = col.get(i) else {
+                    continue;
+                };
+                let key_ref = key_slot.get(row).unwrap_or(&NULL_CELL);
+                if let Some(cnt) = map.get_mut(key_ref) {
+                    *cnt += 1;
+                } else {
+                    map.insert(key_ref.clone_for_borrow(), 1);
+                }
+            }
+            return Some(count_cell_map_to_rows(&by_key, map));
+        }
+
         if let Some(map) = scoped_par_count_by(col, Some(pred), now, &by_key, usize::MAX) {
             return Some(count_cell_map_to_rows(&by_key, map));
         }
@@ -2239,8 +2406,12 @@ impl Db {
         let mut key_slot = FieldSlot::new(&by_key);
         for r in col {
             if flt.eval(r, now) {
-                let cell = key_slot.get(r).map(Cell::clone_for_borrow).unwrap_or(Cell::Null);
-                *map.entry(cell).or_insert(0) += 1;
+                let key_ref = key_slot.get(r).unwrap_or(&NULL_CELL);
+                if let Some(cnt) = map.get_mut(key_ref) {
+                    *cnt += 1;
+                } else {
+                    map.insert(key_ref.clone_for_borrow(), 1);
+                }
             }
         }
         Some(count_cell_map_to_rows(&by_key, map))
@@ -2315,7 +2486,39 @@ impl Db {
             agg_summarize_disk(&eng, name, filter, now, specs, by, &sum_f64_flags, max_bytes)?
         } else {
             let col = self.store.collection(name);
-            agg_summarize(col, filter, now, specs, by, &sum_f64_flags, max_bytes)?
+            if let Some(pred) = filter {
+                if let Some((uses, covered)) =
+                    crate::index::pick_index_with_coverage(&self.catalog, name, pred)
+                    && let Some(idxs) = self.store.index_seek(name, &uses, now)
+                {
+                    let residual = if covered { None } else { Some(pred) };
+                    agg_summarize_indexed(
+                        col,
+                        &idxs,
+                        residual,
+                        now,
+                        specs,
+                        by,
+                        &sum_f64_flags,
+                        max_bytes,
+                    )?
+                } else if let Some(idxs) = self.mirror_select(name, pred, now) {
+                    agg_summarize_indexed(
+                        col,
+                        &idxs,
+                        None,
+                        now,
+                        specs,
+                        by,
+                        &sum_f64_flags,
+                        max_bytes,
+                    )?
+                } else {
+                    agg_summarize(col, filter, now, specs, by, &sum_f64_flags, max_bytes)?
+                }
+            } else {
+                agg_summarize(col, filter, now, specs, by, &sum_f64_flags, max_bytes)?
+            }
         };
 
         for step in &tail {
@@ -2532,7 +2735,7 @@ impl DCountAcc {
         }
     }
 
-    fn finish(self) -> i64 {
+    fn finish_ref(&self) -> i64 {
         match self {
             DCountAcc::Exact(set) => set.len() as i64,
             DCountAcc::Hll(regs) => {
@@ -2544,7 +2747,7 @@ impl DCountAcc {
                     if r == 0 {
                         zeros += 1;
                     }
-                    sum_inv += 2.0f64.powi(-(i32::from(r)));
+                    sum_inv += f64::from_bits((1023u64.saturating_sub(u64::from(r))) << 52);
                 }
                 let raw = alpha * m * m / sum_inv;
                 let est = if raw <= 2.5 * m && zeros > 0 {
@@ -2555,6 +2758,10 @@ impl DCountAcc {
                 est.round().max(0.0) as i64
             }
         }
+    }
+
+    fn finish(self) -> i64 {
+        self.finish_ref()
     }
 
     fn merge(&mut self, other: DCountAcc, state_bytes: &mut usize, max_bytes: usize) -> Result<(), Error> {
@@ -2678,27 +2885,28 @@ impl TDigest {
             (TDIGEST_DELTA / (2.0 * std::f64::consts::PI))
                 * (2.0 * q.clamp(0.0, 1.0) - 1.0).asin()
         };
-        let mut merged: Vec<(f64, f64)> = Vec::with_capacity(self.centroids.len().min(128));
-        let mut it = self.centroids.drain(..);
-        let (mut cur_m, mut cur_w) = it.next().unwrap();
+        let (mut cur_m, mut cur_w) = self.centroids[0];
         let mut weight_so_far = 0.0f64;
         let mut k_limit = k_of(0.0) + 1.0;
-        for (m, w) in it {
+        let mut write_idx = 0usize;
+        for i in 1..self.centroids.len() {
+            let (m, w) = self.centroids[i];
             let next_q = (weight_so_far + cur_w + w) / total;
             if k_of(next_q) <= k_limit {
                 let new_w = cur_w + w;
                 cur_m = (cur_m * cur_w + m * w) / new_w;
                 cur_w = new_w;
             } else {
-                merged.push((cur_m, cur_w));
+                self.centroids[write_idx] = (cur_m, cur_w);
+                write_idx += 1;
                 weight_so_far += cur_w;
                 k_limit = k_of(weight_so_far / total) + 1.0;
                 cur_m = m;
                 cur_w = w;
             }
         }
-        merged.push((cur_m, cur_w));
-        self.centroids = merged;
+        self.centroids[write_idx] = (cur_m, cur_w);
+        self.centroids.truncate(write_idx + 1);
     }
 
     fn quantile(&mut self, pct: f64) -> Option<f64> {
@@ -2824,33 +3032,46 @@ impl PercentileAcc {
         }
     }
 
-    fn finish(self, pct: f64) -> Cell {
+    fn finish_ref(&mut self, pct: f64) -> Cell {
         let val = match self {
-            PercentileAcc::Exact(mut vals) => {
-                if vals.is_empty() {
+            PercentileAcc::Exact(vals) => {
+                let n = vals.len();
+                if n == 0 {
                     None
+                } else if n == 1 {
+                    Some(vals[0])
+                } else if pct <= 0.0 {
+                    vals.iter().copied().min_by(f64::total_cmp)
+                } else if pct >= 100.0 {
+                    vals.iter().copied().max_by(f64::total_cmp)
                 } else {
-                    vals.sort_by(f64::total_cmp);
-                    let n = vals.len();
-                    if pct <= 0.0 {
-                        Some(vals[0])
-                    } else if pct >= 100.0 {
-                        Some(vals[n - 1])
+                    let pos = (pct / 100.0) * ((n - 1) as f64);
+                    let lo = pos.floor() as usize;
+                    let hi = pos.ceil() as usize;
+                    let (_, &mut lo_val, upper) = vals.select_nth_unstable_by(lo, f64::total_cmp);
+                    if lo == hi {
+                        Some(lo_val)
                     } else {
-                        let pos = (pct / 100.0) * ((n - 1) as f64);
-                        let lo = pos.floor() as usize;
-                        let hi = pos.ceil() as usize;
+                        let hi_val = upper
+                            .iter()
+                            .copied()
+                            .min_by(f64::total_cmp)
+                            .unwrap_or(lo_val);
                         let w = pos - (lo as f64);
-                        Some(vals[lo] + (vals[hi] - vals[lo]) * w)
+                        Some(lo_val + (hi_val - lo_val) * w)
                     }
                 }
             }
-            PercentileAcc::Digest(mut td) => td.quantile(pct),
+            PercentileAcc::Digest(td) => td.quantile(pct),
         };
         match val {
             Some(v) => Cell::Float(if v == 0.0 { 0.0 } else { v }),
             None => Cell::Null,
         }
+    }
+
+    fn finish(mut self, pct: f64) -> Cell {
+        self.finish_ref(pct)
     }
 
     fn merge(
@@ -2910,14 +3131,14 @@ impl PercentileAcc {
     }
 }
 
+type AccVec = SmallVec<[MetricAcc; 2]>;
+
 #[derive(Clone)]
 pub(crate) enum MetricAcc {
     Count(i64),
     Sum {
-        int_sum: i128,
         exact: crate::exact_sum::ExactSum,
         saw_float: bool,
-        int_overflow: bool,
         prefer_f64: bool,
     },
     Avg {
@@ -2942,10 +3163,8 @@ impl MetricAcc {
         match &spec.func {
             AggFunc::Count => Self::Count(0),
             AggFunc::Sum(_) => Self::Sum {
-                int_sum: 0,
                 exact: crate::exact_sum::ExactSum::default(),
                 saw_float: false,
-                int_overflow: false,
                 prefer_f64,
             },
             AggFunc::Avg(_) => Self::Avg {
@@ -2982,19 +3201,11 @@ impl MetricAcc {
                 *n += 1;
             }
             MetricAcc::Sum {
-                int_sum,
-                exact,
-                saw_float,
-                int_overflow,
-                ..
+                exact, saw_float, ..
             } => match c1 {
                 Cell::Null => {}
                 Cell::Int(i) => {
                     exact.add_i64(*i);
-                    match int_sum.checked_add(i128::from(*i)) {
-                        Some(s) => *int_sum = s,
-                        None => *int_overflow = true,
-                    }
                 }
                 other => {
                     if let Some(f) = other.as_f64() {
@@ -3050,21 +3261,52 @@ impl MetricAcc {
         Ok(())
     }
 
+    fn finish_ref(&mut self) -> Cell {
+        match self {
+            MetricAcc::Count(n) => Cell::Int(*n),
+            MetricAcc::Sum {
+                exact,
+                saw_float,
+                prefer_f64,
+            } => {
+                let int_sum = exact.int_part();
+                if *saw_float || int_sum < i128::from(i64::MIN) || int_sum > i128::from(i64::MAX) {
+                    Cell::Float(exact.value())
+                } else if int_sum == 0 && *prefer_f64 {
+                    Cell::Float(0.0)
+                } else {
+                    Cell::Int(int_sum as i64)
+                }
+            }
+            MetricAcc::Avg { sum, count } => {
+                if *count == 0 {
+                    Cell::Float(0.0)
+                } else {
+                    Cell::Float(sum.value() / (*count as f64))
+                }
+            }
+            MetricAcc::Min(v) | MetricAcc::Max(v) => {
+                v.as_ref().map(Cell::clone_for_borrow).unwrap_or(Cell::Null)
+            }
+            MetricAcc::DCount(acc) => Cell::Int(acc.finish_ref()),
+            MetricAcc::Percentile { pct, acc } => acc.finish_ref(*pct),
+            MetricAcc::ArgExtremumScalar { best, .. } => best
+                .as_ref()
+                .map(|(_, v)| v.clone_for_borrow())
+                .unwrap_or(Cell::Null),
+        }
+    }
+
     fn finish(self) -> Cell {
         match self {
             MetricAcc::Count(n) => Cell::Int(n),
             MetricAcc::Sum {
-                int_sum,
                 exact,
                 saw_float,
-                int_overflow,
                 prefer_f64,
             } => {
-                if saw_float
-                    || int_overflow
-                    || int_sum < i128::from(i64::MIN)
-                    || int_sum > i128::from(i64::MAX)
-                {
+                let int_sum = exact.int_part();
+                if saw_float || int_sum < i128::from(i64::MIN) || int_sum > i128::from(i64::MAX) {
                     Cell::Float(exact.value())
                 } else if int_sum == 0 && prefer_f64 {
                     Cell::Float(0.0)
@@ -3099,27 +3341,18 @@ impl MetricAcc {
             }
             (
                 MetricAcc::Sum {
-                    int_sum,
                     exact,
                     saw_float,
-                    int_overflow,
                     prefer_f64,
                 },
                 MetricAcc::Sum {
-                    int_sum: o_int,
                     exact: o_exact,
                     saw_float: o_saw,
-                    int_overflow: o_ovf,
                     prefer_f64: o_pref,
                 },
             ) => {
-                match int_sum.checked_add(o_int) {
-                    Some(s) => *int_sum = s,
-                    None => *int_overflow = true,
-                }
                 exact.merge(o_exact);
                 *saw_float |= o_saw;
-                *int_overflow |= o_ovf;
                 *prefer_f64 |= o_pref;
                 Ok(())
             }
@@ -3211,7 +3444,7 @@ fn cmp_group_tuples(a: &[Cell], b: &[Cell]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
-fn build_accs(specs: &[AggSpec], sum_f64_flags: &[bool]) -> Vec<MetricAcc> {
+fn build_accs(specs: &[AggSpec], sum_f64_flags: &[bool]) -> AccVec {
     specs
         .iter()
         .enumerate()
@@ -3219,13 +3452,92 @@ fn build_accs(specs: &[AggSpec], sum_f64_flags: &[bool]) -> Vec<MetricAcc> {
         .collect()
 }
 
-fn emit_summarize_row(by: &[GroupKey], keys: GroupTuple, specs: &[AggSpec], accs: Vec<MetricAcc>) -> Row {
+struct SummarizeRowLayout {
+    shape: Arc<crate::store::RowShape>,
+    slots: SmallVec<[usize; 8]>,
+}
+
+impl SummarizeRowLayout {
+    fn try_new(by: &[GroupKey], specs: &[AggSpec]) -> Option<Self> {
+        let total = by.len() + specs.len();
+        if total == 0 {
+            return None;
+        }
+        let mut names: SmallVec<[&str; 8]> = SmallVec::with_capacity(total);
+        for gk in by {
+            names.push(gk.alias.as_str());
+        }
+        for sp in specs {
+            names.push(sp.alias.as_str());
+        }
+        let shape = Row::shape_of(&names);
+        if shape.names().len() != total {
+            // Duplicate output alias: fall back to sequential `insert` so last-wins holds.
+            return None;
+        }
+        let slots = names
+            .iter()
+            .map(|&nm| shape.names().iter().position(|s| s == nm).unwrap_or(0))
+            .collect();
+        Some(Self { shape, slots })
+    }
+
+    #[inline]
+    fn build_owned(&self, keys: GroupTuple, accs: AccVec) -> Row {
+        let total = self.slots.len();
+        let mut cells: SmallVec<[Cell; 4]> = smallvec::smallvec![Cell::Null; total];
+        let mut idx = 0usize;
+        for kcell in keys {
+            cells[self.slots[idx]] = kcell;
+            idx += 1;
+        }
+        for acc in accs {
+            cells[self.slots[idx]] = acc.finish();
+            idx += 1;
+        }
+        Row::from_parts(Arc::clone(&self.shape), cells)
+    }
+
+    #[inline]
+    fn build_ref(&self, keys: &[Cell], accs: &mut [MetricAcc]) -> Row {
+        let total = self.slots.len();
+        let mut cells: SmallVec<[Cell; 4]> = smallvec::smallvec![Cell::Null; total];
+        let mut idx = 0usize;
+        for kcell in keys {
+            cells[self.slots[idx]] = kcell.clone_for_borrow();
+            idx += 1;
+        }
+        for acc in accs.iter_mut() {
+            cells[self.slots[idx]] = acc.finish_ref();
+            idx += 1;
+        }
+        Row::from_parts(Arc::clone(&self.shape), cells)
+    }
+}
+
+fn emit_summarize_row(by: &[GroupKey], keys: GroupTuple, specs: &[AggSpec], accs: AccVec) -> Row {
     let mut row = crate::store::acquire_row();
     for (gk, kcell) in by.iter().zip(keys.into_iter()) {
-        row.insert(gk.alias.clone(), kcell);
+        row.insert(gk.alias.as_str(), kcell);
     }
     for (spec, acc) in specs.iter().zip(accs.into_iter()) {
-        row.insert(spec.alias.clone(), acc.finish());
+        row.insert(spec.alias.as_str(), acc.finish());
+    }
+    row
+}
+
+fn emit_summarize_row_ref(
+    by: &[GroupKey],
+    keys: &[Cell],
+    specs: &[AggSpec],
+    accs: &mut [MetricAcc],
+) -> Row {
+    let mut row = crate::store::acquire_row();
+    for (gk, kcell) in by.iter().zip(keys.iter()) {
+        row.insert(gk.alias.as_str(), kcell.clone_for_borrow());
+    }
+    for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+        row.insert(spec.alias.as_str(), acc.finish_ref());
     }
     row
 }
@@ -3278,8 +3590,8 @@ impl<'k> SpecReader<'k> {
 
 #[derive(Clone)]
 pub(crate) enum PartialSummarizeState {
-    Single(Vec<MetricAcc>),
-    Grouped(FxHashMap<GroupTuple, Vec<MetricAcc>>),
+    Single(AccVec),
+    Grouped(FxHashMap<GroupTuple, AccVec>),
 }
 
 pub(crate) fn merge_partial_states(
@@ -3324,19 +3636,164 @@ pub(crate) fn finish_partial_state(
     by: &[GroupKey],
     specs: &[AggSpec],
 ) -> Vec<Row> {
+    let layout = SummarizeRowLayout::try_new(by, specs);
     match state {
-        PartialSummarizeState::Single(accs) => {
-            vec![emit_summarize_row(by, GroupTuple::new(), specs, accs)]
-        }
+        PartialSummarizeState::Single(accs) => vec![match &layout {
+            Some(lay) => lay.build_owned(GroupTuple::new(), accs),
+            None => emit_summarize_row(by, GroupTuple::new(), specs, accs),
+        }],
         PartialSummarizeState::Grouped(groups) => {
-            let mut entries: Vec<(GroupTuple, Vec<MetricAcc>)> = groups.into_iter().collect();
+            let mut entries: Vec<(GroupTuple, AccVec)> = groups.into_iter().collect();
             entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
-            entries
-                .into_iter()
-                .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
-                .collect()
+            match &layout {
+                Some(lay) => entries
+                    .into_iter()
+                    .map(|(k, accs)| lay.build_owned(k, accs))
+                    .collect(),
+                None => entries
+                    .into_iter()
+                    .map(|(k, accs)| emit_summarize_row(by, k, specs, accs))
+                    .collect(),
+            }
         }
     }
+}
+
+pub(crate) fn finish_partial_state_ref(
+    state: &mut PartialSummarizeState,
+    by: &[GroupKey],
+    specs: &[AggSpec],
+) -> Vec<Row> {
+    let layout = SummarizeRowLayout::try_new(by, specs);
+    match state {
+        PartialSummarizeState::Single(accs) => vec![match &layout {
+            Some(lay) => lay.build_ref(&[], accs.as_mut_slice()),
+            None => emit_summarize_row_ref(by, &[], specs, accs.as_mut_slice()),
+        }],
+        PartialSummarizeState::Grouped(groups) => {
+            let mut entries: Vec<(&GroupTuple, &mut AccVec)> = groups.iter_mut().collect();
+            entries.sort_unstable_by(|(a, _), (b, _)| cmp_group_tuples(a, b));
+            match &layout {
+                Some(lay) => entries
+                    .into_iter()
+                    .map(|(k, accs)| lay.build_ref(k.as_slice(), accs.as_mut_slice()))
+                    .collect(),
+                None => entries
+                    .into_iter()
+                    .map(|(k, accs)| emit_summarize_row_ref(by, k.as_slice(), specs, accs))
+                    .collect(),
+            }
+        }
+    }
+}
+
+#[inline]
+fn push_specs_from_row(
+    r: &Row,
+    accs: &mut [MetricAcc],
+    spec_readers: &mut [SpecReader<'_>],
+    state_bytes: &mut usize,
+    max_bytes: usize,
+) -> Result<(), Error> {
+    for (acc, sr) in accs.iter_mut().zip(spec_readers.iter_mut()) {
+        let (c1, c2) = match sr {
+            SpecReader::None => (&NULL_CELL, None),
+            SpecReader::One(r1) => (r1.get(r), None),
+            SpecReader::Two(r1, r2) => (r1.get(r), Some(r2.get(r))),
+        };
+        acc.push(c1, c2, state_bytes, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn fold_summarize_rows_seq(
+    rows: &[Row],
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<PartialSummarizeState, Error> {
+    let mut flt = filter.map(PredSlots::new);
+    let mut spec_readers: Vec<SpecReader<'_>> = specs.iter().map(SpecReader::from_spec).collect();
+    let mut state_bytes = 0usize;
+
+    if by.is_empty() {
+        let mut accs = build_accs(specs, sum_f64_flags);
+        for r in rows {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
+            }
+            push_specs_from_row(r, &mut accs, &mut spec_readers, &mut state_bytes, max_bytes)?;
+        }
+        return Ok(PartialSummarizeState::Single(accs));
+    }
+
+    let mut groups: FxHashMap<GroupTuple, AccVec> = FxHashMap::default();
+    if by.len() == 1 {
+        let gk0 = &by[0];
+        let mut br0 = FieldReader::new(gk0.source_field());
+        let is_plain_field = matches!(gk0.expr, GroupExpr::Field(_));
+        for r in rows {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
+            }
+            let raw = br0.get(r);
+            let accs = if is_plain_field
+                && !matches!(raw, Cell::Float(f) if *f == 0.0 && f.is_sign_negative())
+            {
+                if let Some(accs) = groups.get_mut(std::slice::from_ref(raw)) {
+                    accs
+                } else {
+                    let gkey: GroupTuple = smallvec::smallvec![raw.clone_for_borrow()];
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, specs.len()));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    groups.entry(gkey).or_insert_with(|| build_accs(specs, sum_f64_flags))
+                }
+            } else {
+                let kcell = eval_group_cell(&gk0.expr, raw);
+                if let Some(accs) = groups.get_mut(std::slice::from_ref(&kcell)) {
+                    accs
+                } else {
+                    let gkey: GroupTuple = smallvec::smallvec![kcell];
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, specs.len()));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    groups.entry(gkey).or_insert_with(|| build_accs(specs, sum_f64_flags))
+                }
+            };
+            push_specs_from_row(r, accs, &mut spec_readers, &mut state_bytes, max_bytes)?;
+        }
+        return Ok(PartialSummarizeState::Grouped(groups));
+    }
+
+    let mut by_readers: Vec<FieldReader<'_>> = by
+        .iter()
+        .map(|gk| FieldReader::new(gk.source_field()))
+        .collect();
+    let mut gkey_buf: GroupTuple = SmallVec::with_capacity(by.len());
+    for r in rows {
+        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+            continue;
+        }
+        gkey_buf.clear();
+        for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
+            gkey_buf.push(eval_group_cell(&gk.expr, br.get(r)));
+        }
+        let accs = if let Some(accs) = groups.get_mut(gkey_buf.as_slice()) {
+            accs
+        } else {
+            state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey_buf, specs.len()));
+            check_agg_quota(state_bytes, max_bytes)?;
+            let owned_key = gkey_buf.clone();
+            groups
+                .entry(owned_key)
+                .or_insert_with(|| build_accs(specs, sum_f64_flags))
+        };
+        push_specs_from_row(r, accs, &mut spec_readers, &mut state_bytes, max_bytes)?;
+    }
+
+    Ok(PartialSummarizeState::Grouped(groups))
 }
 
 pub(crate) fn fold_summarize_rows(
@@ -3348,61 +3805,138 @@ pub(crate) fn fold_summarize_rows(
     sum_f64_flags: &[bool],
     max_bytes: usize,
 ) -> Result<PartialSummarizeState, Error> {
-    static NULL: Cell = Cell::Null;
+    #[cfg(feature = "parallel")]
+    if rows.len() >= PAR_AGG_MIN_ROWS
+        && !specs
+            .iter()
+            .any(|s| matches!(s.func, AggFunc::Percentile { .. }))
+    {
+        use rayon::prelude::*;
+        let parts: Vec<Result<PartialSummarizeState, Error>> = rows
+            .par_chunks(PAR_AGG_CHUNK_ROWS)
+            .map(|chunk| {
+                fold_summarize_rows_seq(chunk, filter, now, specs, by, sum_f64_flags, max_bytes)
+            })
+            .collect();
+        let mut iter = parts.into_iter();
+        if let Some(Ok(mut acc_state)) = iter.next() {
+            let mut ok = true;
+            for part_res in iter {
+                match part_res {
+                    Ok(part) => {
+                        if merge_partial_states(&mut acc_state, part, specs.len(), max_bytes)
+                            .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return Ok(acc_state);
+            }
+        }
+    }
+    fold_summarize_rows_seq(rows, filter, now, specs, by, sum_f64_flags, max_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agg_summarize_indexed(
+    col: &[Row],
+    idxs: &[usize],
+    filter: Option<&Pred>,
+    now: i64,
+    specs: &[AggSpec],
+    by: &[GroupKey],
+    sum_f64_flags: &[bool],
+    max_bytes: usize,
+) -> Result<Vec<Row>, Error> {
     let mut flt = filter.map(PredSlots::new);
-    let mut by_readers: Vec<FieldReader<'_>> = by
-        .iter()
-        .map(|gk| FieldReader::new(gk.source_field()))
-        .collect();
     let mut spec_readers: Vec<SpecReader<'_>> = specs.iter().map(SpecReader::from_spec).collect();
     let mut state_bytes = 0usize;
 
-    if by.is_empty() {
+    let state = if by.is_empty() {
         let mut accs = build_accs(specs, sum_f64_flags);
-        for r in rows {
+        for &i in idxs {
+            let Some(r) = col.get(i) else { continue };
             if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
                 continue;
             }
-            for (acc, sr) in accs.iter_mut().zip(spec_readers.iter_mut()) {
-                let (c1, c2) = match sr {
-                    SpecReader::None => (&NULL, None),
-                    SpecReader::One(r1) => (r1.get(r), None),
-                    SpecReader::Two(r1, r2) => (r1.get(r), Some(r2.get(r))),
-                };
-                acc.push(c1, c2, &mut state_bytes, max_bytes)?;
+            push_specs_from_row(r, &mut accs, &mut spec_readers, &mut state_bytes, max_bytes)?;
+        }
+        PartialSummarizeState::Single(accs)
+    } else if by.len() == 1 {
+        let gk0 = &by[0];
+        let mut br0 = FieldReader::new(gk0.source_field());
+        let is_plain_field = matches!(gk0.expr, GroupExpr::Field(_));
+        let mut groups: FxHashMap<GroupTuple, AccVec> = FxHashMap::default();
+        for &i in idxs {
+            let Some(r) = col.get(i) else { continue };
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
             }
-        }
-        return Ok(PartialSummarizeState::Single(accs));
-    }
-
-    let mut groups: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
-    for r in rows {
-        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
-            continue;
-        }
-        let mut gkey: GroupTuple = SmallVec::with_capacity(by.len());
-        for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
-            gkey.push(eval_group_cell(&gk.expr, br.get(r)));
-        }
-        let accs = match groups.entry(gkey) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), specs.len()));
-                check_agg_quota(state_bytes, max_bytes)?;
-                e.insert(build_accs(specs, sum_f64_flags))
-            }
-        };
-        for (acc, sr) in accs.iter_mut().zip(spec_readers.iter_mut()) {
-            let (c1, c2) = match sr {
-                SpecReader::None => (&NULL, None),
-                SpecReader::One(r1) => (r1.get(r), None),
-                SpecReader::Two(r1, r2) => (r1.get(r), Some(r2.get(r))),
+            let raw = br0.get(r);
+            let accs = if is_plain_field
+                && !matches!(raw, Cell::Float(f) if *f == 0.0 && f.is_sign_negative())
+            {
+                if let Some(accs) = groups.get_mut(std::slice::from_ref(raw)) {
+                    accs
+                } else {
+                    let gkey: GroupTuple = smallvec::smallvec![raw.clone_for_borrow()];
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, specs.len()));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    groups.entry(gkey).or_insert_with(|| build_accs(specs, sum_f64_flags))
+                }
+            } else {
+                let kcell = eval_group_cell(&gk0.expr, raw);
+                if let Some(accs) = groups.get_mut(std::slice::from_ref(&kcell)) {
+                    accs
+                } else {
+                    let gkey: GroupTuple = smallvec::smallvec![kcell];
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, specs.len()));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    groups.entry(gkey).or_insert_with(|| build_accs(specs, sum_f64_flags))
+                }
             };
-            acc.push(c1, c2, &mut state_bytes, max_bytes)?;
+            push_specs_from_row(r, accs, &mut spec_readers, &mut state_bytes, max_bytes)?;
         }
-    }
-
-    Ok(PartialSummarizeState::Grouped(groups))
+        PartialSummarizeState::Grouped(groups)
+    } else {
+        let mut by_readers: Vec<FieldReader<'_>> = by
+            .iter()
+            .map(|gk| FieldReader::new(gk.source_field()))
+            .collect();
+        let mut groups: FxHashMap<GroupTuple, AccVec> = FxHashMap::default();
+        let mut gkey_buf: GroupTuple = SmallVec::with_capacity(by.len());
+        for &i in idxs {
+            let Some(r) = col.get(i) else { continue };
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
+            }
+            gkey_buf.clear();
+            for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
+                gkey_buf.push(eval_group_cell(&gk.expr, br.get(r)));
+            }
+            let accs = if let Some(accs) = groups.get_mut(gkey_buf.as_slice()) {
+                accs
+            } else {
+                state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey_buf, specs.len()));
+                check_agg_quota(state_bytes, max_bytes)?;
+                let owned_key = gkey_buf.clone();
+                groups
+                    .entry(owned_key)
+                    .or_insert_with(|| build_accs(specs, sum_f64_flags))
+            };
+            push_specs_from_row(r, accs, &mut spec_readers, &mut state_bytes, max_bytes)?;
+        }
+        PartialSummarizeState::Grouped(groups)
+    };
+    Ok(finish_partial_state(state, by, specs))
 }
 
 pub(crate) fn agg_summarize(
@@ -3492,28 +4026,52 @@ fn fold_summarize_disk(
     } else {
         None
     };
-    let mut groups: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
+    let mut groups: FxHashMap<GroupTuple, AccVec> = FxHashMap::default();
+    let mut gkey_buf: GroupTuple = SmallVec::with_capacity(by.len());
     let mut loop_err: Option<Error> = None;
 
     let scanned = eng.scan_cells(table, filter, &needed, now, |_, cells| {
         let accs: &mut [MetricAcc] = if let Some(ref mut s) = single {
             s.as_mut_slice()
+        } else if by.len() == 1 {
+            let gk0 = &by[0];
+            let raw = cells.get(by_pos[0]).unwrap_or(&NULL);
+            let kcell = eval_group_cell(&gk0.expr, raw);
+            if groups.contains_key(std::slice::from_ref(&kcell)) {
+                groups
+                    .get_mut(std::slice::from_ref(&kcell))
+                    .unwrap()
+                    .as_mut_slice()
+            } else {
+                let gkey: GroupTuple = smallvec::smallvec![kcell];
+                state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, specs.len()));
+                if let Err(err) = check_agg_quota(state_bytes, max_bytes) {
+                    loop_err = Some(err);
+                    return false;
+                }
+                groups
+                    .entry(gkey)
+                    .or_insert_with(|| build_accs(specs, sum_f64_flags))
+                    .as_mut_slice()
+            }
         } else {
-            let mut gkey: GroupTuple = SmallVec::with_capacity(by.len());
+            gkey_buf.clear();
             for (gk, &idx) in by.iter().zip(by_pos.iter()) {
                 let raw = cells.get(idx).unwrap_or(&NULL);
-                gkey.push(eval_group_cell(&gk.expr, raw));
+                gkey_buf.push(eval_group_cell(&gk.expr, raw));
             }
-            match groups.entry(gkey) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), specs.len()));
-                    if let Err(err) = check_agg_quota(state_bytes, max_bytes) {
-                        loop_err = Some(err);
-                        return false;
-                    }
-                    e.insert(build_accs(specs, sum_f64_flags))
+            if groups.contains_key(gkey_buf.as_slice()) {
+                groups.get_mut(gkey_buf.as_slice()).unwrap().as_mut_slice()
+            } else {
+                state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey_buf, specs.len()));
+                if let Err(err) = check_agg_quota(state_bytes, max_bytes) {
+                    loop_err = Some(err);
+                    return false;
                 }
+                groups
+                    .entry(gkey_buf.clone())
+                    .or_insert_with(|| build_accs(specs, sum_f64_flags))
+                    .as_mut_slice()
             }
         };
         for (acc, pos) in accs.iter_mut().zip(spec_pos.iter()) {
@@ -3604,33 +4162,69 @@ pub(crate) fn agg_arg_extremum(
         return Ok(best.into_iter().map(|(_, r)| r.clone()).collect());
     }
 
-    let mut by_readers: Vec<FieldReader<'_>> = by
-        .iter()
-        .map(|gk| FieldReader::new(gk.source_field()))
-        .collect();
     let mut groups: FxHashMap<GroupTuple, (Cell, &Row)> = FxHashMap::default();
     let mut state_bytes = 0usize;
 
-    for r in rows {
-        if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
-            continue;
-        }
-        let mut gkey: GroupTuple = SmallVec::with_capacity(by.len());
-        for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
-            gkey.push(eval_group_cell(&gk.expr, br.get(r)));
-        }
-        let ord = order_reader.get(r);
-        match groups.entry(gkey) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                state_bytes = state_bytes.saturating_add(group_key_bytes(e.key(), 1));
-                check_agg_quota(state_bytes, max_bytes)?;
-                e.insert((ord.clone_for_borrow(), r));
+    if by.len() == 1 {
+        let gk0 = &by[0];
+        let mut br0 = FieldReader::new(gk0.source_field());
+        let is_plain_field = matches!(gk0.expr, GroupExpr::Field(_));
+        for r in rows {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
             }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                let (prev, _) = e.get();
-                if arg_extremum_better(is_max, ord, prev) {
-                    *e.get_mut() = (ord.clone_for_borrow(), r);
+            let raw = br0.get(r);
+            let ord = order_reader.get(r);
+            if is_plain_field
+                && !matches!(raw, Cell::Float(f) if *f == 0.0 && f.is_sign_negative())
+            {
+                if let Some(entry) = groups.get_mut(std::slice::from_ref(raw)) {
+                    if arg_extremum_better(is_max, ord, &entry.0) {
+                        *entry = (ord.clone_for_borrow(), r);
+                    }
+                } else {
+                    let gkey: GroupTuple = smallvec::smallvec![raw.clone_for_borrow()];
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, 1));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    groups.insert(gkey, (ord.clone_for_borrow(), r));
                 }
+            } else {
+                let kcell = eval_group_cell(&gk0.expr, raw);
+                if let Some(entry) = groups.get_mut(std::slice::from_ref(&kcell)) {
+                    if arg_extremum_better(is_max, ord, &entry.0) {
+                        *entry = (ord.clone_for_borrow(), r);
+                    }
+                } else {
+                    let gkey: GroupTuple = smallvec::smallvec![kcell];
+                    state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey, 1));
+                    check_agg_quota(state_bytes, max_bytes)?;
+                    groups.insert(gkey, (ord.clone_for_borrow(), r));
+                }
+            }
+        }
+    } else {
+        let mut by_readers: Vec<FieldReader<'_>> = by
+            .iter()
+            .map(|gk| FieldReader::new(gk.source_field()))
+            .collect();
+        let mut gkey_buf: GroupTuple = SmallVec::with_capacity(by.len());
+        for r in rows {
+            if !flt.as_mut().is_none_or(|f| f.eval(r, now)) {
+                continue;
+            }
+            gkey_buf.clear();
+            for (gk, br) in by.iter().zip(by_readers.iter_mut()) {
+                gkey_buf.push(eval_group_cell(&gk.expr, br.get(r)));
+            }
+            let ord = order_reader.get(r);
+            if let Some(entry) = groups.get_mut(gkey_buf.as_slice()) {
+                if arg_extremum_better(is_max, ord, &entry.0) {
+                    *entry = (ord.clone_for_borrow(), r);
+                }
+            } else {
+                state_bytes = state_bytes.saturating_add(group_key_bytes(&gkey_buf, 1));
+                check_agg_quota(state_bytes, max_bytes)?;
+                groups.insert(gkey_buf.clone(), (ord.clone_for_borrow(), r));
             }
         }
     }
@@ -3642,7 +4236,7 @@ pub(crate) fn agg_arg_extremum(
         .map(|(k, (_, r))| {
             let mut out = r.clone();
             for (gk, kcell) in by.iter().zip(k.into_iter()) {
-                out.insert(gk.alias.clone(), kcell);
+                out.insert(gk.alias.as_str(), kcell);
             }
             out
         })
@@ -3678,21 +4272,17 @@ fn write_metric_acc(out: &mut Vec<u8>, acc: &MetricAcc) -> Result<(), Error> {
             out.extend_from_slice(&n.to_le_bytes());
         }
         MetricAcc::Sum {
-            int_sum,
             exact,
             saw_float,
-            int_overflow,
             prefer_f64,
         } => {
             out.push(0x02);
-            out.extend_from_slice(&int_sum.to_le_bytes());
             let (ex_i, ex_f, ex_c) = exact.into_parts();
+            out.extend_from_slice(&ex_i.to_le_bytes());
             out.extend_from_slice(&ex_i.to_le_bytes());
             out.extend_from_slice(&ex_f.to_bits().to_le_bytes());
             out.extend_from_slice(&ex_c.to_bits().to_le_bytes());
-            let flags = (*saw_float as u8)
-                | ((*int_overflow as u8) << 1)
-                | ((*prefer_f64 as u8) << 2);
+            let flags = (*saw_float as u8) | ((*prefer_f64 as u8) << 2);
             out.push(flags);
         }
         MetricAcc::Avg { sum, count } => {
@@ -3788,16 +4378,14 @@ fn read_metric_acc(cur: &mut &[u8]) -> Result<MetricAcc, Error> {
     match tag {
         0x01 => Ok(MetricAcc::Count(crate::batch::read_i64_le(cur)?)),
         0x02 => {
-            let int_sum = read_i128_le(cur)?;
+            let _int_sum = read_i128_le(cur)?;
             let ex_i = read_i128_le(cur)?;
             let ex_f = read_f64_le(cur)?;
             let ex_c = read_f64_le(cur)?;
             let flags = crate::batch::read_u8(cur)?;
             Ok(MetricAcc::Sum {
-                int_sum,
                 exact: crate::exact_sum::ExactSum::from_parts(ex_i, ex_f, ex_c),
-                saw_float: (flags & 1) != 0,
-                int_overflow: (flags & 2) != 0,
+                saw_float: (flags & 3) != 0,
                 prefer_f64: (flags & 4) != 0,
             })
         }
@@ -3917,7 +4505,7 @@ fn encode_partial_groups(state: &PartialSummarizeState) -> Result<Vec<u8>, Error
         PartialSummarizeState::Grouped(groups) => {
             out.push(1);
             out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
-            let spec_count = groups.values().next().map_or(0, Vec::len);
+            let spec_count = groups.values().next().map_or(0, SmallVec::len);
             out.extend_from_slice(&(spec_count as u32).to_le_bytes());
             for (gkey, accs) in groups {
                 let klen = u16::try_from(gkey.len())
@@ -3939,8 +4527,8 @@ fn encode_partial_groups(state: &PartialSummarizeState) -> Result<Vec<u8>, Error
 }
 
 enum DecodedPartialGroups {
-    Single(Vec<MetricAcc>),
-    Grouped(Vec<(GroupTuple, Vec<MetricAcc>)>),
+    Single(AccVec),
+    Grouped(Vec<(GroupTuple, AccVec)>),
 }
 
 fn decode_partial_groups(bytes: &[u8]) -> Result<DecodedPartialGroups, Error> {
@@ -3978,7 +4566,7 @@ fn decode_partial_groups(bytes: &[u8]) -> Result<DecodedPartialGroups, Error> {
         for _ in 0..klen {
             gkey.push(crate::batch::read_wire_cell(&mut cur)?);
         }
-        let mut accs = Vec::with_capacity(spec_count);
+        let mut accs = AccVec::with_capacity(spec_count);
         for _ in 0..spec_count {
             accs.push(read_metric_acc(&mut cur)?);
         }
@@ -4063,10 +4651,14 @@ pub(crate) fn merge_partial_summarize_wire(
                 dst.merge(src, &mut state_bytes, max_bytes)?;
             }
         }
-        return Ok(vec![emit_summarize_row(by, GroupTuple::new(), specs, merged)]);
+        return Ok(finish_partial_state(
+            PartialSummarizeState::Single(merged),
+            by,
+            specs,
+        ));
     }
 
-    let mut merged: FxHashMap<GroupTuple, Vec<MetricAcc>> = FxHashMap::default();
+    let mut merged: FxHashMap<GroupTuple, AccVec> = FxHashMap::default();
     for raw in payloads {
         let DecodedPartialGroups::Grouped(items) = decode_partial_groups(raw)? else {
             return Err(Error::runtime(
@@ -4229,354 +4821,6 @@ pub(crate) fn apply_coordinator_post_steps(
     Ok(rows)
 }
 
-fn collect_query_collections(query: &Query, out: &mut Vec<String>) {
-    if let Source::Collection(c) = &query.source
-        && !out.contains(c)
-    {
-        out.push(c.clone());
-    }
-    for step in &query.steps {
-        match step {
-            Step::Join { collection, .. } => {
-                if !out.contains(collection) {
-                    out.push(collection.clone());
-                }
-            }
-            Step::Union(sub) => collect_query_collections(sub, out),
-            _ => {}
-        }
-    }
-}
-
-impl super::Db {
-    pub(crate) fn cold_disk_engine_lock(
-        &self,
-    ) -> Option<&Arc<std::sync::RwLock<crate::disk::DiskEngine>>> {
-        self.store.disk.as_ref().map(|d| &d.engine)
-    }
-
-    pub(crate) fn capture_snapshot_wire_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut cold_names: Vec<String> = self
-            .store
-            .disk
-            .as_ref()
-            .map(|d| d.tables.keys().cloned().collect())
-            .unwrap_or_default();
-        if let Some(d) = self.store.disk.as_ref()
-            && let Ok(eng) = d.engine.read()
-        {
-            for name in eng.manifest.tables.keys() {
-                if !cold_names.contains(name) {
-                    cold_names.push(name.clone());
-                }
-            }
-        } else if let Some(p) = self
-            .persist
-            .as_ref()
-            .filter(|p| p.cold && crate::disk::is_disk_dir(&p.dir))
-            && let Ok(eng) = crate::disk::DiskEngine::open_read_only(&p.dir)
-        {
-            for name in eng.manifest.tables.keys() {
-                if !cold_names.contains(name) {
-                    cold_names.push(name.clone());
-                }
-            }
-        }
-        let mut collections_map: BTreeMap<String, Vec<Row>> = BTreeMap::new();
-        for (name, rows) in self.store.collections.iter() {
-            if cold_names.iter().any(|c| c == name) {
-                collections_map.insert(name.clone(), Vec::new());
-            } else {
-                collections_map.insert(name.clone(), rows.clone());
-            }
-        }
-        let cat_hash = self
-            .persist
-            .as_ref()
-            .map(|p| p.catalog_hash.clone())
-            .unwrap_or_else(|| self.catalog.hash_str().to_string());
-        let snap_ref = crate::persist::SnapshotRef {
-            r#gen: self.store.r#gen,
-            embed_id: &self.store.embed_id,
-            next_id: self.store.next_id,
-            catalog_hash: &cat_hash,
-            log_offset: 0,
-            collections: &collections_map,
-            edges: &self.store.edges,
-            extra_collections: &self.store.extra_collections,
-            extra_rels: &self.store.extra_rels,
-            extra_indexes: &self.store.extra_indexes,
-            extra_filters: &self.store.extra_filters,
-            extra_owned: &self.store.extra_owned,
-            cold_collections: &cold_names,
-        };
-        let mut buf = Vec::with_capacity(4096);
-        crate::persist::encode_snapshot_ref_to_writer(&mut buf, &snap_ref)?;
-        Ok(buf)
-    }
-
-    pub(crate) fn from_cold_engine_and_snapshot(
-        dir: &std::path::Path,
-        eng: crate::disk::DiskEngine,
-        snap_bytes: Option<&[u8]>,
-        quotas: crate::Quotas,
-    ) -> Result<Self, Error> {
-        let mut catalog = crate::catalog::fixture();
-        let mut store = if let Some(raw) = snap_bytes {
-            let mut snap = crate::persist::decode_snapshot_bytes(raw)
-                .ok_or_else(|| Error::runtime("corrupt or unsupported cold snapshot payload"))?;
-            if snap.cold_collections.is_empty() && !eng.manifest.tables.is_empty() {
-                snap.cold_collections = eng.manifest.tables.keys().cloned().collect();
-            }
-            crate::store::Store::from_snapshot_with_disk_engine(dir, snap, Some(eng))?
-        } else {
-            crate::store::checkpoint::populate_store_from_native_engine(eng, &catalog, None)
-        };
-        store.merge_extras_into(&mut catalog);
-        let col_names: Vec<String> = store
-            .collections
-            .keys()
-            .filter(|name| !store.is_disk_backed(name))
-            .cloned()
-            .collect();
-        for cname in col_names {
-            store.rebuild_fts_collection(&catalog, &cname);
-        }
-        let mut db = Self::bare(catalog, store);
-        db.quotas = quotas;
-        Ok(db)
-    }
-
-    pub(crate) fn hydrate_cold_collection_inner(&mut self, table: &str) -> Result<usize, Error> {
-        let Some(d) = self.store.disk.as_ref() else {
-            return Ok(0);
-        };
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-        let n = eng.hydrate_table(table)?;
-        drop(eng);
-        if n > 0 {
-            self.reader_cache = None;
-            self.query_cache.clear();
-        }
-        Ok(n)
-    }
-
-    pub(crate) fn hydrate_query_cold_tables(&mut self, query: &Query) -> Result<bool, Error> {
-        let Some(d) = self.store.disk.as_ref() else {
-            return Ok(false);
-        };
-        let mut cols = Vec::new();
-        collect_query_collections(query, &mut cols);
-        let mut hydrated_any = false;
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-        if eng.remote_tier.is_none() {
-            return Ok(false);
-        }
-        for col in cols {
-            if self.store.is_disk_backed(&col) && !eng.is_table_hydrated(&col) {
-                eng.hydrate_table(&col)?;
-                hydrated_any = true;
-            }
-        }
-        drop(eng);
-        if hydrated_any {
-            self.reader_cache = None;
-            self.query_cache.clear();
-        }
-        Ok(hydrated_any)
-    }
-
-    pub(crate) fn has_unhydrated_cold_tables(&self) -> bool {
-        let Some(d) = self.store.disk.as_ref() else {
-            return false;
-        };
-        d.engine
-            .read()
-            .map(|eng| eng.has_unhydrated_tables())
-            .unwrap_or(false)
-    }
-
-    pub(crate) fn evict_cold_cache_inner(&mut self, max_bytes: u64) -> Result<u64, Error> {
-        let Some(d) = self.store.disk.as_ref() else {
-            return Ok(0);
-        };
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-        let remaining = eng.evict_local_cache_to(max_bytes)?;
-        drop(eng);
-        self.reader_cache = None;
-        self.query_cache.clear();
-        Ok(remaining)
-    }
-
-    pub(crate) fn cold_local_cache_bytes_inner(&self) -> u64 {
-        let Some(d) = self.store.disk.as_ref() else {
-            return 0;
-        };
-        d.engine
-            .read()
-            .map(|eng| eng.local_cache_bytes())
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn capture_bootstrap_bundle(
-        &mut self,
-    ) -> Result<(u64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<(u64, Vec<u8>)>), Error> {
-        let needs_ckpt = self.persist.as_ref().is_some_and(|p| {
-            p.writes_since_snapshot > 0
-                || ((self.store.is_native_disk() || self.store.disk.is_some() || p.cold)
-                    && !crate::disk::is_disk_dir(&p.dir))
-        });
-        if needs_ckpt {
-            let _ = self.checkpoint();
-        }
-        let cur_gen = self.store.r#gen;
-        let snap_bytes = self.capture_snapshot_wire_bytes()?;
-        let (manifest_json, tombstones_raw, segs) = if let Some(d) = self.store.disk.as_ref() {
-            let eng = d
-                .engine
-                .read()
-                .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-            eng.export_cold_bootstrap_parts()?
-        } else if let Some(p) = self
-            .persist
-            .as_ref()
-            .filter(|p| p.cold && crate::disk::is_disk_dir(&p.dir))
-        {
-            let eng = crate::disk::DiskEngine::open_read_only(&p.dir)?;
-            eng.export_cold_bootstrap_parts()?
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-        Ok((cur_gen, snap_bytes, manifest_json, tombstones_raw, segs))
-    }
-
-    pub(crate) fn apply_bootstrap_bundle(
-        &mut self,
-        snap_bytes: &[u8],
-        cold_manifest_json: &[u8],
-        cold_tombstones: &[u8],
-        cold_segments: &[(u64, Vec<u8>)],
-    ) -> Result<u64, Error> {
-        let snap = crate::persist::decode_snapshot_bytes(snap_bytes)
-            .ok_or_else(|| Error::runtime("corrupt or unsupported bootstrap snapshot payload"))?;
-        let new_gen = snap.r#gen;
-        let has_cold = !cold_manifest_json.is_empty();
-        let persist_info = self.persist.as_ref().map(|p| (p.dir.clone(), p.sync));
-        let quotas = self.quotas;
-
-        if let Some((dir, sync)) = persist_info {
-            // Release all open WAL/mmap/lock handles before overwriting local files.
-            *self = Self::empty();
-            crate::persist::ensure_dir(&dir)?;
-            if has_cold {
-                let seg_root = dir.join(crate::disk::SEGMENTS_DIR);
-                if seg_root.exists() {
-                    let _ = std::fs::remove_dir_all(&seg_root);
-                }
-                std::fs::create_dir_all(&seg_root).map_err(crate::persist::io_err)?;
-                std::fs::write(dir.join(crate::disk::MANIFEST_FILE), cold_manifest_json)
-                    .map_err(crate::persist::io_err)?;
-                std::fs::write(dir.join(crate::disk::TOMBSTONES_FILE), cold_tombstones)
-                    .map_err(crate::persist::io_err)?;
-                for (seg_id, lseg) in cold_segments {
-                    crate::disk::unpack_segment_dir(
-                        lseg,
-                        &seg_root.join(format!("seg_{seg_id:08}")),
-                    )?;
-                }
-            }
-            crate::persist::write_snapshot(&dir, &snap)?;
-            crate::persist::write_head(
-                &dir,
-                &crate::persist::Head {
-                    r#gen: snap.r#gen,
-                    catalog_hash: snap.catalog_hash.clone(),
-                    embed_id: snap.embed_id.clone(),
-                },
-            )?;
-            std::fs::write(dir.join(crate::persist::LOG_NAME), [])
-                .map_err(crate::persist::io_err)?;
-            let mut reopened = Self::open_follower_with(
-                &dir,
-                crate::exec::OpenOpts {
-                    sync,
-                    cold: has_cold,
-                },
-            )?;
-            reopened.quotas = quotas;
-            *self = reopened;
-            return Ok(new_gen);
-        }
-
-        let mut catalog = crate::catalog::fixture();
-        let store = if has_cold {
-            let tmp_dir = std::env::temp_dir().join(format!(
-                "lin_mem_follower_cold_{}_{}",
-                std::process::id(),
-                new_gen
-            ));
-            let seg_root = tmp_dir.join(crate::disk::SEGMENTS_DIR);
-            if tmp_dir.exists() {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-            }
-            std::fs::create_dir_all(&seg_root).map_err(crate::persist::io_err)?;
-            std::fs::write(tmp_dir.join(crate::disk::MANIFEST_FILE), cold_manifest_json)
-                .map_err(crate::persist::io_err)?;
-            std::fs::write(tmp_dir.join(crate::disk::TOMBSTONES_FILE), cold_tombstones)
-                .map_err(crate::persist::io_err)?;
-            for (seg_id, lseg) in cold_segments {
-                crate::disk::unpack_segment_dir(lseg, &seg_root.join(format!("seg_{seg_id:08}")))?;
-            }
-            let eng = crate::disk::DiskEngine::open(&tmp_dir, false)?;
-            crate::store::Store::from_snapshot_with_disk_engine(&tmp_dir, snap, Some(eng))?
-        } else {
-            crate::store::Store::from_snapshot_with_disk_engine(
-                std::path::Path::new(""),
-                snap,
-                None,
-            )?
-        };
-        store.merge_extras_into(&mut catalog);
-        let mut rebuilt = Self::bare(catalog, store);
-        rebuilt.follower = true;
-        rebuilt.quotas = quotas;
-        *self = rebuilt;
-        Ok(new_gen)
-    }
-
-    pub(crate) fn hydrate_stmts_cold_tables(
-        &mut self,
-        stmts: &[crate::ast::Stmt],
-    ) -> Result<bool, Error> {
-        let mut any = false;
-        for stmt in stmts {
-            match stmt {
-                crate::ast::Stmt::Query(q) => {
-                    if self.hydrate_query_cold_tables(q)? {
-                        any = true;
-                    }
-                }
-                crate::ast::Stmt::Let { query, .. } => {
-                    if self.hydrate_query_cold_tables(query)? {
-                        any = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(any)
-    }
-}
-
 pub(crate) fn eval_partial_summarize_query_on_reader(
     reader: &super::ReadDb,
     q: &Query,
@@ -4640,29 +4884,9 @@ pub(crate) fn coordinator_agg_arg_extremum(
     agg_arg_extremum(rows, None, super::now_ms(), is_max, order, by, max_bytes)
 }
 
+#[inline]
 fn rows_to_union_batch(rows: &[Row]) -> crate::batch::RecordBatch {
-    if rows.len() <= 1
-        || rows[1..]
-            .iter()
-            .all(|r| r.len() == rows[0].len() && r.keys().eq(rows[0].keys()))
-    {
-        return super::join::rows_to_rough_batch(rows);
-    }
-    let mut all_names = std::collections::BTreeSet::new();
-    for row in rows {
-        for k in row.keys() {
-            all_names.insert(k.clone());
-        }
-    }
-    let names: Vec<String> = all_names.into_iter().collect();
-    let names_arc: Arc<[String]> = names.clone().into();
-    let mut batch = crate::batch::RecordBatch::with_capacity(names_arc, rows.len());
-    for row in rows {
-        for (i, name) in names.iter().enumerate() {
-            batch.cols[i].push(row.get(name).cloned().unwrap_or(Cell::Null));
-        }
-    }
-    batch
+    crate::batch::RecordBatch::from_rows(rows)
 }
 
 pub(crate) fn rows_to_batch_for_query(rows: &[Row], q: &Query) -> crate::batch::RecordBatch {
