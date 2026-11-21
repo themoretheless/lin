@@ -8,6 +8,7 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::Row;
@@ -20,7 +21,7 @@ fn next_epoch() -> u64 {
 
 #[derive(Debug)]
 pub struct RowMap {
-    map: BTreeMap<String, Vec<Row>>,
+    map: Arc<BTreeMap<String, Vec<Row>>>,
     epoch: u64,
     rewrite_epoch: u64,
 }
@@ -42,13 +43,20 @@ impl RowMap {
         self.rewrite_epoch
     }
 
-    /// Build a copy backed by `map` while preserving `self.epoch` (used by `Store::clone_mem`
-    /// so read snapshots share mirrors built against the same immutable row version).
-    pub(crate) fn clone_with_map(&self, map: BTreeMap<String, Vec<Row>>) -> Self {
+    /// O(1) copy-on-write snapshot of the underlying `BTreeMap` `Arc`.
+    #[inline]
+    pub(crate) fn share_arc(&self) -> Arc<BTreeMap<String, Vec<Row>>> {
+        Arc::clone(&self.map)
+    }
+
+    /// Restore from a shared `Arc` snapshot with a fresh write epoch.
+    #[inline]
+    pub(crate) fn from_arc(map: Arc<BTreeMap<String, Vec<Row>>>) -> Self {
+        let ep = next_epoch();
         Self {
             map,
-            epoch: self.epoch,
-            rewrite_epoch: self.rewrite_epoch,
+            epoch: ep,
+            rewrite_epoch: ep,
         }
     }
 
@@ -66,10 +74,11 @@ impl RowMap {
     /// (`push` / `extend` / `reserve`), keeping existing prefix `[0..old_len]` intact.
     pub(crate) fn append_only_mut(&mut self, key: &str) -> &mut Vec<Row> {
         self.touch_append_only();
-        if self.map.contains_key(key) {
-            self.map.get_mut(key).expect("existing collection")
+        let map = Arc::make_mut(&mut self.map);
+        if map.contains_key(key) {
+            map.get_mut(key).expect("existing collection")
         } else {
-            self.map.entry(key.to_string()).or_default()
+            map.entry(key.to_string()).or_default()
         }
     }
 
@@ -79,17 +88,17 @@ impl RowMap {
         Q: Ord + ?Sized,
     {
         self.touch();
-        self.map.get_mut(key)
+        Arc::make_mut(&mut self.map).get_mut(key)
     }
 
     pub fn entry(&mut self, key: String) -> Entry<'_, String, Vec<Row>> {
         self.touch();
-        self.map.entry(key)
+        Arc::make_mut(&mut self.map).entry(key)
     }
 
     pub fn insert(&mut self, key: String, rows: Vec<Row>) -> Option<Vec<Row>> {
         self.touch();
-        self.map.insert(key, rows)
+        Arc::make_mut(&mut self.map).insert(key, rows)
     }
 
     pub fn remove<Q>(&mut self, key: &Q) -> Option<Vec<Row>>
@@ -98,27 +107,27 @@ impl RowMap {
         Q: Ord + ?Sized,
     {
         self.touch();
-        self.map.remove(key)
+        Arc::make_mut(&mut self.map).remove(key)
     }
 
     pub fn iter_mut(&mut self) -> std::collections::btree_map::IterMut<'_, String, Vec<Row>> {
         self.touch();
-        self.map.iter_mut()
+        Arc::make_mut(&mut self.map).iter_mut()
     }
 
     pub fn values_mut(&mut self) -> std::collections::btree_map::ValuesMut<'_, String, Vec<Row>> {
         self.touch();
-        self.map.values_mut()
+        Arc::make_mut(&mut self.map).values_mut()
     }
 
     /// Unrestricted mutable access; counts as a write.
     pub fn map_mut(&mut self) -> &mut BTreeMap<String, Vec<Row>> {
         self.touch();
-        &mut self.map
+        Arc::make_mut(&mut self.map)
     }
 
     pub fn into_inner(self) -> BTreeMap<String, Vec<Row>> {
-        self.map
+        Arc::unwrap_or_clone(self.map)
     }
 }
 
@@ -131,7 +140,7 @@ impl Default for RowMap {
 impl Clone for RowMap {
     fn clone(&self) -> Self {
         Self {
-            map: self.map.clone(),
+            map: Arc::clone(&self.map),
             epoch: self.epoch,
             rewrite_epoch: self.rewrite_epoch,
         }
@@ -149,7 +158,7 @@ impl From<BTreeMap<String, Vec<Row>>> for RowMap {
     fn from(map: BTreeMap<String, Vec<Row>>) -> Self {
         let ep = next_epoch();
         Self {
-            map,
+            map: Arc::new(map),
             epoch: ep,
             rewrite_epoch: ep,
         }

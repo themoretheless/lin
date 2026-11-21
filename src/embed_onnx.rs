@@ -17,6 +17,7 @@ pub struct OnnxEmbedder {
     id: String,
     dim: usize,
     inner: Mutex<TextEmbedding>,
+    zero_vec: Arc<[f32]>,
 }
 
 impl std::fmt::Debug for OnnxEmbedder {
@@ -41,10 +42,12 @@ impl OnnxEmbedder {
         let inner =
             TextEmbedding::try_new(InitOptions::new(model).with_show_download_progress(false))
                 .map_err(|e| Error::runtime(format!("onnx embedder: {e}")))?;
+        let zero_vec: Arc<[f32]> = Arc::from(vec![0f32; dim]);
         Ok(Self {
             id,
             dim,
             inner: Mutex::new(inner),
+            zero_vec,
         })
     }
 
@@ -66,14 +69,14 @@ impl Embedder for OnnxEmbedder {
     fn embed(&self, text: &str) -> Arc<[f32]> {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return Arc::from(vec![0f32; self.dim]),
+            Err(_) => return Arc::clone(&self.zero_vec),
         };
-        match guard.embed(vec![text], None) {
-            Ok(mut batches) => {
-                let v = batches.pop().unwrap_or_default();
-                normalize_onnx_dim(v, self.dim)
-            }
-            Err(_) => Arc::from(vec![0f32; self.dim]),
+        match guard.embed(std::slice::from_ref(&text), None) {
+            Ok(mut batches) => match batches.pop() {
+                Some(v) if !v.is_empty() => normalize_onnx_dim(v, self.dim),
+                _ => Arc::clone(&self.zero_vec),
+            },
+            Err(_) => Arc::clone(&self.zero_vec),
         }
     }
 
@@ -83,14 +86,41 @@ impl Embedder for OnnxEmbedder {
         }
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return vec![Arc::from(vec![0f32; self.dim]); texts.len()],
+            Err(_) => return vec![Arc::clone(&self.zero_vec); texts.len()],
         };
-        match guard.embed(texts.to_vec(), None) {
+        match guard.embed(texts, None) {
             Ok(batches) => batches
                 .into_iter()
-                .map(|v| normalize_onnx_dim(v, self.dim))
+                .map(|v| {
+                    if v.is_empty() {
+                        Arc::clone(&self.zero_vec)
+                    } else {
+                        normalize_onnx_dim(v, self.dim)
+                    }
+                })
                 .collect(),
-            Err(_) => vec![Arc::from(vec![0f32; self.dim]); texts.len()],
+            Err(_) => vec![Arc::clone(&self.zero_vec); texts.len()],
+        }
+    }
+
+    fn embed_batch_owned(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return (0..texts.len()).map(|_| vec![0f32; self.dim]).collect(),
+        };
+        match guard.embed(texts, None) {
+            Ok(mut batches) => {
+                for v in &mut batches {
+                    if v.len() != self.dim {
+                        v.resize(self.dim, 0.0);
+                    }
+                }
+                batches
+            }
+            Err(_) => (0..texts.len()).map(|_| vec![0f32; self.dim]).collect(),
         }
     }
 }

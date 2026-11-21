@@ -28,15 +28,16 @@ thread_local! {
 
 #[inline]
 pub fn acquire_orders_row() -> Row {
+    static ORDERS_SHAPE: std::sync::LazyLock<Arc<Shape>> =
+        std::sync::LazyLock::new(|| Row::shape_of(&["id", "total", "user_id"]));
     ORDERS_ROW_POOL.with(|pool| {
         if let Some(row) = pool.borrow_mut().pop() {
             return row;
         }
-        let mut r = Row::new();
-        r.insert("id".to_string(), Cell::Null);
-        r.insert("total".to_string(), Cell::Null);
-        r.insert("user_id".to_string(), Cell::Null);
-        r
+        Row::from_parts(
+            Arc::clone(&ORDERS_SHAPE),
+            [Cell::Null, Cell::Null, Cell::Null],
+        )
     })
 }
 
@@ -62,21 +63,19 @@ pub(super) fn next_docs_epoch() -> u64 {
     NEXT_DOCS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One recycled `{id, title}` result vector. Process-wide, so its contents are never
-/// trusted: users refill or clear it.
-pub(super) static ID_TITLE_POOL: std::sync::Mutex<Option<Vec<Row>>> = std::sync::Mutex::new(None);
-
+#[inline]
 pub fn release_id_title_rows(rows: Vec<Row>) {
-    if let Ok(mut guard) = ID_TITLE_POOL.lock() {
-        *guard = Some(rows);
-    }
+    let _ = ID_TITLE_POOL.try_with(|cell| cell.set(Some(rows)));
 }
 
+#[inline]
 pub(crate) fn take_recycled_id_title_vec() -> Option<Vec<Row>> {
-    ID_TITLE_POOL.lock().ok().and_then(|mut guard| guard.take())
+    ID_TITLE_POOL.try_with(|cell| cell.take()).ok().flatten()
 }
 
 thread_local! {
+    static ID_TITLE_POOL: std::cell::Cell<Option<Vec<Row>>> =
+        const { std::cell::Cell::new(None) };
     static SINGLE_ID_TITLE_VEC: std::cell::Cell<Vec<Row>> =
         const { std::cell::Cell::new(Vec::new()) };
     static GENERAL_ROW_VEC_POOL: std::cell::RefCell<Option<Vec<Row>>> =
@@ -231,7 +230,8 @@ impl std::fmt::Display for InlineStr {
 impl PartialEq for InlineStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        // Every constructor zeroes `buf[len..22]`, so fixed-width comparison is exact and branchless.
+        self.len == other.len && self.buf == other.buf
     }
 }
 
@@ -329,7 +329,11 @@ impl PartialEq for Cell {
             (Cell::Float(a), Cell::Float(b)) => a.to_bits() == b.to_bits(),
             (Cell::Bool(a), Cell::Bool(b)) => a == b,
             (Cell::Time(a), Cell::Time(b)) => a == b,
-            (Cell::Vec(a), Cell::Vec(b)) => a == b,
+            (Cell::Vec(a), Cell::Vec(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.len() == b.len()
+                        && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()))
+            }
             _ => false,
         }
     }
@@ -629,15 +633,38 @@ fn intern_known_wing(wing: &str) -> Option<Arc<str>> {
 }
 
 #[inline]
+pub(crate) fn empty_arc_str() -> Arc<str> {
+    static EMPTY: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from(""));
+    Arc::clone(&EMPTY)
+}
+
+#[inline]
+pub(crate) fn cell_arc_or_empty(cell: Option<&Cell>) -> Arc<str> {
+    match cell {
+        Some(Cell::Text(s)) => Arc::clone(s),
+        Some(Cell::SmallText(s)) => {
+            if s.is_empty() {
+                empty_arc_str()
+            } else {
+                Arc::from(s.as_str())
+            }
+        }
+        _ => empty_arc_str(),
+    }
+}
+
+#[inline]
 pub(crate) fn intern_wing(wing: Arc<str>) -> Arc<str> {
+    if wing.is_empty() {
+        return empty_arc_str();
+    }
     intern_known_wing(wing.as_ref()).unwrap_or(wing)
 }
 
 #[inline]
 pub(crate) fn intern_wing_str(wing: &str) -> Arc<str> {
-    static EMPTY: std::sync::LazyLock<Arc<str>> = std::sync::LazyLock::new(|| Arc::from(""));
     if wing.is_empty() {
-        return Arc::clone(&EMPTY);
+        return empty_arc_str();
     }
     intern_known_wing(wing).unwrap_or_else(|| Arc::from(wing))
 }
@@ -646,6 +673,14 @@ pub(super) fn docs_hot_field(f: &str) -> bool {
     matches!(f, "id" | "title" | "layer" | "wing")
 }
 
+#[inline]
+pub(crate) fn shape_id() -> &'static Arc<super::RowShape> {
+    static SHAPE: std::sync::LazyLock<Arc<super::RowShape>> =
+        std::sync::LazyLock::new(|| Row::shape_of(&["id"]));
+    &SHAPE
+}
+
+#[inline]
 pub(crate) fn shape_id_title() -> &'static Arc<super::RowShape> {
     static SHAPE: std::sync::LazyLock<Arc<super::RowShape>> =
         std::sync::LazyLock::new(|| Row::shape_of(&["id", "title"]));
@@ -654,9 +689,10 @@ pub(crate) fn shape_id_title() -> &'static Arc<super::RowShape> {
 
 #[inline]
 pub(super) fn row_id_title(id: &Arc<str>, title: &Arc<str>) -> Row {
-    Row::from_parts(
+    Row::from_pair(
         Arc::clone(shape_id_title()),
-        [Cell::Text(Arc::clone(id)), Cell::Text(Arc::clone(title))],
+        Cell::Text(Arc::clone(id)),
+        Cell::Text(Arc::clone(title)),
     )
 }
 
@@ -801,37 +837,65 @@ impl OwnedRowProjector {
 }
 
 pub fn project_fields(row: &Row, fields: &[String]) -> Row {
-    if fields.is_empty() {
-        return Row::new();
-    }
-    if fields.len() == 2 && fields[0] != fields[1] {
-        let shape = if (fields[0] == "id" && fields[1] == "title")
-            || (fields[0] == "title" && fields[1] == "id")
-        {
-            Arc::clone(shape_id_title())
-        } else {
-            Row::shape_of(fields)
-        };
-        let swap = fields[0] > fields[1];
-        let c0 = row
-            .get(&fields[0])
-            .map(Cell::clone_for_borrow)
-            .unwrap_or(Cell::Null);
-        let c1 = row
-            .get(&fields[1])
-            .map(Cell::clone_for_borrow)
-            .unwrap_or(Cell::Null);
-        return Row::from_parts(shape, if swap { [c1, c0] } else { [c0, c1] });
-    }
-    let mut out = acquire_row();
-    for f in fields {
-        if let Some(v) = row.get(f) {
-            out.insert(f.as_str(), v.clone_for_borrow());
-        } else {
-            out.insert(f.as_str(), Cell::Null);
+    match fields {
+        [] => Row::new(),
+        [f0] => {
+            let shape = if f0 == "id" {
+                Arc::clone(shape_id())
+            } else {
+                Row::shape_of(fields)
+            };
+            let c0 = row
+                .get_str(f0)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
+            Row::from_single(shape, c0)
+        }
+        [f0, f1] if f0 != f1 => {
+            let shape = if (f0 == "id" && f1 == "title") || (f0 == "title" && f1 == "id") {
+                Arc::clone(shape_id_title())
+            } else {
+                Row::shape_of(fields)
+            };
+            let c0 = row
+                .get_str(f0)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
+            let c1 = row
+                .get_str(f1)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
+            if f0 > f1 {
+                Row::from_pair(shape, c1, c0)
+            } else {
+                Row::from_pair(shape, c0, c1)
+            }
+        }
+        [f0, _] => {
+            let shape = if f0 == "id" {
+                Arc::clone(shape_id())
+            } else {
+                Row::shape_of(&fields[..1])
+            };
+            let c0 = row
+                .get_str(f0)
+                .map(Cell::clone_for_borrow)
+                .unwrap_or(Cell::Null);
+            Row::from_single(shape, c0)
+        }
+        _ => {
+            let shape = Row::shape_of(fields);
+            let names = shape.names();
+            Row::from_parts(
+                Arc::clone(&shape),
+                names.iter().map(|f| {
+                    row.get_str(f)
+                        .map(Cell::clone_for_borrow)
+                        .unwrap_or(Cell::Null)
+                }),
+            )
         }
     }
-    out
 }
 
 pub fn now_ms() -> i64 {
@@ -842,17 +906,7 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn content_hash_arc(body: &str) -> Arc<str> {
-    let h = fnv1a64(body.as_bytes());
-    let mut buf = [0u8; 18];
-    buf[0] = b'h';
-    buf[1] = b':';
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
-    }
-    // SAFETY: buf is always ASCII hex.
-    Arc::from(unsafe { std::str::from_utf8_unchecked(&buf) })
+    Arc::from(content_hash_inline(body).as_str())
 }
 
 #[inline]
@@ -892,16 +946,16 @@ pub(super) struct DocSeed<'a> {
 
 pub(super) fn doc_row(d: DocSeed<'_>) -> Row {
     let mut r = Row::new();
-    r.insert("id", Cell::text_arc(d.id));
-    r.insert("uri", Cell::text_arc(d.uri));
-    r.insert("title", Cell::text_arc(d.title));
-    r.insert("wing", Cell::text_arc(d.wing));
-    r.insert("room", Cell::text_arc(d.room));
-    r.insert("layer", Cell::text_arc(d.layer));
-    r.insert("body", Cell::text_arc(d.body));
-    r.insert("hash", Cell::Text(content_hash_arc(d.body)));
-    r.insert("snippet", Cell::text_arc(d.snippet));
-    r.insert("ts", Cell::Time(d.ts));
+    r.insert_str("id", Cell::text_arc(d.id));
+    r.insert_str("uri", Cell::text_arc(d.uri));
+    r.insert_str("title", Cell::text_arc(d.title));
+    r.insert_str("wing", Cell::text_arc(d.wing));
+    r.insert_str("room", Cell::text_arc(d.room));
+    r.insert_str("layer", Cell::text_arc(d.layer));
+    r.insert_str("body", Cell::text_arc(d.body));
+    r.insert_str("hash", Cell::SmallText(content_hash_inline(d.body)));
+    r.insert_str("snippet", Cell::text_arc(d.snippet));
+    r.insert_str("ts", Cell::Time(d.ts));
     r
 }
 

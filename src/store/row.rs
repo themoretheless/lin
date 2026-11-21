@@ -26,21 +26,33 @@ const MAX_INTERNED_SHAPES: usize = 65_536;
 
 static INTERNED_SHAPES: AtomicUsize = AtomicUsize::new(0);
 
+#[inline]
+fn name_tag(s: &str) -> u16 {
+    ((s.len().min(255) as u16) << 8) | (s.as_bytes().first().copied().unwrap_or(0) as u16)
+}
+
+#[inline]
+fn build_tags(names: &[String]) -> Box<[u16]> {
+    names.iter().map(|s| name_tag(s)).collect()
+}
+
 /// Sorted field names of a row, shared by every row with the same fields.
 pub struct Shape {
-    names: Box<[String]>,
+    names: Arc<[String]>,
+    tags: Box<[u16]>,
     /// Shapes reached by adding one field: `(position of the new field, shape)`.
     children: RwLock<Vec<(usize, Arc<Shape>)>>,
 }
 
 /// Every interned shape by its names, so that a set of names has one shape no matter
 /// which transitions led to it. Consulted only when a transition is not cached yet.
-static BY_NAMES: LazyLock<std::sync::Mutex<rustc_hash::FxHashMap<Box<[String]>, Arc<Shape>>>> =
+static BY_NAMES: LazyLock<std::sync::Mutex<rustc_hash::FxHashMap<Arc<[String]>, Arc<Shape>>>> =
     LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashMap::default()));
 
 static ROOT: LazyLock<Arc<Shape>> = LazyLock::new(|| {
     Arc::new(Shape {
-        names: Box::new([]),
+        names: Arc::from([]),
+        tags: Box::new([]),
         children: RwLock::new(Vec::new()),
     })
 });
@@ -50,6 +62,25 @@ impl Shape {
     #[inline]
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// Position of `key` in this shape, using a compact `(len, first_byte)` tag scan for
+    /// shapes up to 24 fields (avoiding pointer-chasing `String` buffers on non-matches)
+    /// and binary search for wider shapes.
+    #[inline]
+    pub fn position(&self, key: &str) -> Option<usize> {
+        let names = &*self.names;
+        if names.len() <= 24 {
+            let key_tag = name_tag(key);
+            for (i, &t) in self.tags.iter().enumerate() {
+                if t == key_tag && names[i].as_str() == key {
+                    return Some(i);
+                }
+            }
+            None
+        } else {
+            names.binary_search_by(|n| n.as_str().cmp(key)).ok()
+        }
     }
 
     #[inline]
@@ -74,6 +105,17 @@ impl Shape {
         }
     }
 
+    /// Pre-resolve `key` against this shape: `Ok(existing_pos)` if already present, or
+    /// `Err((insert_at, child_shape))` so callers updating uniform batches pay transition
+    /// lookup once per batch instead of once per row.
+    #[inline]
+    pub(crate) fn prepare_insert(self: &Arc<Self>, key: &str) -> Result<usize, (usize, Arc<Shape>)> {
+        match self.find(key) {
+            Ok(pos) => Ok(pos),
+            Err(at) => Err((at, self.with(at, key))),
+        }
+    }
+
     /// The shape with `key` added at sorted position `at`.
     fn with(self: &Arc<Self>, at: usize, key: &str) -> Arc<Shape> {
         if let Ok(children) = self.children.read() {
@@ -87,11 +129,13 @@ impl Shape {
         names.extend(self.names[..at].iter().cloned());
         names.push(key.to_owned());
         names.extend(self.names[at..].iter().cloned());
-        let names = names.into_boxed_slice();
+        let names: Arc<[String]> = Arc::from(names);
         if INTERNED_SHAPES.load(AtomicOrdering::Relaxed) >= MAX_INTERNED_SHAPES {
             // Cache full: the key set still works, it is just not shared.
+            let tags = build_tags(&names);
             return Arc::new(Shape {
                 names,
+                tags,
                 children: RwLock::new(Vec::new()),
             });
         }
@@ -105,8 +149,10 @@ impl Shape {
             match by_names.get(&names) {
                 Some(existing) => Arc::clone(existing),
                 None => {
+                    let tags = build_tags(&names);
                     let made = Arc::new(Shape {
-                        names: names.clone(),
+                        names: Arc::clone(&names),
+                        tags,
                         children: RwLock::new(Vec::new()),
                     });
                     by_names.insert(names, Arc::clone(&made));
@@ -171,12 +217,12 @@ impl<'k> FieldSlot<'k> {
     #[inline]
     pub fn get<'r>(&mut self, row: &'r Row) -> Option<&'r Cell> {
         let shape = row.shape.as_ref()?;
-        for (seen, at) in &self.seen {
+        for (seen, at) in self.seen.iter().rev() {
             if Arc::ptr_eq(seen, shape) {
                 return at.map(|i| &row.cells[i]);
             }
         }
-        let at = shape.find(self.key).ok();
+        let at = shape.position(self.key);
         if self.seen.len() == Self::KEPT_SHAPES {
             self.seen.remove(0);
         }
@@ -236,12 +282,12 @@ impl OwnedFieldSlot {
     #[inline]
     pub fn get<'r>(&mut self, row: &'r Row) -> Option<&'r Cell> {
         let shape = row.shape.as_ref()?;
-        for (seen, at) in &self.seen {
+        for (seen, at) in self.seen.iter().rev() {
             if Arc::ptr_eq(seen, shape) {
                 return at.map(|i| &row.cells[i]);
             }
         }
-        let at = shape.find(&self.key).ok();
+        let at = shape.position(&self.key);
         if self.seen.len() == Self::KEPT_SHAPES {
             self.seen.remove(0);
         }
@@ -250,18 +296,18 @@ impl OwnedFieldSlot {
     }
 
     /// Lock-free `&self` lookup for shared `Prepared` plans (`PointGetPlan`, `AggPlan`):
-    /// caches the collection's primary `Shape` on first call and falls back to `row.get`
+    /// caches the collection's primary `Shape` on first call and falls back to `Shape::position`
     /// only if a row has a different shape.
     #[inline]
     pub fn get_sync<'r>(&self, row: &'r Row) -> Option<&'r Cell> {
         let shape = row.shape.as_ref()?;
         let (cached_shape, cached_at) = self
             .sync_seen
-            .get_or_init(|| (Arc::clone(shape), shape.find(&self.key).ok()));
+            .get_or_init(|| (Arc::clone(shape), shape.position(&self.key)));
         if Arc::ptr_eq(cached_shape, shape) {
             return cached_at.map(|i| &row.cells[i]);
         }
-        shape.find(&self.key).ok().map(|i| &row.cells[i])
+        shape.position(&self.key).map(|i| &row.cells[i])
     }
 }
 
@@ -280,6 +326,30 @@ impl Row {
             shape: None,
             cells: SmallVec::new_const(),
         }
+    }
+
+    #[inline]
+    pub fn from_single(shape: Arc<Shape>, c0: Cell) -> Self {
+        debug_assert_eq!(shape.names.len(), 1);
+        Row {
+            shape: Some(shape),
+            cells: smallvec::smallvec![c0],
+        }
+    }
+
+    #[inline]
+    pub fn from_pair(shape: Arc<Shape>, c0: Cell, c1: Cell) -> Self {
+        debug_assert_eq!(shape.names.len(), 2);
+        Row {
+            shape: Some(shape),
+            cells: smallvec::smallvec![c0, c1],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn insert_at_new_shape(&mut self, at: usize, new_shape: Arc<Shape>, value: Cell) {
+        self.shape = Some(new_shape);
+        self.cells.insert(at, value);
     }
 
     /// A row with the given shape and cells (`cells.len()` must equal the shape's width).
@@ -417,29 +487,53 @@ impl Row {
     }
 
     #[inline]
+    fn position(&self, key: &str) -> Option<usize> {
+        self.shape.as_ref()?.position(key)
+    }
+
+    #[inline]
+    pub fn get_str(&self, key: &str) -> Option<&Cell> {
+        self.position(key).map(|i| &self.cells[i])
+    }
+
+    #[inline]
     pub fn get<Q: AsRef<str> + ?Sized>(&self, key: &Q) -> Option<&Cell> {
-        self.find(key.as_ref()).ok().map(|i| &self.cells[i])
+        self.get_str(key.as_ref())
+    }
+
+    #[inline]
+    pub fn get_mut_str(&mut self, key: &str) -> Option<&mut Cell> {
+        self.position(key).map(|i| &mut self.cells[i])
     }
 
     #[inline]
     pub fn get_mut<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<&mut Cell> {
-        self.find(key.as_ref()).ok().map(|i| &mut self.cells[i])
+        self.get_mut_str(key.as_ref())
     }
 
     #[inline]
-    pub fn get_key_value<Q: AsRef<str> + ?Sized>(&self, key: &Q) -> Option<(&String, &Cell)> {
-        let i = self.find(key.as_ref()).ok()?;
+    pub fn get_key_value_str(&self, key: &str) -> Option<(&String, &Cell)> {
+        let i = self.position(key)?;
         Some((&self.names()[i], &self.cells[i]))
     }
 
     #[inline]
+    pub fn get_key_value<Q: AsRef<str> + ?Sized>(&self, key: &Q) -> Option<(&String, &Cell)> {
+        self.get_key_value_str(key.as_ref())
+    }
+
+    #[inline]
+    pub fn contains_key_str(&self, key: &str) -> bool {
+        self.position(key).is_some()
+    }
+
+    #[inline]
     pub fn contains_key<Q: AsRef<str> + ?Sized>(&self, key: &Q) -> bool {
-        self.find(key.as_ref()).is_ok()
+        self.contains_key_str(key.as_ref())
     }
 
     /// Set `key` to `value`; returns the previous value, if any.
-    pub fn insert(&mut self, key: impl AsRef<str>, value: Cell) -> Option<Cell> {
-        let key = key.as_ref();
+    pub fn insert_str(&mut self, key: &str, value: Cell) -> Option<Cell> {
         // Rows are usually built in field-name order: a key past the last name appends
         // without searching.
         let found = match self.names().last() {
@@ -457,6 +551,12 @@ impl Row {
         }
     }
 
+    /// Set `key` to `value`; returns the previous value, if any.
+    #[inline]
+    pub fn insert(&mut self, key: impl AsRef<str>, value: Cell) -> Option<Cell> {
+        self.insert_str(key.as_ref(), value)
+    }
+
     /// Mutable slot for `key`, inserting `default()` when absent.
     pub fn get_or_insert_with(&mut self, key: &str, default: impl FnOnce() -> Cell) -> &mut Cell {
         let i = match self.find(key) {
@@ -471,19 +571,29 @@ impl Row {
         &mut self.cells[i]
     }
 
-    pub fn remove<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<Cell> {
-        let i = self.find(key.as_ref()).ok()?;
+    pub fn remove_str(&mut self, key: &str) -> Option<Cell> {
+        let i = self.position(key)?;
         let cell = self.cells.remove(i);
         self.reshape_without(|pos, _| pos != i);
         Some(cell)
     }
 
-    pub fn remove_entry<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<(String, Cell)> {
-        let i = self.find(key.as_ref()).ok()?;
+    #[inline]
+    pub fn remove<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<Cell> {
+        self.remove_str(key.as_ref())
+    }
+
+    pub fn remove_entry_str(&mut self, key: &str) -> Option<(String, Cell)> {
+        let i = self.position(key)?;
         let name = self.names()[i].clone();
         let cell = self.cells.remove(i);
         self.reshape_without(|pos, _| pos != i);
         Some((name, cell))
+    }
+
+    #[inline]
+    pub fn remove_entry<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<(String, Cell)> {
+        self.remove_entry_str(key.as_ref())
     }
 
     /// Replace the shape by the one keeping only names for which `keep(position, name)`.
@@ -785,6 +895,63 @@ impl Serialize for Row {
 
 impl<'de> Deserialize<'de> for Row {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum KeyRef<'de> {
+            Borrowed(&'de str),
+            Buffered,
+        }
+
+        struct KeySeed<'s>(&'s mut String);
+
+        impl<'de> serde::de::DeserializeSeed<'de> for KeySeed<'_> {
+            type Value = KeyRef<'de>;
+
+            #[inline]
+            fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+                struct KeyVisitor<'s>(&'s mut String);
+
+                impl<'de> Visitor<'de> for KeyVisitor<'_> {
+                    type Value = KeyRef<'de>;
+
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("a field name string")
+                    }
+
+                    #[inline]
+                    fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                        Ok(KeyRef::Borrowed(v))
+                    }
+
+                    #[inline]
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                        self.0.clear();
+                        self.0.push_str(v);
+                        Ok(KeyRef::Buffered)
+                    }
+
+                    #[inline]
+                    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                        *self.0 = v;
+                        Ok(KeyRef::Buffered)
+                    }
+
+                    #[inline]
+                    fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+                        std::str::from_utf8(v).map(KeyRef::Borrowed).map_err(E::custom)
+                    }
+
+                    #[inline]
+                    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                        let s = std::str::from_utf8(v).map_err(E::custom)?;
+                        self.0.clear();
+                        self.0.push_str(s);
+                        Ok(KeyRef::Buffered)
+                    }
+                }
+
+                deserializer.deserialize_str(KeyVisitor(self.0))
+            }
+        }
+
         struct RowVisitor;
         impl<'de> Visitor<'de> for RowVisitor {
             type Value = Row;
@@ -793,8 +960,14 @@ impl<'de> Deserialize<'de> for Row {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Row, A::Error> {
                 let mut row = Row::new();
-                while let Some((k, v)) = access.next_entry::<String, Cell>()? {
-                    row.insert(k, v);
+                let mut key_buf = String::new();
+                while let Some(k_ref) = access.next_key_seed(KeySeed(&mut key_buf))? {
+                    let v: Cell = access.next_value()?;
+                    let k = match k_ref {
+                        KeyRef::Borrowed(s) => s,
+                        KeyRef::Buffered => key_buf.as_str(),
+                    };
+                    row.insert_str(k, v);
                 }
                 Ok(row)
             }

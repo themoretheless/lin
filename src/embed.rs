@@ -361,12 +361,69 @@ impl HashingEmbedder {
     }
 
     fn embed_rows_slice_in_place(&self, rows: &mut [crate::store::Row]) {
+        if rows.is_empty() {
+            return;
+        }
         EMBED_SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let (scratch, lower, text_buf) = &mut *guard;
             scratch.ensure_dim(self.dim);
+
+            let uniform = rows[0].shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let first_shape = Arc::clone(rows[0].shape_arc().unwrap());
+                let title_pos = first_shape.position("title");
+                let body_pos = first_shape.position("body");
+                let snippet_pos = first_shape.position("snippet");
+                let emb_plan = first_shape.prepare_insert("embedding");
+
+                for row in rows {
+                    let vec = {
+                        let cells = row.cells_slice();
+                        let texts = [
+                            title_pos.and_then(|p| cells[p].text()),
+                            body_pos.and_then(|p| cells[p].text()),
+                            snippet_pos.and_then(|p| cells[p].text()),
+                        ];
+                        match prepare_embed_texts(texts, text_buf) {
+                            RowEmbedText::Empty => scratch.finish(),
+                            RowEmbedText::Borrowed(text) => {
+                                self.fill(scratch, crate::fts::lowercased(text, lower));
+                                scratch.finish()
+                            }
+                            RowEmbedText::Appended => {
+                                self.fill(scratch, crate::fts::lowercased(text_buf, lower));
+                                scratch.finish()
+                            }
+                        }
+                    };
+                    match &emb_plan {
+                        Ok(ep) => {
+                            row.cells_mut()[*ep] = crate::store::Cell::Vec(vec);
+                        }
+                        Err((at, new_shape)) => {
+                            row.insert_at_new_shape(
+                                *at,
+                                Arc::clone(new_shape),
+                                crate::store::Cell::Vec(vec),
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+
+            let mut slots = [
+                crate::store::row::FieldSlot::new("title"),
+                crate::store::row::FieldSlot::new("body"),
+                crate::store::row::FieldSlot::new("snippet"),
+            ];
             for row in rows {
-                let vec = match prepare_row_embed_text(row, text_buf) {
+                let vec = match prepare_row_embed_text_slots(row, &mut slots, text_buf) {
                     RowEmbedText::Empty => scratch.finish(),
                     RowEmbedText::Borrowed(text) => {
                         self.fill(scratch, crate::fts::lowercased(text, lower));
@@ -377,10 +434,10 @@ impl HashingEmbedder {
                         scratch.finish()
                     }
                 };
-                if let Some(cell) = row.get_mut("embedding") {
+                if let Some(cell) = row.get_mut_str("embedding") {
                     *cell = crate::store::Cell::Vec(vec);
                 } else {
-                    row.insert("embedding", crate::store::Cell::Vec(vec));
+                    row.insert_str("embedding", crate::store::Cell::Vec(vec));
                 }
             }
         });
@@ -391,9 +448,14 @@ impl HashingEmbedder {
             let mut guard = cell.borrow_mut();
             let (scratch, lower, text_buf) = &mut *guard;
             scratch.ensure_dim(self.dim);
+            let mut slots = [
+                crate::store::row::FieldSlot::new("title"),
+                crate::store::row::FieldSlot::new("body"),
+                crate::store::row::FieldSlot::new("snippet"),
+            ];
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                match prepare_row_embed_text(row, text_buf) {
+                match prepare_row_embed_text_slots(row, &mut slots, text_buf) {
                     RowEmbedText::Empty => {
                         out.push(scratch.finish());
                     }
@@ -410,32 +472,27 @@ impl HashingEmbedder {
             out
         })
     }
+
     /// Add every feature of `lower` (unigrams, char trigrams, string bigrams)
     /// into the accumulator.
     fn fill(&self, s: &mut Scratch, lower: &str) {
-        // The ASCII splitter excludes vertical tab; Unicode splitting includes it.
-        if lower.is_ascii() && !lower.as_bytes().contains(&0x0b) {
-            for token in lower.split_ascii_whitespace() {
-                s.bump_token(token);
-            }
-        } else {
-            for token in lower.split_whitespace() {
-                s.bump_token(token);
-            }
-        }
-        // Character bigrams over the whole string catch short queries.
-        let bytes = lower.as_bytes();
         if self.dim == 768 {
+            crate::fts::for_each_word(lower, |token| {
+                s.bump_token_768(token);
+            });
             let slots = bigram_slots();
-            for w in bytes.windows(2) {
-                s.bump_slot(
+            for w in lower.as_bytes().windows(2) {
+                s.bump_slot_768(
                     slots[usize::from(w[0]) * 256 + usize::from(w[1])] as usize,
                     0.25,
                 );
             }
         } else {
-            for w in bytes.windows(2) {
-                s.bump(w, 0.25);
+            crate::fts::for_each_word(lower, |token| {
+                s.bump_token(token);
+            });
+            for w in lower.as_bytes().windows(2) {
+                s.bump(&w[..2], 0.25);
             }
         }
     }
@@ -488,16 +545,47 @@ impl Scratch {
     }
 
     #[inline]
+    fn bump_token_768(&mut self, token: &str) {
+        self.bump_768(token, 1.0);
+        let bytes = token.as_bytes();
+        if bytes.len() >= 3 {
+            for window in bytes.windows(3) {
+                self.bump_768(&window[..3], 0.5);
+            }
+        } else {
+            self.bump_768(bytes, 0.5);
+        }
+    }
+
+    #[inline]
     fn bump_token(&mut self, token: &str) {
         self.bump(token, 1.0);
         let bytes = token.as_bytes();
         if bytes.len() >= 3 {
             for window in bytes.windows(3) {
-                self.bump(window, 0.5);
+                self.bump(&window[..3], 0.5);
             }
         } else {
             self.bump(bytes, 0.5);
         }
+    }
+
+    #[inline]
+    fn bump_768(&mut self, key: impl Hash, w: f32) {
+        let mut h = FxHasher::default();
+        key.hash(&mut h);
+        let i = (h.finish() as usize) % 768;
+        self.bump_slot_768(i, w);
+    }
+
+    #[inline]
+    fn bump_slot_768(&mut self, i: usize, w: f32) {
+        let v = &mut self.v[..768];
+        let cur = v[i];
+        if cur.to_bits() == 0 {
+            self.touched.push(i as u32);
+        }
+        v[i] = cur + w;
     }
 
     #[inline]
@@ -684,8 +772,10 @@ unsafe fn cosine_neon(a: &[f32], b: &[f32]) -> f64 {
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn cosine_scalar(a: &[f32], b: &[f32]) -> f64 {
-    let n = a.len();
-    let chunks = n / 8;
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
     let mut dot0 = 0.0f32;
     let mut dot1 = 0.0f32;
     let mut dot2 = 0.0f32;
@@ -713,25 +803,11 @@ fn cosine_scalar(a: &[f32], b: &[f32]) -> f64 {
     let mut nb6 = 0.0f32;
     let mut nb7 = 0.0f32;
 
-    for c in 0..chunks {
-        let base = c * 8;
-        let a0 = a[base];
-        let a1 = a[base + 1];
-        let a2 = a[base + 2];
-        let a3 = a[base + 3];
-        let a4 = a[base + 4];
-        let a5 = a[base + 5];
-        let a6 = a[base + 6];
-        let a7 = a[base + 7];
-
-        let b0 = b[base];
-        let b1 = b[base + 1];
-        let b2 = b[base + 2];
-        let b3 = b[base + 3];
-        let b4 = b[base + 4];
-        let b5 = b[base + 5];
-        let b6 = b[base + 6];
-        let b7 = b[base + 7];
+    for (ac, bc) in (&mut a_chunks).zip(&mut b_chunks) {
+        let (a0, a1, a2, a3, a4, a5, a6, a7) =
+            (ac[0], ac[1], ac[2], ac[3], ac[4], ac[5], ac[6], ac[7]);
+        let (b0, b1, b2, b3, b4, b5, b6, b7) =
+            (bc[0], bc[1], bc[2], bc[3], bc[4], bc[5], bc[6], bc[7]);
 
         dot0 += a0 * b0;
         dot1 += a1 * b1;
@@ -765,12 +841,12 @@ fn cosine_scalar(a: &[f32], b: &[f32]) -> f64 {
     let mut na = ((na0 + na1) + (na2 + na3)) as f64 + ((na4 + na5) + (na6 + na7)) as f64;
     let mut nb = ((nb0 + nb1) + (nb2 + nb3)) as f64 + ((nb4 + nb5) + (nb6 + nb7)) as f64;
 
-    for i in (chunks * 8)..n {
-        let x = a[i] as f64;
-        let y = b[i] as f64;
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        let xd = x as f64;
+        let yd = y as f64;
+        dot += xd * yd;
+        na += xd * xd;
+        nb += yd * yd;
     }
 
     if !dot.is_finite() || !na.is_finite() || !nb.is_finite() || na <= 1e-18 || nb <= 1e-18 {
@@ -877,8 +953,10 @@ unsafe fn cosine_with_q_norm_neon(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn cosine_with_q_norm_scalar(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
-    let n = qv.len();
-    let chunks = n / 8;
+    let n = qv.len().min(v.len());
+    let (qv, v) = (&qv[..n], &v[..n]);
+    let mut q_chunks = qv.chunks_exact(8);
+    let mut v_chunks = v.chunks_exact(8);
     let mut dot0 = 0.0f32;
     let mut dot1 = 0.0f32;
     let mut dot2 = 0.0f32;
@@ -897,25 +975,11 @@ fn cosine_with_q_norm_scalar(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
     let mut nb6 = 0.0f32;
     let mut nb7 = 0.0f32;
 
-    for c in 0..chunks {
-        let base = c * 8;
-        let a0 = qv[base];
-        let a1 = qv[base + 1];
-        let a2 = qv[base + 2];
-        let a3 = qv[base + 3];
-        let a4 = qv[base + 4];
-        let a5 = qv[base + 5];
-        let a6 = qv[base + 6];
-        let a7 = qv[base + 7];
-
-        let b0 = v[base];
-        let b1 = v[base + 1];
-        let b2 = v[base + 2];
-        let b3 = v[base + 3];
-        let b4 = v[base + 4];
-        let b5 = v[base + 5];
-        let b6 = v[base + 6];
-        let b7 = v[base + 7];
+    for (ac, bc) in (&mut q_chunks).zip(&mut v_chunks) {
+        let (a0, a1, a2, a3, a4, a5, a6, a7) =
+            (ac[0], ac[1], ac[2], ac[3], ac[4], ac[5], ac[6], ac[7]);
+        let (b0, b1, b2, b3, b4, b5, b6, b7) =
+            (bc[0], bc[1], bc[2], bc[3], bc[4], bc[5], bc[6], bc[7]);
 
         dot0 += a0 * b0;
         dot1 += a1 * b1;
@@ -939,11 +1003,11 @@ fn cosine_with_q_norm_scalar(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
     let mut dot = ((dot0 + dot1) + (dot2 + dot3)) as f64 + ((dot4 + dot5) + (dot6 + dot7)) as f64;
     let mut nb = ((nb0 + nb1) + (nb2 + nb3)) as f64 + ((nb4 + nb5) + (nb6 + nb7)) as f64;
 
-    for i in (chunks * 8)..n {
-        let x = qv[i] as f64;
-        let y = v[i] as f64;
-        dot += x * y;
-        nb += y * y;
+    for (&x, &y) in q_chunks.remainder().iter().zip(v_chunks.remainder()) {
+        let xd = x as f64;
+        let yd = y as f64;
+        dot += xd * yd;
+        nb += yd * yd;
     }
 
     if !dot.is_finite() || !nb.is_finite() || nb <= 1e-18 {
@@ -963,8 +1027,23 @@ fn cosine_with_q_norm_scalar(qv: &[f32], q_norm: f64, v: &[f32]) -> f64 {
 
 #[inline]
 pub(crate) fn l2_norm_f64(v: &[f32]) -> f64 {
-    let mut s = 0.0f64;
-    for &x in v {
+    let mut chunks = v.chunks_exact(4);
+    let mut s0 = 0.0f64;
+    let mut s1 = 0.0f64;
+    let mut s2 = 0.0f64;
+    let mut s3 = 0.0f64;
+    for c in &mut chunks {
+        let x0 = c[0] as f64;
+        let x1 = c[1] as f64;
+        let x2 = c[2] as f64;
+        let x3 = c[3] as f64;
+        s0 += x0 * x0;
+        s1 += x1 * x1;
+        s2 += x2 * x2;
+        s3 += x3 * x3;
+    }
+    let mut s = (s0 + s1) + (s2 + s3);
+    for &x in chunks.remainder() {
         let xd = x as f64;
         s += xd * xd;
     }
@@ -1134,7 +1213,7 @@ thread_local! {
 struct HnswNode<T> {
     id: usize,
     vector: Arc<[T]>,
-    neighbors: Vec<Vec<usize>>,
+    neighbors: smallvec::SmallVec<[Vec<usize>; 2]>,
 }
 
 /// Generic Hierarchical Navigable Small World (HNSW) graph.
@@ -1199,6 +1278,9 @@ impl<T: HnswScalar> HnswGraph<T> {
         total += self.nodes.capacity() * std::mem::size_of::<HnswNode<T>>();
         for node in &self.nodes {
             total += node.vector.len() * std::mem::size_of::<T>();
+            if node.neighbors.spilled() {
+                total += node.neighbors.capacity() * std::mem::size_of::<Vec<usize>>();
+            }
             for level in &node.neighbors {
                 total += level.capacity() * std::mem::size_of::<usize>();
             }
@@ -1260,10 +1342,15 @@ impl<T: HnswScalar> HnswGraph<T> {
         let new_idx = self.nodes.len();
         self.id_to_idx.insert(id, new_idx);
 
+        let mut neighbors = smallvec::SmallVec::with_capacity(node_level + 1);
+        for lvl in 0..=node_level {
+            let cap = if lvl == 0 { self.m0 + 1 } else { self.m + 1 };
+            neighbors.push(Vec::with_capacity(cap));
+        }
         let new_node = HnswNode {
             id,
             vector: Arc::clone(&vector),
-            neighbors: vec![Vec::new(); node_level + 1],
+            neighbors,
         };
         self.nodes.push(new_node);
 
@@ -1299,17 +1386,22 @@ impl<T: HnswScalar> HnswGraph<T> {
 
         // 2. Search layer and connect from min(curr_max_level, node_level) down to 0
         let top_connect_level = curr_max_level.min(node_level);
-        let mut entry_points = vec![curr];
+        let mut entry_points: smallvec::SmallVec<[usize; 64]> = smallvec::smallvec![curr];
+        let mut selected: smallvec::SmallVec<[usize; 64]> = smallvec::SmallVec::new();
 
         for level in (0..=top_connect_level).rev() {
-            let candidates =
+            let mut candidates =
                 self.search_layer(&vector, q_ctx, &entry_points, self.ef_construction, level);
             let max_conn = if level == 0 { self.m0 } else { self.m };
-            let neighbors = self.select_neighbors(&candidates, max_conn);
+            candidates.sort_unstable_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
+            selected.clear();
+            selected.extend(candidates.iter().take(max_conn).map(|n| n.idx));
 
-            self.nodes[new_idx].neighbors[level] = neighbors.clone();
+            let new_nbrs = &mut self.nodes[new_idx].neighbors[level];
+            new_nbrs.clear();
+            new_nbrs.extend_from_slice(&selected);
 
-            for &nbr in &neighbors {
+            for &nbr in &selected {
                 if level < self.nodes[nbr].neighbors.len() {
                     self.nodes[nbr].neighbors[level].push(new_idx);
                     if self.nodes[nbr].neighbors[level].len() > max_conn {
@@ -1318,7 +1410,8 @@ impl<T: HnswScalar> HnswGraph<T> {
                 }
             }
 
-            entry_points = candidates.into_iter().map(|n| n.idx).collect();
+            entry_points.clear();
+            entry_points.extend(candidates.into_iter().map(|n| n.idx));
         }
 
         if node_level > self.max_level {
@@ -1382,27 +1475,23 @@ impl<T: HnswScalar> HnswGraph<T> {
         })
     }
 
-    fn select_neighbors(&self, candidates: &[MaxSimNode], max_conn: usize) -> Vec<usize> {
-        let mut sorted = candidates.to_vec();
-        sorted.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
-        sorted.truncate(max_conn);
-        sorted.into_iter().map(|n| n.idx).collect()
-    }
-
     fn prune_neighbors(&mut self, node_idx: usize, level: usize, max_conn: usize) {
-        let node_vec = Arc::clone(&self.nodes[node_idx].vector);
-        let q_ctx = T::prepare_query(&node_vec);
-        let nbrs = &self.nodes[node_idx].neighbors[level];
-        let mut scored: Vec<MaxSimNode> = nbrs
-            .iter()
-            .map(|&nbr| MaxSimNode {
-                sim: T::sim_ctx(&node_vec, q_ctx, &self.nodes[nbr].vector),
-                idx: nbr,
-            })
-            .collect();
-        scored.sort_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
+        let mut scored: smallvec::SmallVec<[MaxSimNode; 64]> = smallvec::SmallVec::new();
+        {
+            let node_vec = &self.nodes[node_idx].vector;
+            let q_ctx = T::prepare_query(node_vec);
+            for &nbr in &self.nodes[node_idx].neighbors[level] {
+                scored.push(MaxSimNode {
+                    sim: T::sim_ctx(node_vec, q_ctx, &self.nodes[nbr].vector),
+                    idx: nbr,
+                });
+            }
+        }
+        scored.sort_unstable_by(|a, b| b.sim.partial_cmp(&a.sim).unwrap_or(Ordering::Equal));
         scored.truncate(max_conn);
-        self.nodes[node_idx].neighbors[level] = scored.into_iter().map(|d| d.idx).collect();
+        let nbrs = &mut self.nodes[node_idx].neighbors[level];
+        nbrs.clear();
+        nbrs.extend(scored.into_iter().map(|d| d.idx));
     }
 
     fn search_raw(&self, query: &[T], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
@@ -1593,7 +1682,40 @@ pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
     sim.clamp(-1.0, 1.0)
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline]
+unsafe fn dot_sq8_neon(a: &[i8], b: &[i8], n: usize) -> i32 {
+    use std::arch::aarch64::*;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    let chunks64 = n / 64;
+    let mut total = unsafe {
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        let mut acc2 = vdupq_n_s32(0);
+        let mut acc3 = vdupq_n_s32(0);
+        for c in 0..chunks64 {
+            let off = c * 64;
+            acc0 = vdotq_s32(acc0, vld1q_s8(ap.add(off)), vld1q_s8(bp.add(off)));
+            acc1 = vdotq_s32(acc1, vld1q_s8(ap.add(off + 16)), vld1q_s8(bp.add(off + 16)));
+            acc2 = vdotq_s32(acc2, vld1q_s8(ap.add(off + 32)), vld1q_s8(bp.add(off + 32)));
+            acc3 = vdotq_s32(acc3, vld1q_s8(ap.add(off + 48)), vld1q_s8(bp.add(off + 48)));
+        }
+        let mut acc = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+        let mut off = chunks64 * 64;
+        while off + 16 <= n {
+            acc = vdotq_s32(acc, vld1q_s8(ap.add(off)), vld1q_s8(bp.add(off)));
+            off += 16;
+        }
+        (vaddvq_s32(acc), off)
+    };
+    for i in total.1..n {
+        total.0 += (a[i] as i32) * (b[i] as i32);
+    }
+    total.0
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
 #[inline]
 unsafe fn dot_sq8_neon(a: &[i8], b: &[i8], n: usize) -> i32 {
     use std::arch::aarch64::*;
@@ -1623,26 +1745,24 @@ unsafe fn dot_sq8_neon(a: &[i8], b: &[i8], n: usize) -> i32 {
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn dot_sq8_scalar(a: &[i8], b: &[i8], n: usize) -> i32 {
-    let chunks = n / 8;
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
     let mut sum0 = 0i32;
     let mut sum1 = 0i32;
     let mut sum2 = 0i32;
     let mut sum3 = 0i32;
 
-    for i in 0..chunks {
-        let base = i * 8;
-        sum0 += (a[base] as i32) * (b[base] as i32) + (a[base + 1] as i32) * (b[base + 1] as i32);
-        sum1 += (a[base + 2] as i32) * (b[base + 2] as i32)
-            + (a[base + 3] as i32) * (b[base + 3] as i32);
-        sum2 += (a[base + 4] as i32) * (b[base + 4] as i32)
-            + (a[base + 5] as i32) * (b[base + 5] as i32);
-        sum3 += (a[base + 6] as i32) * (b[base + 6] as i32)
-            + (a[base + 7] as i32) * (b[base + 7] as i32);
+    for (ac, bc) in (&mut a_chunks).zip(&mut b_chunks) {
+        sum0 += (ac[0] as i32) * (bc[0] as i32) + (ac[1] as i32) * (bc[1] as i32);
+        sum1 += (ac[2] as i32) * (bc[2] as i32) + (ac[3] as i32) * (bc[3] as i32);
+        sum2 += (ac[4] as i32) * (bc[4] as i32) + (ac[5] as i32) * (bc[5] as i32);
+        sum3 += (ac[6] as i32) * (bc[6] as i32) + (ac[7] as i32) * (bc[7] as i32);
     }
 
     let mut total = (sum0 + sum1) + (sum2 + sum3);
-    for i in (chunks * 8)..n {
-        total += (a[i] as i32) * (b[i] as i32);
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        total += (x as i32) * (y as i32);
     }
     total
 }
@@ -1662,9 +1782,12 @@ impl HnswGraph<i8> {
 
     /// Search for `k` approximate nearest neighbors with a raw `f32` query vector.
     ///
-    /// The query vector is quantized once to SQ8 before traversing the index graph.
+    /// The query vector is quantized once to SQ8 on the stack (for `dim <= 1024`) before traversing.
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(f64, usize)> {
-        let q_sq8 = quantize_sq8(query);
+        let mut q_sq8: smallvec::SmallVec<[i8; 1024]> =
+            smallvec::SmallVec::with_capacity(query.len());
+        q_sq8.resize(query.len(), 0);
+        quantize_sq8_into(query, &mut q_sq8);
         self.search_sq8(&q_sq8, k, ef_search)
     }
 
@@ -1780,13 +1903,8 @@ pub(crate) enum RowEmbedText<'a> {
     Appended,
 }
 
-/// Append or extract the text blob used for embedding a row (title / body / snippet).
-/// Reuses `buf` if multiple fields are present.
-pub(crate) fn prepare_row_embed_text<'a>(
-    row: &'a crate::store::Row,
-    buf: &mut String,
-) -> RowEmbedText<'a> {
-    let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));
+#[inline]
+fn prepare_embed_texts<'a>(texts: [Option<&'a str>; 3], buf: &mut String) -> RowEmbedText<'a> {
     let bytes = texts.iter().flatten().map(|t| t.len()).sum::<usize>();
     if bytes == 0 {
         return RowEmbedText::Empty;
@@ -1805,6 +1923,31 @@ pub(crate) fn prepare_row_embed_text<'a>(
         buf.push_str(text);
     }
     RowEmbedText::Appended
+}
+
+#[inline]
+fn prepare_row_embed_text_slots<'a>(
+    row: &'a crate::store::Row,
+    slots: &mut [crate::store::row::FieldSlot<'_>; 3],
+    buf: &mut String,
+) -> RowEmbedText<'a> {
+    let [s0, s1, s2] = slots;
+    let texts = [
+        s0.get(row).and_then(crate::store::Cell::text),
+        s1.get(row).and_then(crate::store::Cell::text),
+        s2.get(row).and_then(crate::store::Cell::text),
+    ];
+    prepare_embed_texts(texts, buf)
+}
+
+/// Append or extract the text blob used for embedding a row (title / body / snippet).
+/// Reuses `buf` if multiple fields are present.
+pub(crate) fn prepare_row_embed_text<'a>(
+    row: &'a crate::store::Row,
+    buf: &mut String,
+) -> RowEmbedText<'a> {
+    let texts = ["title", "body", "snippet"].map(|k| crate::store::row_text(row, k));
+    prepare_embed_texts(texts, buf)
 }
 
 /// Text blob used for embedding a row (title / body / snippet).

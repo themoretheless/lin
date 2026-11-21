@@ -259,7 +259,8 @@ impl Store {
 
         let snap = persist::read_snapshot(dir)?;
         let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
-        let mut store = match snap.clone() {
+        let prev_snap_hash = snap.as_ref().map(|s| s.catalog_hash.clone());
+        let mut store = match snap {
             Some(s) => Self::from_snapshot_unindexed(dir, s)?,
             None => {
                 let embed = persist::read_head(dir)?
@@ -291,8 +292,9 @@ impl Store {
         store.merge_extras_into(&mut live);
         let live_hash = catalog_hash(&live);
 
-        if let Some(mut snap_val) = snap
-            && snap_val.catalog_hash != live_hash
+        if let Some(old_hash) = prev_snap_hash
+            && old_hash != live_hash
+            && let Some(mut snap_val) = persist::read_snapshot(dir)?
         {
             snap_val.catalog_hash = live_hash.clone();
             persist::write_snapshot(dir, &snap_val)?;
@@ -1221,44 +1223,32 @@ impl Store {
             catalog_hash: persist.catalog_hash.clone(),
             embed_id: self.embed_id.clone(),
         };
-        let stubbed_collections;
-        let collections_ref = if !cold_names.is_empty() {
-            stubbed_collections = self
-                .collections
-                .iter()
-                .map(|(k, v)| {
-                    if cold_names.contains(k) {
-                        (k.clone(), Vec::new())
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-                .collect::<BTreeMap<_, _>>();
-            &stubbed_collections
+        let snap_path = persist::snapshot_path(&persist.dir);
+        if cold_names.is_empty() {
+            let snap_ref = SnapshotRef {
+                r#gen: self.r#gen,
+                embed_id: &self.embed_id,
+                next_id: self.next_id,
+                catalog_hash: &persist.catalog_hash,
+                log_offset: 0,
+                collections: &self.collections,
+                edges: &self.edges,
+                extra_collections: &self.extra_collections,
+                extra_rels: &self.extra_rels,
+                extra_indexes: &self.extra_indexes,
+                extra_filters: &self.extra_filters,
+                extra_owned: &self.extra_owned,
+                cold_collections: &cold_names,
+            };
+            persist::write_snapshot_ref_to_file_ext(&snap_path, &snap_ref, false)?;
         } else {
-            &self.collections
-        };
-
-        let snap_ref = SnapshotRef {
-            r#gen: self.r#gen,
-            embed_id: &self.embed_id,
-            next_id: self.next_id,
-            catalog_hash: &persist.catalog_hash,
-            log_offset: 0,
-            collections: collections_ref,
-            edges: &self.edges,
-            extra_collections: &self.extra_collections,
-            extra_rels: &self.extra_rels,
-            extra_indexes: &self.extra_indexes,
-            extra_filters: &self.extra_filters,
-            extra_owned: &self.extra_owned,
-            cold_collections: &cold_names,
-        };
-        persist::write_snapshot_ref_to_file_ext(
-            &persist::snapshot_path(&persist.dir),
-            &snap_ref,
-            false,
-        )?;
+            write_snapshot_stubbing_cold(
+                &snap_path,
+                self,
+                &persist.catalog_hash,
+                &cold_names,
+            )?;
+        }
         persist::write_head_no_dir_sync(&persist.dir, &head)?;
         persist::sync_dir_checked(&persist.dir)?;
         persist::compact_log(&mut persist.log)?;
@@ -1498,21 +1488,252 @@ impl Store {
     }
 }
 
+/// Write a `0x03` chunked snapshot stubbing out `cold_names` to empty row slices without
+/// cloning non-cold `Vec<Row>` collections.
+fn write_snapshot_stubbing_cold(
+    path: &Path,
+    store: &Store,
+    catalog_hash: &str,
+    cold_names: &[String],
+) -> Result<(), Error> {
+    use std::io::Write as _;
+
+    #[derive(serde::Serialize)]
+    struct SnapshotHeaderOut<'a> {
+        r#gen: u64,
+        embed_id: &'a str,
+        next_id: u64,
+        catalog_hash: &'a str,
+        log_offset: u64,
+        edges: &'a [super::Edge],
+        extra_collections: &'a BTreeMap<String, ColSnap>,
+        extra_rels: &'a BTreeMap<String, persist::RelSnap>,
+        extra_indexes: &'a BTreeMap<String, IndexSnap>,
+        extra_filters: &'a BTreeMap<String, String>,
+        extra_owned: &'a BTreeMap<String, Vec<(String, String)>>,
+        cold_collections: &'a [String],
+    }
+
+    struct CrcWriter<'a, W: std::io::Write> {
+        inner: &'a mut W,
+        crc: crate::crc::Hasher,
+    }
+    impl<W: std::io::Write> std::io::Write for CrcWriter<'_, W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.crc.update(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let cold_set: FxHashSet<&str> = cold_names.iter().map(String::as_str).collect();
+    let tmp = path.with_extension("bin.tmp");
+    let result = (|| -> Result<(), Error> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(persist::io_err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        let mut writer = std::io::BufWriter::with_capacity(128 * 1024, file);
+        {
+            let mut hashing = CrcWriter {
+                inner: &mut writer,
+                crc: crate::crc::Hasher::new(),
+            };
+            hashing.write_all(&[0x03]).map_err(persist::io_err)?;
+            hashing
+                .write_all(&persist::SNAPSHOT_MAGIC)
+                .map_err(persist::io_err)?;
+
+            let header = SnapshotHeaderOut {
+                r#gen: store.r#gen,
+                embed_id: &store.embed_id,
+                next_id: store.next_id,
+                catalog_hash,
+                log_offset: 0,
+                edges: &store.edges,
+                extra_collections: &store.extra_collections,
+                extra_rels: &store.extra_rels,
+                extra_indexes: &store.extra_indexes,
+                extra_filters: &store.extra_filters,
+                extra_owned: &store.extra_owned,
+                cold_collections: cold_names,
+            };
+            let header_bytes = rmp_serde::encode::to_vec_named(&header).map_err(persist::io_err)?;
+            hashing
+                .write_all(&(header_bytes.len() as u32).to_le_bytes())
+                .map_err(persist::io_err)?;
+            hashing.write_all(&header_bytes).map_err(persist::io_err)?;
+
+            const CHUNK_ROWS: usize = 512;
+            struct ChunkDef<'a> {
+                name: &'a str,
+                rows: &'a [super::Row],
+            }
+            let mut chunk_defs = Vec::new();
+            for (name, rows) in &store.collections {
+                if cold_set.contains(name.as_str()) || rows.is_empty() {
+                    chunk_defs.push(ChunkDef {
+                        name: name.as_str(),
+                        rows: &[],
+                    });
+                } else {
+                    for chunk in rows.chunks(CHUNK_ROWS) {
+                        chunk_defs.push(ChunkDef {
+                            name: name.as_str(),
+                            rows: chunk,
+                        });
+                    }
+                }
+            }
+
+            let encode_chunk = |rows: &[super::Row]| -> Result<Vec<u8>, Error> {
+                if rows.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut col_buf = Vec::new();
+                let raw = if let Some((magic, _)) =
+                    persist::encode_insert_rows_direct(0, 0, "", rows, &mut col_buf)
+                {
+                    let mut framed = Vec::with_capacity(8 + col_buf.len());
+                    framed.extend_from_slice(b"LCOL");
+                    framed.extend_from_slice(&magic);
+                    framed.extend_from_slice(&col_buf);
+                    framed
+                } else {
+                    rmp_serde::encode::to_vec_named(rows).map_err(persist::io_err)?
+                };
+                #[cfg(feature = "compress-zstd")]
+                {
+                    zstd::encode_all(&raw[..], 1).map_err(persist::io_err)
+                }
+                #[cfg(not(feature = "compress-zstd"))]
+                {
+                    Ok(raw)
+                }
+            };
+
+            let encoded_chunks: Vec<Result<Vec<u8>, Error>> = if chunk_defs.len() > 1 {
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::*;
+                    chunk_defs.par_iter().map(|c| encode_chunk(c.rows)).collect()
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::with_capacity(chunk_defs.len());
+                        for c in &chunk_defs {
+                            handles.push(s.spawn(move || encode_chunk(c.rows)));
+                        }
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    })
+                }
+            } else {
+                chunk_defs.iter().map(|c| encode_chunk(c.rows)).collect()
+            };
+
+            hashing
+                .write_all(&(chunk_defs.len() as u32).to_le_bytes())
+                .map_err(persist::io_err)?;
+            for (c, encoded) in chunk_defs.iter().zip(encoded_chunks) {
+                let data = encoded?;
+                let name_bytes = c.name.as_bytes();
+                hashing
+                    .write_all(&(name_bytes.len() as u16).to_le_bytes())
+                    .map_err(persist::io_err)?;
+                hashing.write_all(name_bytes).map_err(persist::io_err)?;
+                hashing
+                    .write_all(&(data.len() as u32).to_le_bytes())
+                    .map_err(persist::io_err)?;
+                if !data.is_empty() {
+                    hashing.write_all(&data).map_err(persist::io_err)?;
+                }
+            }
+            hashing.write_all(b"LCRC").map_err(persist::io_err)?;
+            let crc = hashing.crc.finalize();
+            writer
+                .write_all(&crc.to_le_bytes())
+                .map_err(persist::io_err)?;
+        }
+        writer.flush().map_err(persist::io_err)?;
+        let file = writer.into_inner().map_err(persist::io_err)?;
+        persist::durable_sync(&file)
+            .or_else(|_| file.sync_all())
+            .map_err(persist::io_err)?;
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(persist::io_err)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// A logged delete only has to identify its rows: replay finds them by `id` (or `uri`), and
 /// facts by their `s` / `p` / `o` triple. Dropping every other field keeps the record small —
 /// whole rows carry bodies and embeddings, and a few thousand documents overflow the WAL
 /// record limit. Rows without any key field are logged unchanged.
 fn slim_delete_rows(pack: &mut Pack) {
+    static SHAPE_URI: std::sync::LazyLock<Arc<super::RowShape>> =
+        std::sync::LazyLock::new(|| super::Row::shape_of(&["uri"]));
+    static SHAPE_ID_URI: std::sync::LazyLock<Arc<super::RowShape>> =
+        std::sync::LazyLock::new(|| super::Row::shape_of(&["id", "uri"]));
+
     match pack {
         Pack::Delete { collection, rows } => {
-            let keys: &[&str] = if collection == "facts" {
-                &["s", "p", "o"]
+            if collection == "facts" {
+                let ops_shape = super::edges::facts_ops_shape();
+                for row in rows.iter_mut() {
+                    if row.shape_arc().is_some_and(|s| Arc::ptr_eq(s, ops_shape)) {
+                        continue;
+                    }
+                    let o = row.get_str("o").map(super::Cell::clone_for_borrow);
+                    let p = row.get_str("p").map(super::Cell::clone_for_borrow);
+                    let s = row.get_str("s").map(super::Cell::clone_for_borrow);
+                    match (o, p, s) {
+                        (Some(o), Some(p), Some(s)) => {
+                            *row = super::Row::from_parts(Arc::clone(ops_shape), [o, p, s]);
+                        }
+                        (None, None, None) => {}
+                        _ => {
+                            row.retain(|k, _| matches!(k.as_str(), "s" | "p" | "o"));
+                        }
+                    }
+                }
             } else {
-                &["id", "uri"]
-            };
-            for row in rows.iter_mut() {
-                if keys.iter().any(|k| row.contains_key(*k)) {
-                    row.retain(|k, _| keys.contains(&k.as_str()));
+                let id_shape = super::value::shape_id();
+                for row in rows.iter_mut() {
+                    let id = row.get_str("id");
+                    let uri = row.get_str("uri");
+                    match (id, uri) {
+                        (Some(_), None) if row.len() == 1 => {}
+                        (Some(c), None) => {
+                            let c0 = c.clone_for_borrow();
+                            *row = super::Row::from_single(Arc::clone(id_shape), c0);
+                        }
+                        (None, Some(_)) if row.len() == 1 => {}
+                        (None, Some(c)) => {
+                            let c0 = c.clone_for_borrow();
+                            *row = super::Row::from_single(Arc::clone(&SHAPE_URI), c0);
+                        }
+                        (Some(_), Some(_)) if row.len() == 2 => {}
+                        (Some(c0), Some(c1)) => {
+                            let (c0, c1) = (c0.clone_for_borrow(), c1.clone_for_borrow());
+                            *row = super::Row::from_pair(Arc::clone(&SHAPE_ID_URI), c0, c1);
+                        }
+                        (None, None) => {}
+                    }
                 }
             }
         }

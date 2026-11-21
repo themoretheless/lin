@@ -14,7 +14,10 @@ pub struct OllamaEmbedder {
     id: String,
     dim: usize,
     base_url: String,
+    endpoint_url: String,
     model: String,
+    agent: ureq::Agent,
+    zero_vec: Arc<[f32]>,
 }
 
 impl OllamaEmbedder {
@@ -51,11 +54,17 @@ impl OllamaEmbedder {
                 return Err(Error::runtime("remote HTTP requires TLS (https://)"));
             }
         }
+        let endpoint_url = format!("{base}/api/embeddings");
+        let agent = ureq::Agent::new_with_defaults();
+        let zero_vec: Arc<[f32]> = Arc::from(vec![0f32; dim]);
         Ok(Self {
             id,
             dim,
             base_url: base,
+            endpoint_url,
             model,
+            agent,
+            zero_vec,
         })
     }
 
@@ -78,12 +87,12 @@ impl Embedder for OllamaEmbedder {
     }
 
     fn embed(&self, text: &str) -> Arc<[f32]> {
-        match embed_ollama(&self.base_url, &self.model, text) {
+        match embed_ollama_endpoint(&self.agent, &self.endpoint_url, &self.model, text) {
             Ok(v) => {
                 if v.len() == self.dim {
                     Arc::from(v)
                 } else if v.is_empty() {
-                    Arc::from(vec![0f32; self.dim])
+                    Arc::clone(&self.zero_vec)
                 } else {
                     // Truncate / pad to catalog dim so cosine stays defined.
                     let mut out = vec![0f32; self.dim];
@@ -92,18 +101,34 @@ impl Embedder for OllamaEmbedder {
                     Arc::from(out)
                 }
             }
-            Err(_) => Arc::from(vec![0f32; self.dim]),
+            Err(_) => Arc::clone(&self.zero_vec),
         }
     }
 }
 
-fn embed_ollama(base_url: &str, model: &str, text: &str) -> Result<Vec<f32>, Error> {
-    let url = format!("{base_url}/api/embeddings");
-    let body = serde_json::json!({
-        "model": model,
-        "prompt": text,
-    });
-    let resp = ureq::post(&url)
+#[derive(serde::Serialize)]
+struct OllamaEmbedReq<'a> {
+    model: &'a str,
+    prompt: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaEmbedResp {
+    embedding: Vec<f32>,
+}
+
+fn embed_ollama_endpoint(
+    agent: &ureq::Agent,
+    endpoint_url: &str,
+    model: &str,
+    text: &str,
+) -> Result<Vec<f32>, Error> {
+    let body = OllamaEmbedReq {
+        model,
+        prompt: text,
+    };
+    let resp = agent
+        .post(endpoint_url)
         .send_json(&body)
         .map_err(|e| Error::runtime(format!("ollama embed: {e}")))?;
     let status = resp.status();
@@ -113,22 +138,18 @@ fn embed_ollama(base_url: &str, model: &str, text: &str) -> Result<Vec<f32>, Err
             status.as_u16()
         )));
     }
-    let parsed: serde_json::Value = resp
+    let parsed: OllamaEmbedResp = resp
         .into_body()
         .read_json()
         .map_err(|e| Error::runtime(format!("ollama embed json: {e}")))?;
-    let arr = parsed
-        .get("embedding")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::runtime("ollama embed: missing embedding array"))?;
-    let mut out = Vec::with_capacity(arr.len());
-    for x in arr {
-        let f = x
-            .as_f64()
-            .ok_or_else(|| Error::runtime("ollama embed: non-float in embedding"))?;
-        out.push(f as f32);
-    }
-    Ok(out)
+    Ok(parsed.embedding)
+}
+
+#[cfg(test)]
+fn embed_ollama(base_url: &str, model: &str, text: &str) -> Result<Vec<f32>, Error> {
+    let agent = ureq::Agent::new_with_defaults();
+    let endpoint_url = format!("{base_url}/api/embeddings");
+    embed_ollama_endpoint(&agent, &endpoint_url, model, text)
 }
 
 #[cfg(test)]

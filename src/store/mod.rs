@@ -12,9 +12,10 @@ pub use crate::catalog::catalog_hash;
 pub(crate) use checkpoint::StoreOpenPhases;
 pub use columnar::DictColumn;
 pub use edges::Edge;
+#[allow(unused_imports)]
 pub(crate) use value::{
-    intern_wing, shape_id_title, take_general_rows, take_recycled_id_title_vec,
-    take_single_id_title_vec_with_arcs, wrap_single_row_vec,
+    cell_arc_or_empty, empty_arc_str, intern_wing, shape_id, shape_id_title, take_general_rows,
+    take_recycled_id_title_vec, take_single_id_title_vec_with_arcs, wrap_single_row_vec,
 };
 #[allow(unused_imports)]
 pub use value::{
@@ -323,7 +324,7 @@ pub struct Store {
     /// without cloning full `BTreeMap` rows. Organized SoA (struct-of-arrays) for cache locality.
     pub(crate) docs_id: Vec<Arc<str>>,
     pub(crate) docs_title: Vec<Arc<str>>,
-    docs_title_packed: OnceLock<(Vec<u8>, bool)>,
+    docs_title_packed: OnceLock<Arc<(Vec<u8>, bool)>>,
     pub(crate) docs_epoch: u64,
     docs_layer: DictColumn,
     pub(crate) docs_wing: DictColumn,
@@ -1052,40 +1053,6 @@ impl Store {
         self.promote_disk_col(name);
     }
 
-    fn clone_rows_parallel(rows: &[Row]) -> Vec<Row> {
-        let n = rows.len();
-        if n < 65536 {
-            return rows.to_vec();
-        }
-        let max_threads = if n >= 8192 { 8 } else { 4 };
-        let threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1)
-            .min(max_threads)
-            .min((n + 511) / 512);
-        if threads <= 1 {
-            return rows.to_vec();
-        }
-        let chunk_size = (n + threads - 1) / threads;
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(threads - 1);
-            let mut all_chunks = rows.chunks(chunk_size);
-            for _ in 0..threads - 1 {
-                if let Some(chunk) = all_chunks.next() {
-                    handles.push(scope.spawn(move || chunk.to_vec()));
-                }
-            }
-            let my_chunk = all_chunks.next().unwrap_or(&[]);
-            let my_work = my_chunk.to_vec();
-            let mut out = Vec::with_capacity(n);
-            for handle in handles {
-                out.extend(handle.join().expect("row clone worker panicked"));
-            }
-            out.extend(my_work);
-            out
-        })
-    }
-
     /// Deep-copy the memory image (no durable handle). Used for read snapshots.
     pub fn clone_mem(&mut self) -> Self {
         self.flush_fts_deferred_docs();
@@ -1112,17 +1079,13 @@ impl Store {
         });
         let docs_title_packed = OnceLock::new();
         if let Some(val) = self.docs_title_packed.get() {
-            let _ = docs_title_packed.set(val.clone());
-        }
-        let mut collections = BTreeMap::new();
-        for (name, rows) in &self.collections {
-            collections.insert(name.clone(), Self::clone_rows_parallel(rows));
+            let _ = docs_title_packed.set(Arc::clone(val));
         }
         Self {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
-            collections: self.collections.clone_with_map(collections),
+            collections: self.collections.clone(),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
@@ -1198,7 +1161,7 @@ impl Store {
                     }
                     return;
                 }
-                let emb = row.get("embedding").and_then(|c| match c {
+                let emb = row.get_str("embedding").and_then(|c| match c {
                     Cell::Vec(v) => Some(Arc::clone(v)),
                     _ => None,
                 });
@@ -1207,9 +1170,9 @@ impl Store {
                 // Update cache-friendly count tracking
                 self.update_col_count(collection, 1);
 
-                self.row_maps_register(collection, idx);
-                let _ = self.index_insert_at(collection, idx);
-                self.fts_insert_at(collection, idx);
+                self.row_maps_register_row(collection, idx, row);
+                let _ = self.index_insert_row(collection, idx, row);
+                self.fts_insert_row(collection, idx, row);
                 if let Some(v) = emb
                     && let Some(hnsw) = self.hnsw.get_mut(collection)
                 {
@@ -1281,9 +1244,7 @@ impl Store {
                 }
             }
             Pack::AppendFact { row } => {
-                // Zero-copy borrow: avoid unnecessary clone from owned Row
-                let (result, _) = self.append_fact_row(&row);
-                drop(result); // Drop the returned row since we already updated collection
+                let _ = self.append_fact_row_no_ret(row);
             }
             Pack::AppendFactsBulk { s, p, o } => {
                 let _ = self.append_facts_spo_bulk(s, p, o, false);
@@ -1308,19 +1269,26 @@ impl Store {
                 }
                 let mut new_rows = 0;
                 for new in rows {
-                    let id = row_text(new, "id").map(str::to_string);
-                    let idx = id.as_ref().and_then(|id| self.row_index(collection, id));
-                    let new_emb = new.get("embedding").and_then(|c| match c {
+                    let idx = row_text(new, "id").and_then(|id| self.row_index(collection, id));
+                    let new_emb = new.get_str("embedding").and_then(|c| match c {
                         Cell::Vec(v) => Some(Arc::clone(v)),
                         _ => None,
                     });
                     if let Some(i) = idx {
-                        let before = self.collection(collection)[i].clone();
-                        let emb_changed = before.get("embedding") != new.get("embedding");
-                        self.collection_mut(collection)[i] = new.clone();
+                        let before = std::mem::replace(
+                            &mut self.collection_mut(collection)[i],
+                            new.clone(),
+                        );
+                        let emb_changed =
+                            before.get_str("embedding") != new.get_str("embedding");
                         self.row_maps_sync_updated(collection, i, &before, new);
                         let _ = self.index_update_row(collection, i, &before, new);
-                        self.fts_sync_at(collection, i, &before);
+                        if collection == "docs" {
+                            self.flush_fts_deferred_docs();
+                        }
+                        if let Some(fts) = self.fts.get_mut(collection) {
+                            fts.sync_row(i, &before, new);
+                        }
                         if emb_changed && let Some(hnsw) = self.hnsw.get_mut(collection) {
                             if let Some(v) = new_emb {
                                 hnsw.insert(i, v);
@@ -1333,9 +1301,9 @@ impl Store {
                     self.collection_mut(collection).push(new.clone());
                     let i = self.collection(collection).len() - 1;
                     new_rows += 1;
-                    self.row_maps_register(collection, i);
-                    let _ = self.index_insert_at(collection, i);
-                    self.fts_insert_at(collection, i);
+                    self.row_maps_register_row(collection, i, new);
+                    let _ = self.index_insert_row(collection, i, new);
+                    self.fts_insert_row(collection, i, new);
                     if let Some(v) = new_emb
                         && let Some(hnsw) = self.hnsw.get_mut(collection)
                     {
@@ -1482,7 +1450,7 @@ impl Store {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
-            collections: (*self.collections).clone(),
+            collections: self.collections.share_arc(),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
@@ -1515,7 +1483,7 @@ impl Store {
             r#gen: self.r#gen,
             embed_id: self.embed_id.clone(),
             next_id: self.next_id,
-            collections: (*self.collections).clone(),
+            collections: self.collections.share_arc(),
             edges: self.edges.clone(),
             extra_collections: self.extra_collections.clone(),
             extra_rels: self.extra_rels.clone(),
@@ -1535,7 +1503,7 @@ impl Store {
         self.r#gen = b.r#gen;
         self.embed_id = b.embed_id;
         self.next_id = b.next_id;
-        self.collections = b.collections.into();
+        self.collections = rowmap::RowMap::from_arc(b.collections);
         self.edges = b.edges;
         self.extra_collections = b.extra_collections;
         self.extra_rels = b.extra_rels;
@@ -1651,10 +1619,22 @@ impl Store {
             if self.edge_keys.len() == self.edges.len() {
                 for idx in (mark.edge_len..self.edges.len()).rev() {
                     let e = &self.edges[idx];
-                    let rel_arc = Arc::<str>::from(e.rel.as_str());
-                    let from_arc = Arc::<str>::from(e.from.as_str());
-                    let to_arc = Arc::<str>::from(e.to.as_str());
-                    self.edge_keys.remove(&(rel_arc, from_arc, to_arc));
+                    if let Some((rel_arc, out_by_node)) = self.edges_out.get_key_value(e.rel.as_str())
+                        && let Some((from_arc, _)) = out_by_node.get_key_value(e.from.as_str())
+                        && let Some((to_arc, _)) = self
+                            .edges_in
+                            .get(e.rel.as_str())
+                            .and_then(|m| m.get_key_value(e.to.as_str()))
+                    {
+                        let probe = std::mem::ManuallyDrop::new(unsafe {
+                            (
+                                std::ptr::read(rel_arc),
+                                std::ptr::read(from_arc),
+                                std::ptr::read(to_arc),
+                            )
+                        });
+                        self.edge_keys.remove(&*probe);
+                    }
                     if let Some(by_node) = self.edges_out.get_mut(e.rel.as_str())
                         && let Some(list) = by_node.get_mut(e.from.as_str())
                     {
@@ -2428,24 +2408,26 @@ impl Store {
 
     /// Single-row hot projection from parallel docs columns.
     pub fn project_docs_hot_idx(&self, i: usize, fields: &[String]) -> Option<Row> {
-        if i >= self.docs_id.len() {
+        if i >= self.docs_id.len() || !fields.iter().all(|f| docs_hot_field(f)) {
             return None;
         }
-        if fields.len() == 2 && fields[0] == "id" && fields[1] == "title" {
+        if fields.is_empty() {
+            return Some(Row::new());
+        }
+        if fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"))
+        {
             return Some(row_id_title(&self.docs_id[i], &self.docs_title[i]));
         }
-        let mut row = Row::new();
-        for f in fields {
-            let cell = match f.as_str() {
-                "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
-                "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
-                "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
-                "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
-                _ => return None,
-            };
-            row.insert(f.clone(), cell);
-        }
-        Some(row)
+        let plan = columnar::DocHotPlan::new(fields);
+        Some(plan.build_row(
+            i,
+            &self.docs_id,
+            &self.docs_title,
+            &self.docs_layer,
+            &self.docs_wing,
+        ))
     }
 
     pub fn rebuild_row_maps(&mut self) {
@@ -2470,8 +2452,8 @@ impl Store {
             self.facts_p.reserve(facts.len());
             self.facts_o.reserve(facts.len());
             for row in facts {
-                let (s, p, o) =
-                    spo_key(row).unwrap_or_else(|| (Arc::from(""), Arc::from(""), Arc::from("")));
+                let (s, p, o) = spo_key(row)
+                    .unwrap_or_else(|| (empty_arc_str(), empty_arc_str(), empty_arc_str()));
                 self.facts_s.push(s);
                 self.facts_p.push(p);
                 self.facts_o.push(o);
@@ -2632,6 +2614,7 @@ impl Store {
         }
         if !self.deferred_doc_wing_updates.is_empty() {
             let updates = std::mem::take(&mut self.deferred_doc_wing_updates);
+            self.retired_cells.clear();
             for upd in updates {
                 let new_cell = Cell::Text(Arc::clone(&upd.new_wing));
                 for live_idx in self.indexes.values_mut() {
@@ -2666,19 +2649,23 @@ impl Store {
             return;
         }
         let swaps = std::mem::take(&mut self.fts_deferred_doc_swaps);
+        let retired_rows = std::mem::take(&mut self.retired_rows);
+        self.retired_doc_ids.clear();
+        self.retired_arcs.clear();
+        self.retired_cells.clear();
         for (p, r_idx, last) in swaps {
             let old_n = last + 1;
-            if let Some(doomed) = self.retired_rows.get(r_idx).cloned() {
+            if let Some(doomed) = retired_rows.get(r_idx) {
                 if p != last {
-                    self.index_swap_remove_rows("docs", p, &doomed, last);
+                    self.index_swap_remove_rows("docs", p, doomed, last);
                     if let Some(fts) = self.fts.get_mut("docs")
                         && let Some(docs) = self.collections.get("docs")
                         && let Some(tail) = docs.get(p)
                     {
-                        fts.swap_remove_row(p, &doomed, last, tail);
+                        fts.swap_remove_row(p, doomed, last, tail);
                     }
                     if !self.docs_by_uri.is_empty() {
-                        if let Some(dead_uri) = row_text(&doomed, "uri") {
+                        if let Some(dead_uri) = row_text(doomed, "uri") {
                             self.docs_by_uri.remove(dead_uri);
                         }
                         if let Some(docs) = self.collections.get("docs")
@@ -2687,40 +2674,42 @@ impl Store {
                         {
                             if let Some(slot) = self.docs_by_uri.get_mut(u_s) {
                                 *slot = p;
-                            } else if let Some(uri) = tail.get("uri").and_then(Cell::text_shared) {
+                            } else if let Some(uri) =
+                                tail.get_str("uri").and_then(Cell::text_shared)
+                            {
                                 self.docs_by_uri.insert(uri, p);
                             }
                         }
                     }
                 } else {
-                    self.index_remove_row("docs", p, &doomed);
+                    self.index_remove_row("docs", p, doomed);
                     if let Some(fts) = self.fts.get_mut("docs") {
-                        fts.remove_row(p, &doomed);
+                        fts.remove_row(p, doomed);
                     }
                     if !self.docs_by_uri.is_empty()
-                        && let Some(dead_uri) = row_text(&doomed, "uri")
+                        && let Some(dead_uri) = row_text(doomed, "uri")
                     {
                         self.docs_by_uri.remove(dead_uri);
                     }
                 }
-            }
-            // The id map and the position translation are settled here too: left stale,
-            // the next row appended at `last` would be translated to `p` and never found.
-            if let Some(doomed) = self.retired_rows.get(r_idx)
-                && let Some(by_id) = self.by_id.get_mut("docs")
-            {
-                if let Some(dead_id) = row_text(doomed, "id") {
-                    by_id.remove(dead_id);
-                }
-                if p != last
-                    && let Some(tail_id) = self
-                        .collections
-                        .get("docs")
-                        .and_then(|docs| docs.get(p))
-                        .and_then(|tail| tail.get("id"))
-                        .and_then(Cell::text_shared)
-                {
-                    by_id.insert(tail_id, p);
+                // Settle the id map and position translation here so `retired_doc_ids` stays
+                // empty and subsequent deletes/inserts keep their fast paths enabled.
+                if let Some(by_id) = self.by_id.get_mut("docs") {
+                    if let Some(dead_id) = row_text(doomed, "id") {
+                        by_id.remove(dead_id);
+                    }
+                    if p != last
+                        && let Some(tail) = self.collections.get("docs").and_then(|docs| docs.get(p))
+                        && let Some(tail_s) = row_text(tail, "id")
+                    {
+                        if let Some(slot) = by_id.get_mut(tail_s) {
+                            *slot = p;
+                        } else if let Some(tail_id) =
+                            tail.get_str("id").and_then(Cell::text_shared)
+                        {
+                            by_id.insert(tail_id, p);
+                        }
+                    }
                 }
             }
             if let Some(at) = self
@@ -2730,12 +2719,8 @@ impl Store {
             {
                 self.docs_moved_idxs.remove(at);
             }
-            if self.docs_id.len() == old_n && p < old_n {
-                self.retired_doc_ids.push(self.docs_id.swap_remove(p));
-            }
-            if self.docs_title.len() == old_n && p < old_n {
-                self.retired_arcs.push(self.docs_title.swap_remove(p));
-            }
+            swap_pop_at(&mut self.docs_id, p, old_n);
+            swap_pop_at(&mut self.docs_title, p, old_n);
             self.docs_layer.swap_pop_at(p, old_n);
             self.docs_wing.swap_pop_at(p, old_n);
         }
@@ -2744,10 +2729,13 @@ impl Store {
     pub fn point_delete_docs_at_in_memory(
         &mut self,
         p: usize,
-        _precomputed_idx_keys: Option<&(crate::index::IndexKey, crate::index::IndexKey)>,
+        precomputed_idx_keys: Option<&(crate::index::IndexKey, crate::index::IndexKey)>,
     ) {
         if self.has_deferred_doc_ops() {
             self.flush_fts_deferred_docs();
+        }
+        if self.fts_deferred_doc_swaps.is_empty() && !self.retired_rows.is_empty() {
+            self.retired_rows.clear();
         }
         let old_n = match self.collections.get("docs") {
             Some(rows) => rows.len(),
@@ -2791,7 +2779,16 @@ impl Store {
         let doomed = self.collections.get_mut("docs").unwrap().swap_remove(p);
         let has_hnsw = !self.hnsw.is_empty();
         if p != last {
-            self.index_swap_remove_rows("docs", p, &doomed, last);
+            if let Some((kd, kt)) = precomputed_idx_keys
+                && self.indexes.len() == 1
+                && let Some(live_idx) = self.indexes.values_mut().next()
+                && live_idx.def.collection == "docs"
+                && live_idx.def.pred.is_none()
+            {
+                live_idx.swap_remove_keys(p, kd, last, kt);
+            } else {
+                self.index_swap_remove_rows("docs", p, &doomed, last);
+            }
             if has_hnsw && let Some(hnsw) = self.hnsw.get_mut("docs") {
                 hnsw.remove(p);
                 hnsw.move_id(last, p);
@@ -3148,12 +3145,7 @@ impl Store {
             // The slab's columns follow the rows array: the value at `p` moves to the
             // tail and the restored row takes `p`, which one swap-push expresses.
             if collection == "facts" {
-                let get = |f: &str| {
-                    doomed
-                        .get(f)
-                        .and_then(Cell::text_shared)
-                        .unwrap_or_default()
-                };
+                let get = |f: &str| cell_arc_or_empty(doomed.get_str(f));
                 swap_push_at(&mut self.facts_s, p, len, get("s"));
                 swap_push_at(&mut self.facts_p, p, len, get("p"));
                 swap_push_at(&mut self.facts_o, p, len, get("o"));
@@ -3227,32 +3219,23 @@ impl Store {
             self.docs_layer.reserve(n);
             self.docs_wing.reserve(n);
             let first = &rows[0];
-            let id_pos = first.keys().position(|k| k == "id");
-            let uri_pos = first.keys().position(|k| k == "uri");
-            let title_pos = first.keys().position(|k| k == "title");
-            let layer_pos = first.keys().position(|k| k == "layer");
-            let wing_pos = first.keys().position(|k| k == "wing");
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 {
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let id_pos = fshape.position("id");
+                let uri_pos = fshape.position("uri");
+                let title_pos = fshape.position("title");
+                let layer_pos = fshape.position("layer");
+                let wing_pos = fshape.position("wing");
                 for (i, row) in rows.iter().enumerate() {
-                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
-                    for (p, val) in row.values().enumerate().take(32) {
-                        cells[p] = val;
-                    }
-                    let id_arc: Arc<str> = id_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let uri_arc: Option<Arc<str>> = uri_pos.and_then(|p| cells[p].text_shared());
-                    let title_arc: Arc<str> = title_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let layer_arc: Arc<str> = layer_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let wing_arc: Arc<str> = wing_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-
+                    let cells = row.cells_slice();
+                    let id_arc = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                    let uri_arc = uri_pos.and_then(|p| cells[p].text_shared());
+                    let title_arc = cell_arc_or_empty(title_pos.map(|p| &cells[p]));
                     if !id_arc.is_empty() {
                         by_id_map.insert(Arc::clone(&id_arc), i);
                     }
@@ -3261,37 +3244,35 @@ impl Store {
                     }
                     self.docs_id.push(id_arc);
                     self.docs_title.push(title_arc);
-                    self.docs_layer.push(layer_arc);
-                    self.docs_wing.push(intern_wing(wing_arc));
+                    self.docs_layer.push_cell(layer_pos.map(|p| &cells[p]));
+                    self.docs_wing.push_cell(wing_pos.map(|p| &cells[p]));
                 }
                 return;
             }
             for (i, row) in rows.iter().enumerate() {
-                let mut id = None;
-                let mut uri = None;
-                let mut title = None;
-                let mut layer = None;
-                let mut wing = None;
+                let mut found: [Option<&Cell>; 5] = [None; 5];
                 for (k, v) in row {
                     match k.as_str() {
-                        "id" => id = v.text_shared(),
-                        "uri" => uri = v.text_shared(),
-                        "title" => title = v.text_shared(),
-                        "layer" => layer = v.text_shared(),
-                        "wing" => wing = v.text_shared(),
+                        "id" => found[0] = Some(v),
+                        "uri" => found[1] = Some(v),
+                        "title" => found[2] = Some(v),
+                        "layer" => found[3] = Some(v),
+                        "wing" => found[4] = Some(v),
                         _ => {}
                     }
                 }
-                if let Some(ref id_val) = id {
-                    by_id_map.insert(Arc::clone(id_val), i);
+                if let Some(id_val) = found[0].and_then(Cell::text_shared) {
+                    by_id_map.insert(Arc::clone(&id_val), i);
+                    self.docs_id.push(id_val);
+                } else {
+                    self.docs_id.push(empty_arc_str());
                 }
-                if let Some(ref uri_val) = uri {
-                    self.docs_by_uri.insert(Arc::clone(uri_val), i);
+                if let Some(uri_val) = found[1].and_then(Cell::text_shared) {
+                    self.docs_by_uri.insert(uri_val, i);
                 }
-                self.docs_id.push(id.unwrap_or_default());
-                self.docs_title.push(title.unwrap_or_default());
-                self.docs_layer.push(layer.unwrap_or_default());
-                self.docs_wing.push(intern_wing(wing.unwrap_or_default()));
+                self.docs_title.push(cell_arc_or_empty(found[2]));
+                self.docs_layer.push_cell(found[3]);
+                self.docs_wing.push_cell(found[4]);
             }
             return;
         }
@@ -3302,23 +3283,21 @@ impl Store {
             self.orders_total.reserve(n);
             self.orders_total_tag.reserve(n);
             let first = &rows[0];
-            let id_pos = first.keys().position(|k| k == "id");
-            let uid_pos = first.keys().position(|k| k == "user_id");
-            let total_pos = first.keys().position(|k| k == "total");
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 {
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let id_pos = fshape.position("id");
+                let uid_pos = fshape.position("user_id");
+                let total_pos = fshape.position("total");
                 for (i, row) in rows.iter().enumerate() {
-                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
-                    for (p, val) in row.values().enumerate().take(32) {
-                        cells[p] = val;
-                    }
-                    let id_arc: Arc<str> = id_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let uid_arc: Arc<str> = uid_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let total_cell = total_pos.map(|p| cells[p]);
+                    let cells = row.cells_slice();
+                    let id_arc = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                    let uid_arc = cell_arc_or_empty(uid_pos.map(|p| &cells[p]));
+                    let total_cell = total_pos.map(|p| &cells[p]);
                     let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
                     let total_tag = order_total_tag(total_cell);
                     if !id_arc.is_empty() {
@@ -3332,14 +3311,14 @@ impl Store {
                 return;
             }
             for (i, row) in rows.iter().enumerate() {
-                let mut id = None;
-                let mut uid = None;
+                let mut id_cell = None;
+                let mut uid_cell = None;
                 let mut total = 0.0;
                 let mut total_tag = 2u8;
                 for (k, v) in row {
                     match k.as_str() {
-                        "id" => id = v.text_shared(),
-                        "user_id" => uid = v.text_shared(),
+                        "id" => id_cell = Some(v),
+                        "user_id" => uid_cell = Some(v),
                         "total" => {
                             total = v.as_f64().unwrap_or(0.0);
                             total_tag = order_total_tag(Some(v));
@@ -3347,11 +3326,13 @@ impl Store {
                         _ => {}
                     }
                 }
-                if let Some(ref id_val) = id {
-                    by_id_map.insert(Arc::clone(id_val), i);
+                if let Some(id_val) = id_cell.and_then(Cell::text_shared) {
+                    by_id_map.insert(Arc::clone(&id_val), i);
+                    self.orders_id.push(id_val);
+                } else {
+                    self.orders_id.push(empty_arc_str());
                 }
-                self.orders_id.push(id.unwrap_or_default());
-                self.orders_user_id.push(uid.unwrap_or_default());
+                self.orders_user_id.push(cell_arc_or_empty(uid_cell));
                 self.orders_total.push(total);
                 self.orders_total_tag.push(total_tag);
             }
@@ -3362,21 +3343,19 @@ impl Store {
             self.users_id.reserve(n);
             self.users_email.reserve(n);
             let first = &rows[0];
-            let id_pos = first.keys().position(|k| k == "id");
-            let email_pos = first.keys().position(|k| k == "email");
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 {
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let id_pos = fshape.position("id");
+                let email_pos = fshape.position("email");
                 for (i, row) in rows.iter().enumerate() {
-                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
-                    for (p, val) in row.values().enumerate().take(32) {
-                        cells[p] = val;
-                    }
-                    let id_arc: Arc<str> = id_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let email_arc: Arc<str> = email_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
+                    let cells = row.cells_slice();
+                    let id_arc = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                    let email_arc = cell_arc_or_empty(email_pos.map(|p| &cells[p]));
                     if !id_arc.is_empty() {
                         by_id_map.insert(Arc::clone(&id_arc), i);
                     }
@@ -3386,20 +3365,22 @@ impl Store {
                 return;
             }
             for (i, row) in rows.iter().enumerate() {
-                let mut id = None;
-                let mut email = None;
+                let mut id_cell = None;
+                let mut email_cell = None;
                 for (k, v) in row {
                     match k.as_str() {
-                        "id" => id = v.text_shared(),
-                        "email" => email = v.text_shared(),
+                        "id" => id_cell = Some(v),
+                        "email" => email_cell = Some(v),
                         _ => {}
                     }
                 }
-                if let Some(ref id_val) = id {
-                    by_id_map.insert(Arc::clone(id_val), i);
+                if let Some(id_val) = id_cell.and_then(Cell::text_shared) {
+                    by_id_map.insert(Arc::clone(&id_val), i);
+                    self.users_id.push(id_val);
+                } else {
+                    self.users_id.push(empty_arc_str());
                 }
-                self.users_id.push(id.unwrap_or_default());
-                self.users_email.push(email.unwrap_or_default());
+                self.users_email.push(cell_arc_or_empty(email_cell));
             }
             return;
         }
@@ -3407,9 +3388,8 @@ impl Store {
         if collection == "facts" {
             self.facts_by_spo.reserve(n);
             for (i, row) in rows.iter().enumerate() {
-                let id = row.get("id").and_then(Cell::text_shared);
-                if let Some(ref id_val) = id {
-                    by_id_map.insert(Arc::clone(id_val), i);
+                if let Some(id_val) = row.get_str("id").and_then(Cell::text_shared) {
+                    by_id_map.insert(id_val, i);
                 }
                 if let Some(spo) = spo_key(row) {
                     self.facts_by_spo.insert(spo, i);
@@ -3419,124 +3399,161 @@ impl Store {
         }
 
         for (i, row) in rows.iter().enumerate() {
-            let id = row.get("id").and_then(Cell::text_shared);
-            if let Some(ref id_val) = id {
-                by_id_map.insert(Arc::clone(id_val), i);
+            if let Some(id_val) = row.get_str("id").and_then(Cell::text_shared) {
+                by_id_map.insert(id_val, i);
             }
         }
     }
 
     pub fn row_maps_register(&mut self, collection: &str, idx: usize) {
-        let Some(row) = self
-            .collections
-            .get(collection)
-            .and_then(|c| c.get(idx))
-            .cloned()
-        else {
+        if (collection == "docs" && idx > self.docs_id.len())
+            || (collection == "orders" && idx > self.orders_id.len())
+            || (collection == "users" && idx > self.users_id.len())
+        {
+            self.rebuild_row_maps_collection(collection);
+            return;
+        }
+        if collection == "docs" {
+            self.invalidate_docs_cache();
+        }
+        let Some(row) = self.collections.get(collection).and_then(|c| c.get(idx)) else {
             return;
         };
-        self.row_maps_register_row(collection, idx, &row);
+        Self::register_row_in_maps_inner(
+            collection,
+            idx,
+            row,
+            &mut self.by_id,
+            &mut self.docs_by_uri,
+            &mut self.docs_moved_ids,
+            &mut self.retired_doc_ids,
+            &mut self.docs_id,
+            &mut self.docs_title,
+            &mut self.docs_layer,
+            &mut self.docs_wing,
+            &mut self.orders_id,
+            &mut self.orders_user_id,
+            &mut self.orders_total,
+            &mut self.orders_total_tag,
+            &mut self.users_id,
+            &mut self.users_email,
+        );
     }
 
     /// Register maps/columns from an already-built row (avoids re-fetch).
     pub fn row_maps_register_row(&mut self, collection: &str, idx: usize, row: &Row) {
+        if (collection == "docs" && idx > self.docs_id.len())
+            || (collection == "orders" && idx > self.orders_id.len())
+            || (collection == "users" && idx > self.users_id.len())
+        {
+            self.rebuild_row_maps_collection(collection);
+            return;
+        }
         if collection == "docs" {
             self.invalidate_docs_cache();
         }
-        let id = row.get("id").and_then(Cell::text_shared);
-        let uri = if collection == "docs" {
-            row.get("uri").and_then(Cell::text_shared)
-        } else {
-            None
-        };
+        Self::register_row_in_maps_inner(
+            collection,
+            idx,
+            row,
+            &mut self.by_id,
+            &mut self.docs_by_uri,
+            &mut self.docs_moved_ids,
+            &mut self.retired_doc_ids,
+            &mut self.docs_id,
+            &mut self.docs_title,
+            &mut self.docs_layer,
+            &mut self.docs_wing,
+            &mut self.orders_id,
+            &mut self.orders_user_id,
+            &mut self.orders_total,
+            &mut self.orders_total_tag,
+            &mut self.users_id,
+            &mut self.users_email,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_row_in_maps_inner(
+        collection: &str,
+        idx: usize,
+        row: &Row,
+        by_id: &mut BTreeMap<String, FxHashMap<Arc<str>, usize>>,
+        docs_by_uri: &mut FxHashMap<Arc<str>, usize>,
+        docs_moved_ids: &mut smallvec::SmallVec<[(Arc<str>, usize); 16]>,
+        retired_doc_ids: &mut smallvec::SmallVec<[Arc<str>; 16]>,
+        docs_id: &mut Vec<Arc<str>>,
+        docs_title: &mut Vec<Arc<str>>,
+        docs_layer: &mut DictColumn,
+        docs_wing: &mut DictColumn,
+        orders_id: &mut Vec<Arc<str>>,
+        orders_user_id: &mut Vec<Arc<str>>,
+        orders_total: &mut Vec<f64>,
+        orders_total_tag: &mut Vec<u8>,
+        users_id: &mut Vec<Arc<str>>,
+        users_email: &mut Vec<Arc<str>>,
+    ) {
+        let id = row.get_str("id").and_then(Cell::text_shared);
         if let Some(ref id) = id {
             if collection == "docs" {
-                if !self.docs_moved_ids.is_empty() {
-                    self.docs_moved_ids.retain(|(k, _)| k != id);
+                if !docs_moved_ids.is_empty() {
+                    docs_moved_ids.retain(|(k, _)| k != id);
                 }
-                if !self.retired_doc_ids.is_empty() {
-                    self.retired_doc_ids.retain(|k| k != id);
+                if !retired_doc_ids.is_empty() {
+                    retired_doc_ids.retain(|k| k != id);
                 }
             }
-            if let Some(map) = self.by_id.get_mut(collection) {
-                map.insert(Arc::clone(id), idx);
-            } else {
-                self.by_id
-                    .entry(collection.to_string())
-                    .or_default()
-                    .insert(Arc::clone(id), idx);
-            }
+            by_id_slot(by_id, collection).insert(Arc::clone(id), idx);
         }
-        if collection == "docs" {
-            let title = row
-                .get("title")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
-            let layer = row
-                .get("layer")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
-            let wing = intern_wing(
-                row.get("wing")
-                    .and_then(Cell::text_shared)
-                    .unwrap_or_default(),
-            );
-            let did = id.clone().unwrap_or_default();
-            if let Some(uri) = uri {
-                self.docs_by_uri.insert(uri, idx);
+        match collection {
+            "docs" => {
+                let title = cell_arc_or_empty(row.get_str("title"));
+                let did = id.unwrap_or_else(empty_arc_str);
+                if let Some(uri) = row.get_str("uri").and_then(Cell::text_shared) {
+                    docs_by_uri.insert(uri, idx);
+                }
+                if idx == docs_id.len() {
+                    docs_id.push(did);
+                    docs_title.push(title);
+                    docs_layer.push_cell(row.get_str("layer"));
+                    docs_wing.push_cell(row.get_str("wing"));
+                } else {
+                    docs_id[idx] = did;
+                    docs_title[idx] = title;
+                    docs_layer.set_cell(idx, row.get_str("layer"));
+                    docs_wing.set_cell(idx, row.get_str("wing"));
+                }
             }
-            if idx == self.docs_id.len() {
-                self.docs_id.push(did);
-                self.docs_title.push(title);
-                self.docs_layer.push(layer);
-                self.docs_wing.push(wing);
-            } else if idx < self.docs_id.len() {
-                self.docs_id[idx] = did;
-                self.docs_title[idx] = title;
-                self.docs_layer.set(idx, layer);
-                self.docs_wing.set(idx, wing);
-            } else {
-                self.rebuild_row_maps_collection("docs");
+            "orders" => {
+                let uid = cell_arc_or_empty(row.get_str("user_id"));
+                let total_cell = row.get_str("total");
+                let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
+                let total_tag = order_total_tag(total_cell);
+                let did = id.unwrap_or_else(empty_arc_str);
+                if idx == orders_id.len() {
+                    orders_id.push(did);
+                    orders_user_id.push(uid);
+                    orders_total.push(total);
+                    orders_total_tag.push(total_tag);
+                } else {
+                    orders_id[idx] = did;
+                    orders_user_id[idx] = uid;
+                    orders_total[idx] = total;
+                    orders_total_tag[idx] = total_tag;
+                }
             }
-        }
-        if collection == "orders" {
-            let uid = row
-                .get("user_id")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
-            let total_cell = row.get("total");
-            let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
-            let total_tag = order_total_tag(total_cell);
-            let did = id.clone().unwrap_or_default();
-            if idx == self.orders_id.len() {
-                self.orders_id.push(did);
-                self.orders_user_id.push(uid);
-                self.orders_total.push(total);
-                self.orders_total_tag.push(total_tag);
-            } else if idx < self.orders_id.len() {
-                self.orders_id[idx] = did;
-                self.orders_user_id[idx] = uid;
-                self.orders_total[idx] = total;
-                self.orders_total_tag[idx] = total_tag;
-            } else {
-                self.rebuild_row_maps_collection("orders");
+            "users" => {
+                let email = cell_arc_or_empty(row.get_str("email"));
+                let did = id.unwrap_or_else(empty_arc_str);
+                if idx == users_id.len() {
+                    users_id.push(did);
+                    users_email.push(email);
+                } else {
+                    users_id[idx] = did;
+                    users_email[idx] = email;
+                }
             }
-        }
-        if collection == "users" {
-            let email = row
-                .get("email")
-                .and_then(Cell::text_shared)
-                .unwrap_or_default();
-            let did = id.clone().unwrap_or_default();
-            if idx == self.users_id.len() {
-                self.users_id.push(did);
-                self.users_email.push(email);
-            } else if idx < self.users_id.len() {
-                self.users_id[idx] = did;
-                self.users_email[idx] = email;
-            } else {
-                self.rebuild_row_maps_collection("users");
-            }
+            _ => {}
         }
     }
 
@@ -3559,39 +3576,26 @@ impl Store {
                     return;
                 }
             }
-            let by_id = if let Some(m) = self.by_id.get_mut(collection) {
-                m
-            } else {
-                by_id_slot(&mut self.by_id, collection)
-            };
+            let by_id = by_id_slot(&mut self.by_id, collection);
             let first = &rows[0];
-            let id_pos = first.keys().position(|k| k == "id");
-            let uri_pos = first.keys().position(|k| k == "uri");
-            let title_pos = first.keys().position(|k| k == "title");
-            let layer_pos = first.keys().position(|k| k == "layer");
-            let wing_pos = first.keys().position(|k| k == "wing");
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 {
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let id_pos = fshape.position("id");
+                let uri_pos = fshape.position("uri");
+                let title_pos = fshape.position("title");
+                let layer_pos = fshape.position("layer");
+                let wing_pos = fshape.position("wing");
                 for (i, row) in rows.iter().enumerate() {
                     let idx = start + i;
-                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
-                    for (p, val) in row.values().enumerate().take(32) {
-                        cells[p] = val;
-                    }
-                    let id_arc: Arc<str> = id_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let uri_arc: Option<Arc<str>> = uri_pos.and_then(|p| cells[p].text_shared());
-                    let title_arc: Arc<str> = title_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let layer_arc: Arc<str> = layer_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-                    let wing_arc: Arc<str> = wing_pos
-                        .and_then(|p| cells[p].text_shared())
-                        .unwrap_or_default();
-
+                    let cells = row.cells_slice();
+                    let id_arc = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                    let uri_arc = uri_pos.and_then(|p| cells[p].text_shared());
+                    let title_arc = cell_arc_or_empty(title_pos.map(|p| &cells[p]));
                     if !id_arc.is_empty() {
                         by_id.insert(Arc::clone(&id_arc), idx);
                     }
@@ -3600,14 +3604,14 @@ impl Store {
                     }
                     self.docs_id.push(id_arc);
                     self.docs_title.push(title_arc);
-                    self.docs_layer.push(layer_arc);
-                    self.docs_wing.push(intern_wing(wing_arc));
+                    self.docs_layer.push_cell(layer_pos.map(|p| &cells[p]));
+                    self.docs_wing.push_cell(wing_pos.map(|p| &cells[p]));
                 }
                 return;
             }
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
-                let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
+                let mut found: [Option<&Cell>; 5] = [None; 5];
                 for (field, value) in row {
                     let slot = match field.as_str() {
                         "id" => 0,
@@ -3617,35 +3621,59 @@ impl Store {
                         "wing" => 4,
                         _ => continue,
                     };
-                    texts[slot] = value.text_shared();
+                    found[slot] = Some(value);
                 }
-                let [id, uri, title, layer, wing] = texts;
-                if let Some(ref id) = id {
-                    by_id.insert(Arc::clone(id), idx);
+                if let Some(id) = found[0].and_then(Cell::text_shared) {
+                    by_id.insert(Arc::clone(&id), idx);
+                    self.docs_id.push(id);
+                } else {
+                    self.docs_id.push(empty_arc_str());
                 }
-                if let Some(uri) = uri {
+                if let Some(uri) = found[1].and_then(Cell::text_shared) {
                     self.docs_by_uri.insert(uri, idx);
                 }
-                self.docs_id.push(id.unwrap_or_default());
-                self.docs_title.push(title.unwrap_or_default());
-                self.docs_layer.push(layer.unwrap_or_default());
-                self.docs_wing.push(intern_wing(wing.unwrap_or_default()));
+                self.docs_title.push(cell_arc_or_empty(found[2]));
+                self.docs_layer.push_cell(found[3]);
+                self.docs_wing.push_cell(found[4]);
             }
             return;
         }
         if collection == "orders" && self.orders_id.len() == start {
             let by_id = by_id_slot(&mut self.by_id, collection);
+            let first = &rows[0];
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let id_pos = fshape.position("id");
+                let uid_pos = fshape.position("user_id");
+                let total_pos = fshape.position("total");
+                for (i, row) in rows.iter().enumerate() {
+                    let idx = start + i;
+                    let cells = row.cells_slice();
+                    let id = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                    let uid = cell_arc_or_empty(uid_pos.map(|p| &cells[p]));
+                    let total_cell = total_pos.map(|p| &cells[p]);
+                    let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
+                    let total_tag = order_total_tag(total_cell);
+                    if !id.is_empty() {
+                        by_id.insert(Arc::clone(&id), idx);
+                    }
+                    self.orders_id.push(id);
+                    self.orders_user_id.push(uid);
+                    self.orders_total.push(total);
+                    self.orders_total_tag.push(total_tag);
+                }
+                return;
+            }
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
-                let id = row
-                    .get("id")
-                    .and_then(Cell::text_shared)
-                    .unwrap_or_default();
-                let uid = row
-                    .get("user_id")
-                    .and_then(Cell::text_shared)
-                    .unwrap_or_default();
-                let total_cell = row.get("total");
+                let id = cell_arc_or_empty(row.get_str("id"));
+                let uid = cell_arc_or_empty(row.get_str("user_id"));
+                let total_cell = row.get_str("total");
                 let total = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
                 let total_tag = order_total_tag(total_cell);
                 if !id.is_empty() {
@@ -3660,16 +3688,33 @@ impl Store {
         }
         if collection == "users" && self.users_id.len() == start {
             let by_id = by_id_slot(&mut self.by_id, collection);
+            let first = &rows[0];
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let id_pos = fshape.position("id");
+                let email_pos = fshape.position("email");
+                for (i, row) in rows.iter().enumerate() {
+                    let idx = start + i;
+                    let cells = row.cells_slice();
+                    let id = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                    let email = cell_arc_or_empty(email_pos.map(|p| &cells[p]));
+                    if !id.is_empty() {
+                        by_id.insert(Arc::clone(&id), idx);
+                    }
+                    self.users_id.push(id);
+                    self.users_email.push(email);
+                }
+                return;
+            }
             for (i, row) in rows.iter().enumerate() {
                 let idx = start + i;
-                let id = row
-                    .get("id")
-                    .and_then(Cell::text_shared)
-                    .unwrap_or_default();
-                let email = row
-                    .get("email")
-                    .and_then(Cell::text_shared)
-                    .unwrap_or_default();
+                let id = cell_arc_or_empty(row.get_str("id"));
+                let email = cell_arc_or_empty(row.get_str("email"));
                 if !id.is_empty() {
                     by_id.insert(Arc::clone(&id), idx);
                 }
@@ -3681,7 +3726,7 @@ impl Store {
         if !matches!(collection, "docs" | "orders" | "users" | "facts") {
             let by_id = by_id_slot(&mut self.by_id, collection);
             for (i, row) in rows.iter().enumerate() {
-                if let Some(id) = row.get("id").and_then(Cell::text_shared) {
+                if let Some(id) = row.get_str("id").and_then(Cell::text_shared) {
                     by_id.insert(id, start + i);
                 }
             }
@@ -3730,7 +3775,7 @@ impl Store {
         after: &Row,
     ) {
         if collection == "docs" {
-            if before.get("title") != after.get("title") {
+            if before.get_str("title") != after.get_str("title") {
                 self.invalidate_docs_cache();
             } else {
                 self.docs_epoch = next_docs_epoch();
@@ -3746,33 +3791,29 @@ impl Store {
         }
         // Identity keys already address this slot. Re-inserting them would
         // allocate fresh id/uri strings for every non-identity field update.
-        let text = |field: &str| {
-            after
-                .get(field)
-                .and_then(Cell::text_shared)
-                .unwrap_or_default()
-        };
         match collection {
             "docs"
                 if idx < self.docs_title.len()
                     && idx < self.docs_layer.len()
                     && idx < self.docs_wing.len() =>
             {
-                self.docs_title[idx] = text("title");
-                self.docs_layer.set(idx, text("layer"));
-                self.docs_wing.set(idx, text("wing"));
+                self.docs_title[idx] = cell_arc_or_empty(after.get_str("title"));
+                self.docs_layer.set_cell(idx, after.get_str("layer"));
+                self.docs_wing.set_cell(idx, after.get_str("wing"));
             }
             "orders"
                 if idx < self.orders_user_id.len()
                     && idx < self.orders_total.len()
                     && idx < self.orders_total_tag.len() =>
             {
-                self.orders_user_id[idx] = text("user_id");
-                let total_cell = after.get("total");
+                self.orders_user_id[idx] = cell_arc_or_empty(after.get_str("user_id"));
+                let total_cell = after.get_str("total");
                 self.orders_total[idx] = total_cell.and_then(Cell::as_f64).unwrap_or(0.0);
                 self.orders_total_tag[idx] = order_total_tag(total_cell);
             }
-            "users" if idx < self.users_email.len() => self.users_email[idx] = text("email"),
+            "users" if idx < self.users_email.len() => {
+                self.users_email[idx] = cell_arc_or_empty(after.get_str("email"));
+            }
             "docs" | "orders" | "users" => self.rebuild_row_maps_collection(collection),
             _ => {}
         }
@@ -3793,15 +3834,20 @@ impl Store {
     }
 
     pub fn index_insert_at(&mut self, collection: &str, row_idx: usize) -> Result<(), Error> {
-        let Some(row) = self
-            .collections
-            .get(collection)
-            .and_then(|c| c.get(row_idx))
-            .cloned()
-        else {
+        if self.indexes.is_empty() {
+            return Ok(());
+        }
+        let Some(row) = self.collections.get(collection).and_then(|c| c.get(row_idx)) else {
             return Ok(());
         };
-        self.index_insert_row(collection, row_idx, &row)
+        for idx in self.indexes.values_mut() {
+            if idx.def.collection == collection
+                && let Err(e) = idx.insert_at(row_idx, row)
+            {
+                return Err(Error::runtime(e));
+            }
+        }
+        Ok(())
     }
 
     pub fn index_insert_row(
@@ -3899,7 +3945,7 @@ impl Store {
                 move || {
                     if let Some(hnsw) = hnsw_opt {
                         for (i, row) in built.iter().enumerate() {
-                            if let Some(Cell::Vec(v)) = row.get("embedding") {
+                            if let Some(Cell::Vec(v)) = row.get_str("embedding") {
                                 hnsw.insert(start + i, v.clone());
                             }
                         }
@@ -3907,43 +3953,24 @@ impl Store {
 
                     let keep_uri = !docs_by_uri.is_empty() || built.len() < 512;
                     let first = &built[0];
-                    let id_pos = first.keys().position(|k| k == "id");
-                    let uri_pos = if keep_uri {
-                        first.keys().position(|k| k == "uri")
-                    } else {
-                        None
-                    };
-                    let title_pos = first.keys().position(|k| k == "title");
-                    let layer_pos = first.keys().position(|k| k == "layer");
-                    let wing_pos = first.keys().position(|k| k == "wing");
                     let same_shape = first.shape_arc().is_some_and(|fs| {
                         built[1..]
                             .iter()
                             .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
                     });
                     if same_shape {
+                        let fshape = first.shape_arc().unwrap();
+                        let id_pos = fshape.position("id");
+                        let uri_pos = if keep_uri { fshape.position("uri") } else { None };
+                        let title_pos = fshape.position("title");
+                        let layer_pos = fshape.position("layer");
+                        let wing_pos = fshape.position("wing");
                         for (i, row) in built.iter().enumerate() {
                             let idx = start + i;
                             let cells = row.cells_slice();
-                            let id_arc: Arc<str> = id_pos
-                                .and_then(|p| cells.get(p))
-                                .and_then(Cell::text_shared)
-                                .unwrap_or_default();
-                            let uri_arc: Option<Arc<str>> = uri_pos
-                                .and_then(|p| cells.get(p))
-                                .and_then(Cell::text_shared);
-                            let title_arc: Arc<str> = title_pos
-                                .and_then(|p| cells.get(p))
-                                .and_then(Cell::text_shared)
-                                .unwrap_or_default();
-                            let layer_arc: Arc<str> = layer_pos
-                                .and_then(|p| cells.get(p))
-                                .and_then(Cell::text_shared)
-                                .unwrap_or_default();
-                            let wing_arc: Arc<str> = wing_pos
-                                .and_then(|p| cells.get(p))
-                                .and_then(Cell::text_shared)
-                                .unwrap_or_default();
+                            let id_arc = cell_arc_or_empty(id_pos.map(|p| &cells[p]));
+                            let uri_arc = uri_pos.and_then(|p| cells[p].text_shared());
+                            let title_arc = cell_arc_or_empty(title_pos.map(|p| &cells[p]));
 
                             if !id_arc.is_empty() {
                                 by_id.insert(Arc::clone(&id_arc), idx);
@@ -3953,13 +3980,13 @@ impl Store {
                             }
                             docs_id.push(id_arc);
                             docs_title.push(title_arc);
-                            docs_layer.push(layer_arc);
-                            docs_wing.push(intern_wing(wing_arc));
+                            docs_layer.push_cell(layer_pos.map(|p| &cells[p]));
+                            docs_wing.push_cell(wing_pos.map(|p| &cells[p]));
                         }
                     } else {
                         for (i, row) in built.iter().enumerate() {
                             let idx = start + i;
-                            let mut texts: [Option<Arc<str>>; 5] = std::array::from_fn(|_| None);
+                            let mut found: [Option<&Cell>; 5] = [None; 5];
                             for (field, value) in row {
                                 let slot = match field.as_str() {
                                     "id" => 0,
@@ -3969,19 +3996,20 @@ impl Store {
                                     "wing" => 4,
                                     _ => continue,
                                 };
-                                texts[slot] = value.text_shared();
+                                found[slot] = Some(value);
                             }
-                            let [id, uri, title, layer, wing] = texts;
-                            if let Some(ref id) = id {
-                                by_id.insert(Arc::clone(id), idx);
+                            if let Some(id) = found[0].and_then(Cell::text_shared) {
+                                by_id.insert(Arc::clone(&id), idx);
+                                docs_id.push(id);
+                            } else {
+                                docs_id.push(empty_arc_str());
                             }
-                            if let Some(uri) = uri {
+                            if let Some(uri) = found[1].and_then(Cell::text_shared) {
                                 docs_by_uri.insert(uri, idx);
                             }
-                            docs_id.push(id.unwrap_or_default());
-                            docs_title.push(title.unwrap_or_default());
-                            docs_layer.push(layer.unwrap_or_default());
-                            docs_wing.push(intern_wing(wing.unwrap_or_default()));
+                            docs_title.push(cell_arc_or_empty(found[2]));
+                            docs_layer.push_cell(found[3]);
+                            docs_wing.push_cell(found[4]);
                         }
                     }
                 },
@@ -4329,19 +4357,11 @@ impl Store {
         if collection == "docs" {
             self.flush_fts_deferred_docs();
         }
-        if !self.fts.contains_key(collection) {
-            return;
-        }
-        let Some(row) = self
-            .collections
-            .get(collection)
-            .and_then(|c| c.get(row_idx))
-            .cloned()
-        else {
-            return;
-        };
-        if let Some(fts) = self.fts.get_mut(collection) {
-            fts.insert_row(row_idx, &row);
+        if let (Some(fts), Some(row)) = (
+            self.fts.get_mut(collection),
+            self.collections.get(collection).and_then(|c| c.get(row_idx)),
+        ) {
+            fts.insert_row(row_idx, row);
         }
     }
 
@@ -4419,15 +4439,15 @@ impl Store {
         if !self.fts.contains_key(collection) {
             return;
         }
-        let Some(row) = self
-            .collections
-            .get(collection)
-            .and_then(|c| c.get(row_idx))
-            .cloned()
-        else {
-            return;
-        };
-        self.fts_remove_row(collection, row_idx, &row);
+        if collection == "docs" {
+            self.flush_fts_deferred_docs();
+        }
+        if let (Some(fts), Some(row)) = (
+            self.fts.get_mut(collection),
+            self.collections.get(collection).and_then(|c| c.get(row_idx)),
+        ) {
+            fts.remove_row(row_idx, row);
+        }
     }
 
     /// Drop one row's postings, given the row itself: only that row's tokens are
@@ -4461,21 +4481,28 @@ impl Store {
         if collection == "docs" {
             self.flush_fts_deferred_docs();
         }
-        let Some(row) = self
-            .collections
-            .get(collection)
-            .and_then(|c| c.get(row_idx))
-            .cloned()
-        else {
-            return;
-        };
-        if let Some(fts) = self.fts.get_mut(collection) {
-            fts.sync_row(row_idx, before, &row);
+        if let (Some(fts), Some(row)) = (
+            self.fts.get_mut(collection),
+            self.collections.get(collection).and_then(|c| c.get(row_idx)),
+        ) {
+            fts.sync_row(row_idx, before, row);
         }
     }
 
     /// Rebuild one collection's FTS using existing field list (after delete / compact).
     pub fn rebuild_fts_inplace(&mut self, collection: &str) {
+        if !self.is_disk_backed(collection) {
+            let rows = self
+                .collections
+                .get(collection)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if let Some(fts) = self.fts.get_mut(collection) {
+                let fields = fts.fields.clone();
+                fts.rebuild_in_place(rows, &fields);
+            }
+            return;
+        }
         let Some(fields) = self.fts.get(collection).map(|f| f.fields.clone()) else {
             return;
         };
@@ -4490,12 +4517,41 @@ impl Store {
         if collection == "docs" {
             self.deferred_doc_wing_updates.clear();
         }
-        let labels: Vec<String> = self
+        let labels: smallvec::SmallVec<[String; 4]> = self
             .indexes
             .iter()
             .filter(|(_, idx)| idx.def.collection == collection)
             .map(|(k, _)| k.clone())
             .collect();
+        if labels.is_empty() {
+            return;
+        }
+        if !self.is_disk_backed(collection) {
+            let rows = self
+                .collections
+                .get(collection)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for label in labels {
+                let def = if let Some(existing) = self.indexes.get(&label) {
+                    existing.def.clone()
+                } else if let Some(snap) = self.extra_indexes.get(&label) {
+                    index_def_of(snap)
+                } else {
+                    continue;
+                };
+                let mut live = LiveIndex::new(def);
+                if live.def.pred.is_none() {
+                    let _ = live.insert_slab_batch_no_reverse(0, rows);
+                } else {
+                    for (i, row) in rows.iter().enumerate() {
+                        let _ = live.insert_at(i, row);
+                    }
+                }
+                self.indexes.insert(label, live);
+            }
+            return;
+        }
         let rows = self.collection(collection).to_vec();
         for label in labels {
             let def = if let Some(existing) = self.indexes.get(&label) {
@@ -4651,7 +4707,7 @@ pub struct MemBackup {
     r#gen: u64,
     embed_id: String,
     next_id: u64,
-    collections: BTreeMap<String, Vec<Row>>,
+    collections: Arc<BTreeMap<String, Vec<Row>>>,
     edges: Vec<Edge>,
     extra_collections: BTreeMap<String, ColSnap>,
     extra_rels: BTreeMap<String, RelSnap>,
@@ -4991,5 +5047,65 @@ mod empty_index_slab_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn point_delete_docs_stays_on_deferred_fast_path_past_inline_limits() {
+        let mut db = crate::Db::empty();
+        db.run("index docs [wing]").unwrap();
+        let rows: Vec<super::Row> = (0..64)
+            .map(|i| {
+                super::Row::from([
+                    ("id", super::Cell::from_text(format!("d{i}"))),
+                    ("uri", super::Cell::from_text(format!("u{i}"))),
+                    ("title", super::Cell::from_text(format!("title {i}"))),
+                    (
+                        "wing",
+                        super::Cell::from_text(if i % 2 == 0 { "rag" } else { "sys" }),
+                    ),
+                    ("body", super::Cell::from_text(format!("body token{i}"))),
+                ])
+            })
+            .collect();
+        db.store.collections.insert("docs".into(), rows);
+        db.store.rebuild_row_maps();
+        db.store.rebuild_indexes();
+        db.store.rebuild_fts(&crate::catalog::fixture());
+
+        // 25 consecutive point deletes (well past retired_rows=2 and retired_arcs=16).
+        for step in 0..25 {
+            let p = step % 5;
+            db.store.point_delete_docs_at_in_memory(p, None);
+            assert!(
+                !db.store.fts_deferred_doc_swaps.is_empty(),
+                "deferred swap should stay active at delete #{step}"
+            );
+        }
+        db.store.flush_fts_deferred_docs();
+        assert!(db.store.retired_rows.is_empty());
+        assert!(db.store.retired_doc_ids.is_empty());
+        assert!(db.store.retired_arcs.is_empty());
+        assert_eq!(db.store.collection("docs").len(), 64 - 25);
+        assert_eq!(db.store.docs_id.len(), 64 - 25);
+        assert_eq!(db.store.by_id["docs"].len(), 64 - 25);
+    }
+
+    #[test]
+    fn rowmap_cow_shares_until_mutated() {
+        let mut store = super::Store::empty("test/8");
+        store.collections.insert(
+            "docs".into(),
+            vec![super::Row::from([("id", super::Cell::from_text("d1"))])],
+        );
+        let snap = store.clone_mem();
+        assert!(std::sync::Arc::ptr_eq(
+            &store.collections.share_arc(),
+            &snap.collections.share_arc()
+        ));
+        store
+            .collection_mut("docs")
+            .push(super::Row::from([("id", super::Cell::from_text("d2"))]));
+        assert_eq!(snap.collection("docs").len(), 1);
+        assert_eq!(store.collection("docs").len(), 2);
     }
 }

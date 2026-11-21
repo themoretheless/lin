@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use super::Store;
-use super::value::{Cell, ID_TITLE_POOL, Row, acquire_row, docs_hot_field, row_id_title};
+use super::value::{
+    Cell, Row, acquire_row, docs_hot_field, empty_arc_str, intern_wing, intern_wing_str,
+    row_id_title, shape_id, shape_id_title, take_recycled_id_title_vec,
+};
 
 /// In-memory dictionary-encoded column for low-cardinality string columns (e.g. `wing`, `layer`).
 ///
@@ -23,6 +26,17 @@ impl PartialEq for DictColumn {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
             return false;
+        }
+        if self.spilled.is_none()
+            && other.spilled.is_none()
+            && self.dict.len() == other.dict.len()
+            && self
+                .dict
+                .iter()
+                .zip(&other.dict)
+                .all(|(a, b)| Arc::ptr_eq(a, b) || a == b)
+        {
+            return self.indices == other.indices;
         }
         for i in 0..self.len() {
             if self.get_ref(i) != other.get_ref(i) {
@@ -73,6 +87,24 @@ impl DictColumn {
     }
 
     #[inline]
+    fn push_new_dict_val(&mut self, val: Arc<str>) {
+        if self.dict.len() < 255 {
+            let pos = self.dict.len() as u8;
+            self.dict.push(val);
+            self.indices.push(pos);
+        } else {
+            let mut spilled = Vec::with_capacity(self.indices.len() + 1);
+            for &idx in &self.indices {
+                spilled.push(Arc::clone(&self.dict[idx as usize]));
+            }
+            spilled.push(val);
+            self.spilled = Some(spilled);
+            self.dict.clear();
+            self.indices.clear();
+        }
+    }
+
+    #[inline]
     pub fn push(&mut self, val: Arc<str>) {
         if let Some(spilled) = &mut self.spilled {
             spilled.push(val);
@@ -89,20 +121,49 @@ impl DictColumn {
             return;
         }
 
-        if self.dict.len() < 255 {
-            let pos = self.dict.len() as u8;
-            self.dict.push(val);
-            self.indices.push(pos);
-        } else {
-            // Dictionary capacity exceeded: spill to flat vector
-            let mut spilled = Vec::with_capacity(self.indices.len() + 1);
-            for &idx in &self.indices {
-                spilled.push(Arc::clone(&self.dict[idx as usize]));
-            }
+        self.push_new_dict_val(val);
+    }
+
+    /// Push from an optional [`Cell`] without allocating an `Arc<str>` when the string already
+    /// resides in `self.dict` (eliminating `SmallText -> Arc<str>` heap churn on bulk inserts).
+    #[inline]
+    pub fn push_cell(&mut self, cell: Option<&Cell>) {
+        if let Some(spilled) = &mut self.spilled {
+            let val = match cell {
+                Some(Cell::Text(arc)) => intern_wing(Arc::clone(arc)),
+                Some(Cell::SmallText(inl)) => intern_wing_str(inl.as_str()),
+                _ => empty_arc_str(),
+            };
             spilled.push(val);
-            self.spilled = Some(spilled);
-            self.dict.clear();
-            self.indices.clear();
+            return;
+        }
+        match cell {
+            Some(Cell::Text(arc)) => {
+                if let Some(pos) = self
+                    .dict
+                    .iter()
+                    .position(|x| Arc::ptr_eq(x, arc) || **x == **arc)
+                {
+                    self.indices.push(pos as u8);
+                    return;
+                }
+                self.push_new_dict_val(intern_wing(Arc::clone(arc)));
+            }
+            Some(Cell::SmallText(inl)) => {
+                let s = inl.as_str();
+                if let Some(pos) = self.dict.iter().position(|x| x.as_ref() == s) {
+                    self.indices.push(pos as u8);
+                    return;
+                }
+                self.push_new_dict_val(intern_wing_str(s));
+            }
+            _ => {
+                if let Some(pos) = self.dict.iter().position(|x| x.is_empty()) {
+                    self.indices.push(pos as u8);
+                    return;
+                }
+                self.push_new_dict_val(empty_arc_str());
+            }
         }
     }
 
@@ -161,7 +222,48 @@ impl DictColumn {
             self.indices[i] = pos as u8;
             return;
         }
-        self.set(i, super::value::intern_wing_str(val));
+        self.set(i, intern_wing_str(val));
+    }
+
+    /// Update slot `i` from an optional [`Cell`], looking up in `self.dict` before allocating.
+    #[inline]
+    pub fn set_cell(&mut self, i: usize, cell: Option<&Cell>) {
+        if let Some(spilled) = &mut self.spilled {
+            spilled[i] = match cell {
+                Some(Cell::Text(arc)) => intern_wing(Arc::clone(arc)),
+                Some(Cell::SmallText(inl)) => intern_wing_str(inl.as_str()),
+                _ => empty_arc_str(),
+            };
+            return;
+        }
+        match cell {
+            Some(Cell::Text(arc)) => {
+                if let Some(pos) = self
+                    .dict
+                    .iter()
+                    .position(|x| Arc::ptr_eq(x, arc) || **x == **arc)
+                {
+                    self.indices[i] = pos as u8;
+                    return;
+                }
+                self.set(i, intern_wing(Arc::clone(arc)));
+            }
+            Some(Cell::SmallText(inl)) => {
+                let s = inl.as_str();
+                if let Some(pos) = self.dict.iter().position(|x| x.as_ref() == s) {
+                    self.indices[i] = pos as u8;
+                    return;
+                }
+                self.set(i, intern_wing_str(s));
+            }
+            _ => {
+                if let Some(pos) = self.dict.iter().position(|x| x.is_empty()) {
+                    self.indices[i] = pos as u8;
+                    return;
+                }
+                self.set(i, empty_arc_str());
+            }
+        }
     }
 
     #[inline]
@@ -201,6 +303,12 @@ impl DictColumn {
         } else {
             None
         }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn as_spilled(&self) -> Option<&[Arc<str>]> {
+        self.spilled.as_deref()
     }
 
     pub fn to_vec(&self) -> Vec<Arc<str>> {
@@ -262,20 +370,23 @@ impl Store {
         // bytes. Mutation invalidates it and the next scan rebuilds it once.
         // Each title is terminated by a 0x00 byte so matching rows advance to
         // the next '\0' in the same cache line without reading an offsets array.
-        let (bytes, has_nul) = self.docs_title_packed.get_or_init(|| {
-            let total_bytes: usize = self.docs_title.iter().map(|s| s.len() + 1).sum();
-            let mut bytes = Vec::with_capacity(total_bytes);
-            let mut has_nul = false;
-            for title in &self.docs_title {
-                let b = title.as_bytes();
-                if memchr::memchr(0, b).is_some() {
-                    has_nul = true;
+        let (bytes, has_nul) = self
+            .docs_title_packed
+            .get_or_init(|| {
+                let total_bytes: usize = self.docs_title.iter().map(|s| s.len() + 1).sum();
+                let mut bytes = Vec::with_capacity(total_bytes);
+                let mut has_nul = false;
+                for title in &self.docs_title {
+                    let b = title.as_bytes();
+                    if memchr::memchr(0, b).is_some() {
+                        has_nul = true;
+                    }
+                    bytes.extend_from_slice(b);
+                    bytes.push(0);
                 }
-                bytes.extend_from_slice(b);
-                bytes.push(0);
-            }
-            (bytes, has_nul)
-        });
+                Arc::new((bytes, has_nul))
+            })
+            .as_ref();
 
         let needle_bytes = needle.as_bytes();
         if *has_nul || memchr::memchr(0, needle_bytes).is_some() {
@@ -307,9 +418,9 @@ impl Store {
             count
         }
 
-        // Only fan out across worker threads when the packed buffer exceeds L2 cache (~512 KiB);
-        // below that threshold, single-core SIMD memchr completes in ~2 µs vs ~12 µs thread wakeup.
-        let threads = if total_rows >= 32_768 && bytes.len() >= 512 * 1024 {
+        // Only fan out across worker threads when > 32k rows AND the packed buffer exceeds L2
+        // cache (~512 KiB); below that threshold, single-core SIMD memchr avoids pool locking.
+        let threads = if total_rows > 32_768 && bytes.len() >= 512 * 1024 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1)
@@ -563,25 +674,24 @@ impl Store {
         if limit == Some(0) {
             return Some(Vec::new());
         }
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
+        let id_title = fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"));
 
         let recycled = if id_title && limit.is_none() && n >= 1024 {
-            ID_TITLE_POOL.lock().ok().and_then(|mut g| g.take())
+            take_recycled_id_title_vec()
         } else {
             None
         };
 
-        // The pooled vector is only a buffer: it may hold another query's rows (the pool
-        // is process-wide and tagged from a thread-local) or rows the caller edited, so
-        // every row is checked against the columns below before it is returned.
+        // The pooled vector is only a buffer: it may hold another query's rows or rows the
+        // caller edited, so every row is checked against the columns below before returning.
         let max_take = limit.unwrap_or(usize::MAX);
         let mut idxs = Vec::with_capacity(limit.unwrap_or(codes.len() / 2 + 16).min(codes.len()));
-        for (i, &c) in codes.iter().enumerate() {
-            if c == code {
-                idxs.push(i);
-                if idxs.len() >= max_take {
-                    break;
-                }
+        for i in memchr::memchr_iter(code, codes) {
+            idxs.push(i);
+            if idxs.len() >= max_take {
+                break;
             }
         }
         if idxs.is_empty() {
@@ -673,7 +783,10 @@ impl Store {
             return None;
         }
         let total_idxs = idxs.len();
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
+        let id_title = fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"));
+        let plan = (!id_title).then(|| DocHotPlan::new(fields));
 
         if total_idxs >= 16384 {
             let threads = std::thread::available_parallelism()
@@ -685,6 +798,7 @@ impl Store {
                 let docs_title = &self.docs_title;
                 let docs_layer = &self.docs_layer;
                 let docs_wing = &self.docs_wing;
+                let plan_ref = plan.as_ref();
 
                 let mut out_buffer: Vec<std::mem::MaybeUninit<Row>> =
                     Vec::with_capacity(total_idxs);
@@ -696,61 +810,36 @@ impl Store {
                 let next_chunk = std::sync::atomic::AtomicUsize::new(0);
                 let chunk_size = 4096;
 
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for _ in 0..threads {
-                        handles.push(scope.spawn(|| {
-                            let k_id = String::from("id");
-                            let k_title = String::from("title");
-                            loop {
-                                let start = next_chunk
-                                    .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                                if start >= total_idxs {
-                                    break;
-                                }
-                                let end = (start + chunk_size).min(total_idxs);
-                                for offset in start..end {
-                                    let i = idxs[offset];
-                                    let slot = unsafe {
-                                        &mut *(out_ptr as *mut std::mem::MaybeUninit<Row>)
-                                            .add(offset)
-                                    };
-                                    if i >= n {
-                                        slot.write(acquire_row());
-                                        continue;
-                                    }
-                                    if id_title {
-                                        let mut row = Row::new();
-                                        row.insert(
-                                            k_id.clone(),
-                                            Cell::Text(Arc::clone(&docs_id[i])),
-                                        );
-                                        row.insert(
-                                            k_title.clone(),
-                                            Cell::Text(Arc::clone(&docs_title[i])),
-                                        );
-                                        slot.write(row);
-                                        continue;
-                                    }
-                                    let mut row = Row::new();
-                                    for f in fields {
-                                        let cell = match f.as_str() {
-                                            "id" => Cell::Text(Arc::clone(&docs_id[i])),
-                                            "title" => Cell::Text(Arc::clone(&docs_title[i])),
-                                            "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
-                                            "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
-                                            _ => Cell::Null,
-                                        };
-                                        row.insert(f.clone(), cell);
-                                    }
-                                    slot.write(row);
-                                }
+                let work = || {
+                    loop {
+                        let start = next_chunk
+                            .fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
+                        if start >= total_idxs {
+                            break;
+                        }
+                        let end = (start + chunk_size).min(total_idxs);
+                        for offset in start..end {
+                            let i = idxs[offset];
+                            let slot = unsafe {
+                                &mut *(out_ptr as *mut std::mem::MaybeUninit<Row>).add(offset)
+                            };
+                            if i >= n {
+                                slot.write(acquire_row());
+                                continue;
                             }
-                        }));
+                            if id_title {
+                                slot.write(row_id_title(&docs_id[i], &docs_title[i]));
+                            } else if let Some(p) = plan_ref {
+                                slot.write(p.build_row(i, docs_id, docs_title, docs_layer, docs_wing));
+                            }
+                        }
                     }
-                    for h in handles {
-                        h.join().unwrap();
+                };
+                std::thread::scope(|scope| {
+                    for _ in 1..threads {
+                        scope.spawn(&work);
                     }
+                    work();
                 });
 
                 let out = unsafe {
@@ -762,26 +851,24 @@ impl Store {
         }
 
         let mut out = Vec::with_capacity(total_idxs);
-        for &i in idxs {
-            if i >= n {
-                continue;
+        if id_title {
+            for &i in idxs {
+                if i < n {
+                    out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+                }
             }
-            if id_title {
-                out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
-                continue;
+        } else if let Some(ref p) = plan {
+            for &i in idxs {
+                if i < n {
+                    out.push(p.build_row(
+                        i,
+                        &self.docs_id,
+                        &self.docs_title,
+                        &self.docs_layer,
+                        &self.docs_wing,
+                    ));
+                }
             }
-            let mut row = Row::new();
-            for f in fields {
-                let cell = match f.as_str() {
-                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
-                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
-                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
-                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
-                    _ => Cell::Null,
-                };
-                row.insert(f.clone(), cell);
-            }
-            out.push(row);
         }
         Some(out)
     }
@@ -796,7 +883,10 @@ impl Store {
             return None;
         }
         let n = self.docs_id.len();
-        let id_title = fields.len() == 2 && fields[0] == "id" && fields[1] == "title";
+        let id_title = fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"));
+        let plan = (!id_title).then(|| DocHotPlan::new(fields));
 
         if n >= 65536 {
             let threads = std::thread::available_parallelism()
@@ -810,6 +900,7 @@ impl Store {
                 let docs_title = &self.docs_title;
                 let docs_layer = &self.docs_layer;
                 let docs_wing = &self.docs_wing;
+                let plan_ref = plan.as_ref();
 
                 let chunks_out: Vec<Vec<Row>> = std::thread::scope(|scope| {
                     let mut handles = Vec::with_capacity(threads);
@@ -820,8 +911,13 @@ impl Store {
                         }
                         let end = (start + chunk_size).min(n);
                         handles.push(scope.spawn(move || {
-                            let mut out = Vec::with_capacity(end - start);
+                            let cap = match title_contains {
+                                None | Some("") => end - start,
+                                Some(_) => ((end - start) / 8).clamp(16, 4096).min(end - start),
+                            };
+                            let mut out = Vec::with_capacity(cap);
                             let finder = title_contains
+                                .filter(|s| !s.is_empty())
                                 .map(|needle| memchr::memmem::Finder::new(needle.as_bytes()));
                             for i in start..end {
                                 if let Some(f) = &finder
@@ -831,20 +927,15 @@ impl Store {
                                 }
                                 if id_title {
                                     out.push(row_id_title(&docs_id[i], &docs_title[i]));
-                                    continue;
+                                } else if let Some(p) = plan_ref {
+                                    out.push(p.build_row(
+                                        i,
+                                        docs_id,
+                                        docs_title,
+                                        docs_layer,
+                                        docs_wing,
+                                    ));
                                 }
-                                let mut row = Row::new();
-                                for f in fields {
-                                    let cell = match f.as_str() {
-                                        "id" => Cell::Text(Arc::clone(&docs_id[i])),
-                                        "title" => Cell::Text(Arc::clone(&docs_title[i])),
-                                        "layer" => Cell::Text(Arc::clone(&docs_layer[i])),
-                                        "wing" => Cell::Text(Arc::clone(&docs_wing[i])),
-                                        _ => Cell::Null,
-                                    };
-                                    row.insert(f.clone(), cell);
-                                }
-                                out.push(row);
                             }
                             out
                         }));
@@ -859,8 +950,14 @@ impl Store {
             }
         }
 
-        let mut out = Vec::new();
-        let finder = title_contains.map(|n| memchr::memmem::Finder::new(n.as_bytes()));
+        let init_cap = match title_contains {
+            None | Some("") => n,
+            Some(_) => (n / 8).clamp(16, 4096).min(n),
+        };
+        let mut out = Vec::with_capacity(init_cap);
+        let finder = title_contains
+            .filter(|s| !s.is_empty())
+            .map(|ndl| memchr::memmem::Finder::new(ndl.as_bytes()));
         for i in 0..n {
             if let Some(f) = &finder
                 && f.find(self.docs_title[i].as_bytes()).is_none()
@@ -869,21 +966,99 @@ impl Store {
             }
             if id_title {
                 out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
-                continue;
+            } else if let Some(ref p) = plan {
+                out.push(p.build_row(
+                    i,
+                    &self.docs_id,
+                    &self.docs_title,
+                    &self.docs_layer,
+                    &self.docs_wing,
+                ));
             }
-            let mut row = Row::new();
-            for f in fields {
-                let cell = match f.as_str() {
-                    "id" => Cell::Text(Arc::clone(&self.docs_id[i])),
-                    "title" => Cell::Text(Arc::clone(&self.docs_title[i])),
-                    "layer" => Cell::Text(Arc::clone(&self.docs_layer[i])),
-                    "wing" => Cell::Text(Arc::clone(&self.docs_wing[i])),
-                    _ => Cell::Null,
-                };
-                row.insert(f.clone(), cell);
-            }
-            out.push(row);
         }
         Some(out)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub(super) enum DocHotCol {
+    Id,
+    Title,
+    Layer,
+    Wing,
+}
+
+pub(super) struct DocHotPlan {
+    shape: Arc<super::RowShape>,
+    cols: smallvec::SmallVec<[DocHotCol; 4]>,
+}
+
+impl DocHotPlan {
+    #[inline]
+    pub(super) fn new(fields: &[String]) -> Self {
+        let shape = if fields.len() == 1 && fields[0] == "id" {
+            Arc::clone(shape_id())
+        } else if fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"))
+        {
+            Arc::clone(shape_id_title())
+        } else {
+            Row::shape_of(fields)
+        };
+        let cols = shape
+            .names()
+            .iter()
+            .map(|name| match name.as_str() {
+                "id" => DocHotCol::Id,
+                "title" => DocHotCol::Title,
+                "layer" => DocHotCol::Layer,
+                _ => DocHotCol::Wing,
+            })
+            .collect();
+        Self { shape, cols }
+    }
+
+    #[inline]
+    pub(super) fn build_row(
+        &self,
+        i: usize,
+        docs_id: &[Arc<str>],
+        docs_title: &[Arc<str>],
+        docs_layer: &DictColumn,
+        docs_wing: &DictColumn,
+    ) -> Row {
+        #[inline]
+        fn col_cell(
+            col: DocHotCol,
+            i: usize,
+            docs_id: &[Arc<str>],
+            docs_title: &[Arc<str>],
+            docs_layer: &DictColumn,
+            docs_wing: &DictColumn,
+        ) -> Cell {
+            match col {
+                DocHotCol::Id => Cell::Text(Arc::clone(&docs_id[i])),
+                DocHotCol::Title => Cell::Text(Arc::clone(&docs_title[i])),
+                DocHotCol::Layer => Cell::Text(Arc::clone(&docs_layer[i])),
+                DocHotCol::Wing => Cell::Text(Arc::clone(&docs_wing[i])),
+            }
+        }
+        match self.cols.as_slice() {
+            [c0] => Row::from_single(
+                Arc::clone(&self.shape),
+                col_cell(*c0, i, docs_id, docs_title, docs_layer, docs_wing),
+            ),
+            [c0, c1] => Row::from_pair(
+                Arc::clone(&self.shape),
+                col_cell(*c0, i, docs_id, docs_title, docs_layer, docs_wing),
+                col_cell(*c1, i, docs_id, docs_title, docs_layer, docs_wing),
+            ),
+            cols => Row::from_parts(
+                Arc::clone(&self.shape),
+                cols.iter()
+                    .map(|&c| col_cell(c, i, docs_id, docs_title, docs_layer, docs_wing)),
+            ),
+        }
     }
 }

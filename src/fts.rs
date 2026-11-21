@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::persist::io_err;
-use crate::store::{Row, row_text};
+use crate::store::row::OwnedFieldSlot;
+use crate::store::{Cell, Row};
 
 pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
@@ -30,6 +31,18 @@ const FTS_CRC_MAGIC: [u8; 4] = *b"LCRC";
 /// independent of how often its tokens occur.
 const FOLD_AFTER: usize = 256;
 
+fn build_fts_slots(fields: &[String]) -> SmallVec<[OwnedFieldSlot; 4]> {
+    let has_snippet = fields.iter().any(|f| f == "snippet");
+    let mut slots: SmallVec<[OwnedFieldSlot; 4]> = fields
+        .iter()
+        .map(|f| OwnedFieldSlot::new(f.as_str()))
+        .collect();
+    if !has_snippet {
+        slots.push(OwnedFieldSlot::new("snippet"));
+    }
+    slots
+}
+
 /// Inverted index: token → sorted unique row indices, plus pending edits.
 ///
 /// `postings` is the folded base; `adds` / `dels` hold changes not yet merged
@@ -37,18 +50,26 @@ const FOLD_AFTER: usize = 256;
 /// [`Self::candidate_idxs`] reads. The three sets may overlap — an entry the
 /// live set already has, or one it never had, is inert — but a position is
 /// never in `adds` and `dels` at the same time.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FtsIndex {
     pub fields: Vec<String>,
+    slots: SmallVec<[OwnedFieldSlot; 4]>,
     postings: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+}
+
+impl Default for FtsIndex {
+    fn default() -> Self {
+        Self::empty(&[])
+    }
 }
 
 impl FtsIndex {
     pub fn empty(fields: &[String]) -> Self {
         Self {
             fields: fields.to_vec(),
+            slots: build_fts_slots(fields),
             postings: FxHashMap::default(),
             dels: FxHashMap::default(),
             adds: FxHashMap::default(),
@@ -63,13 +84,21 @@ impl FtsIndex {
     }
 
     pub fn rebuild_in_place(&mut self, rows: &[Row], fields: &[String]) {
-        self.fields.clear();
-        self.fields.extend_from_slice(fields);
-        self.postings.clear();
+        if self.fields != fields {
+            self.fields.clear();
+            self.fields.extend_from_slice(fields);
+            self.slots = build_fts_slots(fields);
+        }
         self.dels.clear();
         self.adds.clear();
-        self.postings.reserve(rows.len());
+        for list in self.postings.values_mut() {
+            list.clear();
+        }
+        if self.postings.capacity() < rows.len() {
+            self.postings.reserve(rows.len() - self.postings.len());
+        }
         self.append_slab(0, rows);
+        self.postings.retain(|_, list| !list.is_empty());
     }
 
     /// Post a row whose position is new at the tail of the collection: written
@@ -82,10 +111,12 @@ impl FtsIndex {
     }
 
     fn append_row_with_scratch(&mut self, row_idx: usize, row: &Row, scratch: &mut String) {
-        for text in fts_texts(row, &self.fields) {
-            let lowered = lowercased(text, scratch);
-            for tok in lowered.split_whitespace() {
-                add_posting(&mut self.postings, tok, row_idx);
+        for slot in &mut self.slots {
+            if let Some(text) = slot.get(row).and_then(Cell::text) {
+                let lowered = lowercased(text, scratch);
+                for_each_word(lowered, |tok| {
+                    add_posting(&mut self.postings, tok, row_idx);
+                });
             }
         }
     }
@@ -103,32 +134,35 @@ impl FtsIndex {
                 _ => r.len() == first.len() && r.keys().eq(first.keys()),
             };
             let uniform = rows[1..].iter().all(same_fields);
-            if uniform && first.len() <= 32 {
+            if uniform && first.len() <= 64 {
                 let has_snippet = self.fields.iter().any(|f| f == "snippet");
                 let mut target_fields: SmallVec<[&str; 4]> =
                     self.fields.iter().map(|s| s.as_str()).collect();
                 if !has_snippet {
                     target_fields.push("snippet");
                 }
-                let mut slot_mask: u32 = 0;
-                for (pos, (k, _)) in first.iter().enumerate().take(32) {
+                let mut slot_mask: u64 = 0;
+                for (pos, (k, _)) in first.iter().enumerate().take(64) {
                     if target_fields.contains(&k.as_str()) {
-                        slot_mask |= 1u32 << pos;
+                        slot_mask |= 1u64 << pos;
                     }
+                }
+                if slot_mask == 0 {
+                    return;
                 }
                 let mut scratch = String::with_capacity(256);
                 for (i, row) in rows.iter().enumerate() {
                     let row_idx = start + i;
-                    for (pos, val) in row.values().enumerate().take(32) {
-                        if (slot_mask & (1u32 << pos)) != 0 {
-                            if let Some(text) = val.text() {
-                                let lowered = lowercased(text, &mut scratch);
-                                // Same word boundaries as single-row inserts, removals
-                                // and queries (Unicode whitespace, not ASCII only).
-                                for tok in lowered.split_whitespace() {
-                                    add_posting(&mut self.postings, tok, row_idx);
-                                }
-                            }
+                    let cells = row.cells_slice();
+                    let mut m = slot_mask;
+                    while m != 0 {
+                        let pos = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        if let Some(text) = cells[pos].text() {
+                            let lowered = lowercased(text, &mut scratch);
+                            for_each_word(lowered, |tok| {
+                                add_posting(&mut self.postings, tok, row_idx);
+                            });
                         }
                     }
                 }
@@ -150,7 +184,7 @@ impl FtsIndex {
     /// base list already references (a swap-move or an undo restore) is
     /// registered through the delta set.
     pub fn insert_row(&mut self, row_idx: usize, row: &Row) {
-        collect_row_tokens(row, &self.fields);
+        collect_row_tokens(row, &mut self.slots);
         with_collected_tokens(|tok| {
             self.note_add(tok, row_idx);
         });
@@ -160,7 +194,7 @@ impl FtsIndex {
     /// tokens are visited, so the cost is per-row rather than per-vocabulary.
     /// Callers must invoke it while `row` still sits at `row_idx`.
     pub fn remove_row(&mut self, row_idx: usize, row: &Row) {
-        collect_row_tokens(row, &self.fields);
+        collect_row_tokens(row, &mut self.slots);
         with_collected_tokens(|tok| {
             self.note_del(tok, row_idx);
         });
@@ -352,7 +386,7 @@ impl FtsIndex {
     /// own and does not change, so it is computed once instead of per edit —
     /// which is what a swap-move needs, since it moves one row between slots.
     pub fn move_row(&mut self, from: usize, to: usize, row: &Row) {
-        collect_row_tokens(row, &self.fields);
+        collect_row_tokens(row, &mut self.slots);
         with_collected_tokens(|tok| {
             self.note_del(tok, from);
             self.note_add(tok, to);
@@ -369,14 +403,14 @@ impl FtsIndex {
         FTS_SCRATCH.with(|pair_cell| {
             let mut pair = pair_cell.borrow_mut();
             let FtsScratchPair { a, b } = &mut *pair;
-            a.collect(doomed, &self.fields);
-            b.collect(tail, &self.fields);
+            a.collect(doomed, &mut self.slots);
+            b.collect(tail, &mut self.slots);
 
             let (mut d_pos, mut t_pos) = (0, 0);
             while d_pos < a.tokens.len() && t_pos < b.tokens.len() {
-                let d_str = &a.scratch[a.tokens[d_pos].clone()];
-                let t_str = &b.scratch[b.tokens[t_pos].clone()];
-                match d_str.cmp(t_str) {
+                let d_str = a.token_str(d_pos);
+                let t_str = b.token_str(t_pos);
+                match d_str.as_bytes().cmp(t_str.as_bytes()) {
                     std::cmp::Ordering::Less => {
                         self.note_del(d_str, p);
                         d_pos += 1;
@@ -393,12 +427,12 @@ impl FtsIndex {
                 }
             }
             while d_pos < a.tokens.len() {
-                let d_str = &a.scratch[a.tokens[d_pos].clone()];
+                let d_str = a.token_str(d_pos);
                 self.note_del(d_str, p);
                 d_pos += 1;
             }
             while t_pos < b.tokens.len() {
-                let t_str = &b.scratch[b.tokens[t_pos].clone()];
+                let t_str = b.token_str(t_pos);
                 self.note_move_from_tail(t_str, p, last);
                 t_pos += 1;
             }
@@ -410,24 +444,23 @@ impl FtsIndex {
     /// rather than per-vocabulary.
     pub fn sync_row(&mut self, row_idx: usize, before: &Row, after: &Row) {
         if self
-            .fields
-            .iter()
-            .all(|field| before.get(field) == after.get(field))
-            && before.get("snippet") == after.get("snippet")
+            .slots
+            .iter_mut()
+            .all(|slot| slot.get(before) == slot.get(after))
         {
             return;
         }
         FTS_SCRATCH.with(|pair_cell| {
             let mut pair = pair_cell.borrow_mut();
             let FtsScratchPair { a, b } = &mut *pair;
-            a.collect(before, &self.fields);
-            b.collect(after, &self.fields);
+            a.collect(before, &mut self.slots);
+            b.collect(after, &mut self.slots);
 
             let (mut old_pos, mut new_pos) = (0, 0);
             while old_pos < a.tokens.len() && new_pos < b.tokens.len() {
-                let old_str = &a.scratch[a.tokens[old_pos].clone()];
-                let new_str = &b.scratch[b.tokens[new_pos].clone()];
-                match old_str.cmp(new_str) {
+                let old_str = a.token_str(old_pos);
+                let new_str = b.token_str(new_pos);
+                match old_str.as_bytes().cmp(new_str.as_bytes()) {
                     std::cmp::Ordering::Less => {
                         self.note_del(old_str, row_idx);
                         old_pos += 1;
@@ -443,12 +476,12 @@ impl FtsIndex {
                 }
             }
             while old_pos < a.tokens.len() {
-                let old_str = &a.scratch[a.tokens[old_pos].clone()];
+                let old_str = a.token_str(old_pos);
                 self.note_del(old_str, row_idx);
                 old_pos += 1;
             }
             while new_pos < b.tokens.len() {
-                let new_str = &b.scratch[b.tokens[new_pos].clone()];
+                let new_str = b.token_str(new_pos);
                 self.note_add(new_str, row_idx);
                 new_pos += 1;
             }
@@ -457,14 +490,14 @@ impl FtsIndex {
 
     /// Union of posting lists for query tokens (any-token match, then residual score).
     pub fn candidate_idxs(&self, query: &str) -> Vec<usize> {
-        let mut scratch = String::with_capacity(query.len());
+        let mut scratch = String::new();
         let lowered = lowercased(query, &mut scratch);
-        let mut terms = Vec::new();
+        let mut terms: SmallVec<[&str; 8]> = SmallVec::new();
 
-        for tok in lowered.split_whitespace() {
+        for_each_word(lowered, |tok| {
             if let Some(prefix) = tok.strip_suffix('*') {
                 if !prefix.is_empty() {
-                    let mut matched_terms: Vec<&str> = Vec::new();
+                    let mut matched_terms: SmallVec<[&str; 16]> = SmallVec::new();
                     for k in self.postings.keys().chain(self.adds.keys()) {
                         if k.starts_with(prefix) {
                             matched_terms.push(k.as_ref());
@@ -472,14 +505,12 @@ impl FtsIndex {
                     }
                     matched_terms.sort_unstable();
                     matched_terms.dedup();
-                    for term in matched_terms {
-                        terms.push(term);
-                    }
+                    terms.extend(matched_terms);
                 }
             } else {
                 terms.push(tok);
             }
-        }
+        });
 
         if terms.is_empty() {
             return Vec::new();
@@ -488,12 +519,13 @@ impl FtsIndex {
         terms.sort_unstable();
         terms.dedup();
 
-        let mut matched_lists: Vec<std::borrow::Cow<'_, [usize]>> = Vec::with_capacity(terms.len());
+        let mut matched_lists: SmallVec<[std::borrow::Cow<'_, [usize]>; 8]> =
+            SmallVec::with_capacity(terms.len());
         for term in terms {
-            if let Some(list) = self.matches_cow(term) {
-                if !list.is_empty() {
-                    matched_lists.push(list);
-                }
+            if let Some(list) = self.matches_cow(term)
+                && !list.is_empty()
+            {
+                matched_lists.push(list);
             }
         }
 
@@ -518,8 +550,14 @@ impl FtsIndex {
 
     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
         let mut terms: Vec<(&Arc<str>, &SmallVec<[usize; 2]>)> = self.postings.iter().collect();
-        terms.sort_by(|a, b| a.0.cmp(b.0));
-        let mut out = Vec::with_capacity(64 + terms.len() * 16);
+        terms.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let fields_bytes: usize = self.fields.iter().map(|f| 4 + f.len()).sum();
+        let terms_bytes: usize = terms
+            .iter()
+            .map(|(tok, list)| 8 + tok.len() + list.len() * 4)
+            .sum();
+        let exact_cap = 25 + fields_bytes + 4 + terms_bytes + 8;
+        let mut out = Vec::with_capacity(exact_cap);
         out.extend_from_slice(&FTS_MAGIC);
         out.push(FTS_VERSION);
         out.extend_from_slice(&generation.to_le_bytes());
@@ -543,6 +581,7 @@ impl FtsIndex {
         out.extend_from_slice(&FTS_CRC_MAGIC);
         let crc = crate::crc::hardware_crc32c(&out);
         out.extend_from_slice(&crc.to_le_bytes());
+        debug_assert_eq!(out.len(), exact_cap);
         out
     }
 
@@ -594,11 +633,13 @@ impl FtsIndex {
         if i != bytes.len() {
             return Err(io_err("corrupt fts trailer"));
         }
+        let slots = build_fts_slots(&fields);
         Ok((
             generation,
             nrows,
             Self {
                 fields,
+                slots,
                 postings,
                 dels: FxHashMap::default(),
                 adds: FxHashMap::default(),
@@ -648,42 +689,73 @@ fn read_arc_str(b: &[u8], i: &mut usize) -> Result<Arc<str>, Error> {
 
 #[allow(dead_code)]
 pub fn tokenize(text: &str) -> Vec<String> {
-    let mut scratch = String::with_capacity(text.len());
+    let mut scratch = String::new();
     let lowered = lowercased(text, &mut scratch);
-    lowered.split_whitespace().map(|t| t.to_string()).collect()
+    let mut out = Vec::new();
+    for_each_word(lowered, |t| out.push(t.to_string()));
+    out
+}
+
+/// ASCII bytes matching Unicode `White_Space` (`\t`, `\n`, `\x0b`, `\x0c`, `\r`, `' '`).
+#[inline]
+pub(crate) fn is_ascii_unicode_ws(b: u8) -> bool {
+    b == b' ' || b.wrapping_sub(b'\t') < 5
+}
+
+/// Split `s` on Unicode whitespace, using a fast byte loop when `s` is ASCII.
+#[inline]
+pub(crate) fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str)) {
+    if s.is_ascii() {
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            while i < len && is_ascii_unicode_ws(bytes[i]) {
+                i += 1;
+            }
+            if i >= len {
+                break;
+            }
+            let start = i;
+            i += 1;
+            while i < len && !is_ascii_unicode_ws(bytes[i]) {
+                i += 1;
+            }
+            // SAFETY: `s` is ASCII, so every byte offset is a valid UTF-8 boundary.
+            f(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
+        }
+    } else {
+        for tok in s.split_whitespace() {
+            f(tok);
+        }
+    }
 }
 
 /// Text of every field an index tokenizes: the `fts` fields, plus `snippet`
 /// when it is not one of them (lex scoring reads it).
+#[cfg(test)]
 fn fts_texts<'a: 'b, 'b>(row: &'a Row, fields: &'b [String]) -> impl Iterator<Item = &'a str> + 'b {
     let snippet = if fields.iter().any(|f| f == "snippet") {
         None
     } else {
-        row_text(row, "snippet")
+        crate::store::row_text(row, "snippet")
     };
     fields
         .iter()
-        .filter_map(move |f| row_text(row, f))
+        .filter_map(move |f| crate::store::row_text(row, f))
         .chain(snippet)
 }
 
 /// `text` lowercased, borrowed from `text` itself when lowering is a no-op.
-///
-/// Uses SIMD-optimized ASCII handling via make_ascii_lowercase() which rustc
-/// compiles to SSE4/AVX2 instructions on x86_64 targets.
 #[inline]
 pub(crate) fn lowercased<'a>(text: &'a str, scratch: &'a mut String) -> &'a str {
-    if text.is_ascii() {
-        // Fast path: check if already lowercase using byte-level SIMD detection
-        // The .any() iterator is auto-vectorized by rustc for contiguous memory
-        if !text.bytes().any(|b| b.is_ascii_uppercase()) {
-            return text;
-        }
+    // Single auto-vectorized byte pass for the common already-lowercase ASCII case.
+    if !text.bytes().any(|b| b >= 0x80 || b.is_ascii_uppercase()) {
+        return text;
+    }
 
+    if text.is_ascii() {
         scratch.clear();
-        // make_ascii_lowercase() uses single-instruction conversion on modern CPUs:
-        // x86_64: AND with 0xDF to preserve case + OR with 0x20 unconditionally
-        // ARM NEON: vbic/vorr pattern for selective bit manipulation
         scratch.reserve(text.len());
         scratch.push_str(text);
         scratch.make_ascii_lowercase();
@@ -722,32 +794,35 @@ fn subtract_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
     out
 }
 
-/// `a ∪ b` for two sorted lists into `out`, collapsing any overlap between them.
+/// `a ∪ b` for two sorted, duplicate-free lists into `out`, collapsing any overlap between them.
 fn union_sorted_into(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
     out.clear();
     out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        let v = if a[i] <= b[j] {
-            i += 1;
-            a[i - 1]
-        } else {
-            j += 1;
-            b[j - 1]
-        };
-        if out.last().copied() != Some(v) {
-            out.push(v);
+        let va = a[i];
+        let vb = b[j];
+        match va.cmp(&vb) {
+            std::cmp::Ordering::Less => {
+                out.push(va);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                out.push(vb);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                out.push(va);
+                i += 1;
+                j += 1;
+            }
         }
     }
-    for &v in &a[i..] {
-        if out.last().copied() != Some(v) {
-            out.push(v);
-        }
+    if i < a.len() {
+        out.extend_from_slice(&a[i..]);
     }
-    for &v in &b[j..] {
-        if out.last().copied() != Some(v) {
-            out.push(v);
-        }
+    if j < b.len() {
+        out.extend_from_slice(&b[j..]);
     }
 }
 
@@ -835,7 +910,7 @@ fn add_posting(
 struct FtsTokenBuf {
     lower: String,
     scratch: String,
-    tokens: Vec<std::ops::Range<usize>>,
+    tokens: Vec<(u32, u32)>,
 }
 
 impl FtsTokenBuf {
@@ -847,10 +922,17 @@ impl FtsTokenBuf {
         }
     }
 
-    fn collect(&mut self, row: &Row, fields: &[String]) {
+    #[inline]
+    fn token_str(&self, idx: usize) -> &str {
+        let (s, e) = self.tokens[idx];
+        // SAFETY: every `(s, e)` span was produced by `for_each_word` over `self.scratch`.
+        unsafe { std::str::from_utf8_unchecked(&self.scratch.as_bytes()[s as usize..e as usize]) }
+    }
+
+    fn collect(&mut self, row: &Row, slots: &mut [OwnedFieldSlot]) {
         collect_tokens_into_buffers(
             row,
-            fields,
+            slots,
             &mut self.scratch,
             &mut self.lower,
             &mut self.tokens,
@@ -872,42 +954,49 @@ thread_local! {
 
 fn collect_tokens_into_buffers(
     row: &Row,
-    fields: &[String],
+    slots: &mut [OwnedFieldSlot],
     scratch: &mut String,
     lower_scratch: &mut String,
-    tokens: &mut Vec<std::ops::Range<usize>>,
+    tokens: &mut Vec<(u32, u32)>,
 ) {
     scratch.clear();
     tokens.clear();
 
-    for text in fts_texts(row, fields) {
-        if !scratch.is_empty() {
-            scratch.push(' ');
+    for slot in slots {
+        if let Some(text) = slot.get(row).and_then(Cell::text) {
+            if !scratch.is_empty() {
+                scratch.push(' ');
+            }
+            let lowered = lowercased(text, lower_scratch);
+            scratch.push_str(lowered);
         }
-        let lowered = lowercased(text, lower_scratch);
-        scratch.push_str(lowered);
     }
     let base_ptr = scratch.as_ptr() as usize;
-    for word in scratch.split_whitespace() {
+    for_each_word(scratch, |word| {
         let word_offset = (word.as_ptr() as usize) - base_ptr;
-        tokens.push(word_offset..word_offset + word.len());
-    }
+        tokens.push((word_offset as u32, (word_offset + word.len()) as u32));
+    });
 
-    tokens.sort_unstable_by(|a, b| scratch[a.clone()].cmp(&scratch[b.clone()]));
-    tokens.dedup_by(|a, b| scratch[a.clone()] == scratch[b.clone()]);
+    let bytes = scratch.as_bytes();
+    tokens.sort_unstable_by(|&(s1, e1), &(s2, e2)| {
+        bytes[s1 as usize..e1 as usize].cmp(&bytes[s2 as usize..e2 as usize])
+    });
+    tokens.dedup_by(|&mut (s1, e1), &mut (s2, e2)| {
+        bytes[s1 as usize..e1 as usize] == bytes[s2 as usize..e2 as usize]
+    });
 }
 
-fn collect_row_tokens(row: &Row, fields: &[String]) {
+fn collect_row_tokens(row: &Row, slots: &mut [OwnedFieldSlot]) {
     FTS_SCRATCH.with(|pair_cell| {
-        pair_cell.borrow_mut().a.collect(row, fields);
+        pair_cell.borrow_mut().a.collect(row, slots);
     });
 }
 
 fn with_collected_tokens(mut f: impl FnMut(&str)) {
     FTS_SCRATCH.with(|pair_cell| {
         let pair = pair_cell.borrow();
-        for r in &pair.a.tokens {
-            f(&pair.a.scratch[r.clone()]);
+        for idx in 0..pair.a.tokens.len() {
+            f(pair.a.token_str(idx));
         }
     });
 }
@@ -1033,7 +1122,7 @@ pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Cell;
+    use crate::store::{Cell, row_text};
 
     #[test]
     fn snippet_mutations_match_rebuilt_index() {

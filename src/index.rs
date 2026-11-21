@@ -177,6 +177,7 @@ pub struct IndexKey(pub smallvec::SmallVec<[IndexPart; 2]>);
 #[derive(Debug, Clone)]
 pub struct LiveIndex {
     pub def: IndexDef,
+    slots: smallvec::SmallVec<[crate::store::row::OwnedFieldSlot; 2]>,
     /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns)
     pub forward: BTreeMap<IndexKey, PostingList>,
     pub reverse: FxHashMap<usize, IndexKey>,
@@ -240,9 +241,10 @@ impl PostingList {
     fn promote_to_bitmap(&mut self) -> Option<&mut BitSet> {
         if let PostingList::Standard(vec) = self
             && vec.len() >= 64
+            && vec.len().is_power_of_two()
         {
             let max_pos = vec.iter().copied().max().unwrap_or(0);
-            if max_pos <= vec.len().saturating_mul(64) {
+            if max_pos <= vec.len().saturating_mul(256) {
                 let mut set = BitSet::new(max_pos + 1);
                 for &p in vec.iter() {
                     set.insert(p);
@@ -253,6 +255,22 @@ impl PostingList {
         match self {
             PostingList::Bitmap(set) => Some(set),
             PostingList::Standard(_) => None,
+        }
+    }
+
+    #[inline]
+    fn maybe_promote_batch(&mut self) {
+        if let PostingList::Standard(vec) = self
+            && vec.len() >= 64
+        {
+            let max_pos = vec.iter().copied().max().unwrap_or(0);
+            if max_pos <= vec.len().saturating_mul(256) {
+                let mut set = BitSet::new(max_pos + 1);
+                for &p in vec.iter() {
+                    set.insert(p);
+                }
+                *self = PostingList::Bitmap(set);
+            }
         }
     }
 
@@ -282,8 +300,10 @@ impl PostingList {
         }
         match self {
             PostingList::Standard(vec) => {
-                if let Some(p) = vec.iter().position(|&x| x == from) {
-                    vec[p] = to;
+                if vec.len() > 64
+                    && let Some(rel) = vec[64..].iter().position(|&x| x == from)
+                {
+                    vec[64 + rel] = to;
                 } else {
                     vec.push(to);
                 }
@@ -320,8 +340,10 @@ impl PostingList {
         }
         match self {
             PostingList::Standard(vec) => {
-                if let Some(p) = vec.iter().position(|&x| x == pos) {
-                    vec.swap_remove(p);
+                if vec.len() > 64
+                    && let Some(rel) = vec[64..].iter().position(|&x| x == pos)
+                {
+                    vec.swap_remove(64 + rel);
                 }
             }
             PostingList::Bitmap(set) => set.remove(pos),
@@ -498,8 +520,14 @@ impl PostingList {
 
 impl LiveIndex {
     pub fn new(def: IndexDef) -> Self {
+        let slots = def
+            .fields
+            .iter()
+            .map(|f| crate::store::row::OwnedFieldSlot::new(f.as_str()))
+            .collect();
         Self {
             def,
+            slots,
             forward: BTreeMap::new(),
             reverse: FxHashMap::default(),
             use_reverse: true,
@@ -512,6 +540,7 @@ impl LiveIndex {
     pub fn clone_for_read(&self) -> Self {
         Self {
             def: self.def.clone(),
+            slots: self.slots.clone(),
             forward: self.forward.clone(),
             reverse: FxHashMap::default(),
             use_reverse: false,
@@ -601,12 +630,31 @@ impl LiveIndex {
         IndexKey(smallvec::smallvec![cell_part(c0), cell_part(c1)])
     }
 
+    #[inline]
     pub fn key_of(&self, row: &Row) -> IndexKey {
-        let mut parts = smallvec::SmallVec::with_capacity(self.def.fields.len());
-        for f in &self.def.fields {
-            parts.push(cell_part(row.get(f).unwrap_or(&Cell::Null)));
+        match self.slots.as_slice() {
+            [s0] if self.def.fields.len() == 1 => IndexKey(smallvec::smallvec![cell_part(
+                s0.get_sync(row).unwrap_or(&Cell::Null)
+            )]),
+            [s0, s1] if self.def.fields.len() == 2 => IndexKey(smallvec::smallvec![
+                cell_part(s0.get_sync(row).unwrap_or(&Cell::Null)),
+                cell_part(s1.get_sync(row).unwrap_or(&Cell::Null)),
+            ]),
+            slots if slots.len() == self.def.fields.len() => {
+                let mut parts = smallvec::SmallVec::with_capacity(slots.len());
+                for s in slots {
+                    parts.push(cell_part(s.get_sync(row).unwrap_or(&Cell::Null)));
+                }
+                IndexKey(parts)
+            }
+            _ => {
+                let mut parts = smallvec::SmallVec::with_capacity(self.def.fields.len());
+                for f in &self.def.fields {
+                    parts.push(cell_part(row.get_str(f).unwrap_or(&Cell::Null)));
+                }
+                IndexKey(parts)
+            }
         }
-        IndexKey(parts)
     }
 
     pub fn insert_at(&mut self, idx: usize, row: &Row) -> Result<(), String> {
@@ -715,7 +763,7 @@ impl LiveIndex {
         let bitmap_sample = self.def.bitmap_card_field.as_ref().map(|field| {
             let mut distinct = rustc_hash::FxHashSet::default();
             for row in rows.iter().take(100) {
-                if let Some(cell) = row.get(field) {
+                if let Some(cell) = row.get_str(field) {
                     if matches!(cell, Cell::Bool(_)) {
                         return (true, 0);
                     }
@@ -724,6 +772,124 @@ impl LiveIndex {
             }
             (false, distinct.len())
         });
+
+        // Fast path for bulk building into an empty non-reverse index: flat key extraction,
+        // in-place unstable sort (preserving ascending `orig_idx` order per key), direct
+        // dense `BitSet` construction, and O(K) sorted `BTreeMap::from_iter`.
+        if self.forward.is_empty()
+            && !self.use_reverse
+            && self.def.pred.is_none()
+            && rows.len() >= 64
+        {
+            let mut pairs: Vec<(IndexKey, usize)> = Vec::with_capacity(rows.len());
+            let first = &rows[0];
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                match self.def.fields.as_slice() {
+                    [f0] => {
+                        let p0 = fshape.position(f0);
+                        for (i, row) in rows.iter().enumerate() {
+                            let c0 = p0.map_or(&Cell::Null, |p| &row.cells_slice()[p]);
+                            pairs.push((IndexKey(smallvec::smallvec![cell_part(c0)]), start + i));
+                        }
+                    }
+                    [f0, f1] => {
+                        let p0 = fshape.position(f0);
+                        let p1 = fshape.position(f1);
+                        for (i, row) in rows.iter().enumerate() {
+                            let cells = row.cells_slice();
+                            let c0 = p0.map_or(&Cell::Null, |p| &cells[p]);
+                            let c1 = p1.map_or(&Cell::Null, |p| &cells[p]);
+                            pairs.push((
+                                IndexKey(smallvec::smallvec![cell_part(c0), cell_part(c1)]),
+                                start + i,
+                            ));
+                        }
+                    }
+                    fields => {
+                        let positions: smallvec::SmallVec<[Option<usize>; 4]> =
+                            fields.iter().map(|f| fshape.position(f)).collect();
+                        for (i, row) in rows.iter().enumerate() {
+                            let cells = row.cells_slice();
+                            let mut parts = smallvec::SmallVec::with_capacity(positions.len());
+                            for &pos in &positions {
+                                parts.push(cell_part(pos.map_or(&Cell::Null, |p| &cells[p])));
+                            }
+                            pairs.push((IndexKey(parts), start + i));
+                        }
+                    }
+                }
+            } else {
+                for (i, row) in rows.iter().enumerate() {
+                    pairs.push((self.key_of(row), start + i));
+                }
+            }
+
+            pairs.sort_unstable();
+
+            if self.def.unique && pairs.windows(2).any(|w| w[0].0 == w[1].0) {
+                for (i, row) in rows.iter().enumerate() {
+                    let key = self.key_of(row);
+                    self.insert_one_slab_key(start + i, row, key, bitmap_sample)?;
+                }
+                return Ok(());
+            }
+
+            let sample_force_bitmap = bitmap_sample
+                .is_some_and(|(has_bool, count)| has_bool || (count > 0 && count <= 16));
+            let mut entries: Vec<(IndexKey, PostingList)> = Vec::new();
+            let mut iter = pairs.into_iter().peekable();
+            while let Some((key, first_pos)) = iter.next() {
+                let key_has_bool = self.def.bitmap_card_field.is_some()
+                    && key
+                        .0
+                        .first()
+                        .is_some_and(|p| matches!(p, IndexPart::Bool(_)));
+                if iter.peek().is_none_or(|(next_k, _)| *next_k != key) {
+                    let posting = if sample_force_bitmap || key_has_bool {
+                        let mut set = BitSet::new((first_pos + 1).max(64));
+                        set.insert(first_pos);
+                        PostingList::Bitmap(set)
+                    } else {
+                        PostingList::Standard(smallvec::smallvec![first_pos])
+                    };
+                    entries.push((key, posting));
+                    continue;
+                }
+                let mut sv: smallvec::SmallVec<[usize; 2]> = smallvec::smallvec![first_pos];
+                while let Some((_, pos)) = iter.next_if(|(next_k, _)| *next_k == key) {
+                    sv.push(pos);
+                }
+                let m = sv.len();
+                let max_pos = *sv.last().unwrap_or(&0);
+                let posting = if sample_force_bitmap
+                    || key_has_bool
+                    || (m >= 32 && max_pos <= m.saturating_mul(256))
+                {
+                    let mut set = BitSet::new(max_pos + 1);
+                    for &p in &sv {
+                        set.insert(p);
+                    }
+                    PostingList::Bitmap(set)
+                } else {
+                    PostingList::Standard(sv)
+                };
+                entries.push((key, posting));
+            }
+            self.forward = BTreeMap::from_iter(entries);
+            #[cfg(feature = "parallel")]
+            if let Some(ref mut bf) = self.bloom_filter {
+                for k in self.forward.keys() {
+                    bf.add(k);
+                }
+            }
+            return Ok(());
+        }
 
         if let Some(pred) = &self.def.pred {
             let now = crate::store::now_ms();
@@ -751,43 +917,52 @@ impl LiveIndex {
                 self.reverse.reserve(rows.len());
             }
             let first = &rows[0];
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 && self.def.fields.len() <= 8 {
-                let mut slot_to_part = [None; 32];
-                let mut all_found = true;
-                for (part_idx, field) in self.def.fields.iter().enumerate() {
-                    if let Some(pos) = first.keys().position(|k| k == field) {
-                        if pos < 32 {
-                            slot_to_part[pos] = Some(part_idx);
-                        } else {
-                            all_found = false;
-                            break;
-                        }
-                    } else {
-                        all_found = false;
-                        break;
-                    }
-                }
-                if all_found {
-                    let num_parts = self.def.fields.len();
-                    for (i, row) in rows.iter().enumerate() {
-                        let orig_idx = start + i;
-                        let mut parts = smallvec::smallvec![IndexPart::Null; num_parts];
-                        for (pos, val) in row.values().enumerate() {
-                            if let Some(&Some(part_idx)) = slot_to_part.get(pos) {
-                                parts[part_idx] = cell_part(val);
+            let uniform = first.shape_arc().is_some_and(|fs| {
+                rows[1..]
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
+            });
+            if uniform {
+                let fshape = first.shape_arc().unwrap();
+                let positions: smallvec::SmallVec<[Option<usize>; 4]> = self
+                    .def
+                    .fields
+                    .iter()
+                    .map(|f| fshape.position(f))
+                    .collect();
+                for (i, row) in rows.iter().enumerate() {
+                    let orig_idx = start + i;
+                    let cells = row.cells_slice();
+                    let key = match positions.as_slice() {
+                        [p0] => IndexKey(smallvec::smallvec![cell_part(
+                            p0.map_or(&Cell::Null, |p| &cells[p])
+                        )]),
+                        [p0, p1] => IndexKey(smallvec::smallvec![
+                            cell_part(p0.map_or(&Cell::Null, |p| &cells[p])),
+                            cell_part(p1.map_or(&Cell::Null, |p| &cells[p])),
+                        ]),
+                        pos_slice => {
+                            let mut parts = smallvec::SmallVec::with_capacity(pos_slice.len());
+                            for &pos in pos_slice {
+                                parts.push(cell_part(pos.map_or(&Cell::Null, |p| &cells[p])));
                             }
+                            IndexKey(parts)
                         }
-                        let key = IndexKey(parts);
-                        self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
-                    }
-                    return Ok(());
+                    };
+                    self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
+                }
+            } else {
+                for (i, row) in rows.iter().enumerate() {
+                    let orig_idx = start + i;
+                    let key = self.key_of(row);
+                    self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
                 }
             }
-            for (i, row) in rows.iter().enumerate() {
-                let orig_idx = start + i;
-                let key = self.key_of(row);
-                self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
+        }
+
+        if rows.len() >= 256 && self.forward.len().saturating_mul(16) <= start + rows.len() {
+            for list in self.forward.values_mut() {
+                list.maybe_promote_batch();
             }
         }
         Ok(())
@@ -826,23 +1001,26 @@ impl LiveIndex {
     }
 
     pub fn update_row(&mut self, idx: usize, before: &Row, after: &Row) -> Result<(), String> {
+        if self.def.pred.is_none()
+            && (!self.use_reverse || self.reverse.contains_key(&idx))
+            && self.slots.len() == self.def.fields.len()
+            && self.slots.iter().all(|s| s.get_sync(before) == s.get_sync(after))
+        {
+            return Ok(());
+        }
         if self.use_reverse {
             return self.insert_at(idx, after);
         }
-        let now = crate::store::now_ms();
-        let old_key = self
-            .def
-            .pred
-            .as_ref()
-            .is_none_or(|pred| crate::eval::eval_pred(pred, before, now))
-            .then(|| self.key_of(before));
-        let new_key = self
-            .def
-            .pred
-            .as_ref()
-            .is_none_or(|pred| crate::eval::eval_pred(pred, after, now))
-            .then(|| self.key_of(after));
-        self.update_keys(idx, old_key, new_key)
+        if let Some(ref pred) = self.def.pred {
+            let now = crate::store::now_ms();
+            let old_key = crate::eval::eval_pred(pred, before, now).then(|| self.key_of(before));
+            let new_key = crate::eval::eval_pred(pred, after, now).then(|| self.key_of(after));
+            self.update_keys(idx, old_key, new_key)
+        } else {
+            let old_key = Some(self.key_of(before));
+            let new_key = Some(self.key_of(after));
+            self.update_keys(idx, old_key, new_key)
+        }
     }
 
     pub fn update_keys(
@@ -861,12 +1039,15 @@ impl LiveIndex {
         {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
-        if let Some(ok) = old_key {
-            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(ok) {
-                entry.get_mut().remove(idx);
-                if entry.get().is_empty() {
-                    entry.remove_entry();
-                }
+        if let Some(ref ok) = old_key {
+            let empty = if let Some(list) = self.forward.get_mut(ok) {
+                list.remove(idx);
+                list.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.forward.remove(ok);
             }
         }
         if let Some(nk) = new_key {
@@ -886,21 +1067,21 @@ impl LiveIndex {
             self.remove_at(idx);
             return;
         }
-        let now = crate::store::now_ms();
-        if self
-            .def
-            .pred
-            .as_ref()
-            .is_some_and(|pred| !crate::eval::eval_pred(pred, doomed, now))
-        {
-            return;
+        if let Some(ref pred) = self.def.pred {
+            let now = crate::store::now_ms();
+            if !crate::eval::eval_pred(pred, doomed, now) {
+                return;
+            }
         }
         let kd = self.key_of(doomed);
-        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(kd) {
-            entry.get_mut().remove(idx);
-            if entry.get().is_empty() {
-                entry.remove_entry();
-            }
+        let empty = if let Some(list) = self.forward.get_mut(&kd) {
+            list.remove(idx);
+            list.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.forward.remove(&kd);
         }
     }
 
@@ -910,25 +1091,27 @@ impl LiveIndex {
             return;
         }
         if kd == kt {
-            if let std::collections::btree_map::Entry::Occupied(mut entry) =
-                self.forward.entry(kt.clone())
-            {
-                entry.get_mut().remove(last);
-                if entry.get().is_empty() {
-                    entry.remove_entry();
-                }
+            let empty = if let Some(list) = self.forward.get_mut(kt) {
+                list.remove(last);
+                list.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.forward.remove(kt);
             }
         } else {
             if let Some(list) = self.forward.get_mut(kt) {
                 list.replace(last, p);
             }
-            if let std::collections::btree_map::Entry::Occupied(mut entry) =
-                self.forward.entry(kd.clone())
-            {
-                entry.get_mut().remove(p);
-                if entry.get().is_empty() {
-                    entry.remove_entry();
-                }
+            let empty = if let Some(list) = self.forward.get_mut(kd) {
+                list.remove(p);
+                list.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                self.forward.remove(kd);
             }
         }
     }
@@ -1097,9 +1280,46 @@ impl LiveIndex {
         (start, end)
     }
 
+    /// Fast path for full-key equality seeks (`use_.range.is_none() && use_.eqs.len() == arity`),
+    /// building a single `IndexKey` for `BTreeMap::get` instead of two `Bound` keys + `range`.
+    #[inline]
+    fn exact_eq_key(&self, use_: &IndexUse, now: i64) -> Option<IndexKey> {
+        if use_.range.is_some() || use_.eqs.len() != self.def.fields.len() {
+            return None;
+        }
+        let key = match use_.eqs.as_slice() {
+            [(_, v0)] => IndexKey(smallvec::smallvec![value_part(v0, now)]),
+            [(_, v0), (_, v1)] => {
+                IndexKey(smallvec::smallvec![value_part(v0, now), value_part(v1, now)])
+            }
+            eqs => {
+                let mut parts = smallvec::SmallVec::with_capacity(eqs.len());
+                for (_, v) in eqs {
+                    parts.push(value_part(v, now));
+                }
+                IndexKey(parts)
+            }
+        };
+        Some(key)
+    }
+
+    #[inline]
+    fn lookup_exact<'a>(&'a self, key: &IndexKey) -> Option<&'a PostingList> {
+        #[cfg(feature = "parallel")]
+        if let Some(ref filter) = self.bloom_filter
+            && !filter.contains(key)
+        {
+            return None;
+        }
+        self.forward.get(key)
+    }
+
     /// Count matching row indices without allocating an id/index list.
     /// Optional early termination if count exceeds threshold for performance.
     pub fn seek_count(&self, use_: &IndexUse, now: i64) -> usize {
+        if let Some(key) = self.exact_eq_key(use_, now) {
+            return self.lookup_exact(&key).map_or(0, PostingList::count);
+        }
         let (start, end) = self.bounds(use_, now);
         self.forward
             .range((start, end))
@@ -1114,6 +1334,10 @@ impl LiveIndex {
         now: i64,
         threshold: usize,
     ) -> Option<usize> {
+        if let Some(key) = self.exact_eq_key(use_, now) {
+            let count = self.lookup_exact(&key).map_or(0, PostingList::count);
+            return (count <= threshold).then_some(count);
+        }
         let (start, end) = self.bounds(use_, now);
 
         let mut count = 0;
@@ -1128,16 +1352,22 @@ impl LiveIndex {
 
     /// Seek row indices directly calling closure for each index (zero allocations)
     pub fn seek_each(&self, use_: &IndexUse, now: i64, mut f: impl FnMut(usize)) {
-        let (start, end) = self.bounds(use_, now);
-
-        #[cfg(feature = "parallel")]
-        if let (Bound::Included(lo), Bound::Included(hi)) = (&start, &end)
-            && lo == hi
-            && let Some(ref filter) = self.bloom_filter
-            && !filter.contains(lo)
-        {
+        if let Some(key) = self.exact_eq_key(use_, now) {
+            if let Some(list) = self.lookup_exact(&key) {
+                match list {
+                    PostingList::Standard(vec) => {
+                        for &pos in vec {
+                            f(pos);
+                        }
+                    }
+                    PostingList::Bitmap(set) => {
+                        set.for_each(&mut f);
+                    }
+                }
+            }
             return;
         }
+        let (start, end) = self.bounds(use_, now);
 
         for (_, list) in self.forward.range((start, end)) {
             match list {
@@ -1155,16 +1385,13 @@ impl LiveIndex {
 
     /// Seek row indices by range bounds, appending directly into output vector
     pub fn seek_idxs_into(&self, use_: &IndexUse, now: i64, out: &mut Vec<usize>) {
-        let (start, end) = self.bounds(use_, now);
-
-        #[cfg(feature = "parallel")]
-        if let (Bound::Included(lo), Bound::Included(hi)) = (&start, &end)
-            && lo == hi
-            && let Some(ref filter) = self.bloom_filter
-            && !filter.contains(lo)
-        {
+        if let Some(key) = self.exact_eq_key(use_, now) {
+            if let Some(list) = self.lookup_exact(&key) {
+                list.extend_into(out);
+            }
             return;
         }
+        let (start, end) = self.bounds(use_, now);
 
         for (_, list) in self.forward.range((start, end)) {
             list.extend_into(out);
@@ -1173,6 +1400,12 @@ impl LiveIndex {
 
     /// Seek row indices by range bounds: extend output vector from BTreeMap iteration
     pub fn seek_idxs(&self, use_: &IndexUse, now: i64) -> Vec<usize> {
+        if let Some(key) = self.exact_eq_key(use_, now) {
+            return match self.lookup_exact(&key) {
+                Some(list) => list.to_indices(),
+                None => Vec::new(),
+            };
+        }
         let mut out = Vec::new();
         self.seek_idxs_into(use_, now, &mut out);
         out
@@ -1181,15 +1414,13 @@ impl LiveIndex {
     /// Iterate matching row indices in index key order (`desc = false` ascending, `desc = true` descending),
     /// stopping early as soon as `f(row_idx)` returns `false`.
     pub fn seek_ordered_limit(&self, use_: &IndexUse, now: i64, desc: bool, mut f: impl FnMut(usize) -> bool) {
-        let (start, end) = self.bounds(use_, now);
-        #[cfg(feature = "parallel")]
-        if let (Bound::Included(lo), Bound::Included(hi)) = (&start, &end)
-            && lo == hi
-            && let Some(ref filter) = self.bloom_filter
-            && !filter.contains(lo)
-        {
+        if let Some(key) = self.exact_eq_key(use_, now) {
+            if let Some(list) = self.lookup_exact(&key) {
+                let _ = list.for_each_ordered(desc, &mut f);
+            }
             return;
         }
+        let (start, end) = self.bounds(use_, now);
         if desc {
             for (_, list) in self.forward.range((start, end)).rev() {
                 if !list.for_each_ordered(true, &mut f) {
@@ -1216,14 +1447,7 @@ impl LiveIndex {
         use rayon::prelude::*;
 
         uses.par_iter()
-            .map(|use_| {
-                let (start, end) = self.bounds(use_, now);
-                let mut out = Vec::new();
-                for (_, list) in self.forward.range((start, end)) {
-                    list.extend_into(&mut out);
-                }
-                out
-            })
+            .map(|use_| self.seek_idxs(use_, now))
             .collect()
     }
 }
@@ -1950,14 +2174,7 @@ mod storage_tests {
             bitmap_card_field: Some("status".into()),
         };
 
-        let index = LiveIndex {
-            def: index_def,
-            forward: BTreeMap::new(),
-            reverse: FxHashMap::default(),
-            use_reverse: true,
-            #[cfg(feature = "parallel")]
-            bloom_filter: None,
-        };
+        let index = LiveIndex::new(index_def);
 
         // Test with boolean field - should always use bitmap
         let row_pending = Row::from([("status", Cell::Bool(false))]);
@@ -1978,14 +2195,7 @@ mod storage_tests {
             bitmap_card_field: Some("priority".into()),
         };
 
-        let index = LiveIndex {
-            def: index_def,
-            forward: BTreeMap::new(),
-            reverse: FxHashMap::default(),
-            use_reverse: true,
-            #[cfg(feature = "parallel")]
-            bloom_filter: None,
-        };
+        let index = LiveIndex::new(index_def);
 
         // Create sample data with low cardinality (only 3 distinct values)
         let rows: Vec<Row> = (0..100)
@@ -2007,14 +2217,7 @@ mod storage_tests {
             bitmap_card_field: Some("id".into()),
         };
 
-        let index = LiveIndex {
-            def: index_def,
-            forward: BTreeMap::new(),
-            reverse: FxHashMap::default(),
-            use_reverse: true,
-            #[cfg(feature = "parallel")]
-            bloom_filter: None,
-        };
+        let index = LiveIndex::new(index_def);
 
         // Create sample data with high cardinality (100 distinct values in sample)
         let rows: Vec<Row> = (0..100)
@@ -2324,5 +2527,41 @@ mod bitmap_sample_once_tests {
         for population in [9_999, 10_000, 10_001] {
             compare(&rows, false, false, population);
         }
+    }
+
+    #[test]
+    fn bulk_slab_promotes_dense_keys_to_bitmap_for_o1_swap_remove() {
+        let def = IndexDef {
+            collection: "docs".into(),
+            unique: false,
+            fields: vec!["wing".into()],
+            pred: None,
+            bitmap_card_field: None,
+        };
+        let rows: Vec<Row> = (0..10_000)
+            .map(|i| {
+                Row::from([(
+                    "wing",
+                    Cell::from_text(match i % 100 {
+                        0..=49 => "rag",
+                        50..=79 => "sys",
+                        _ => "core",
+                    }),
+                )])
+            })
+            .collect();
+        let mut index = LiveIndex::new(def);
+        index.insert_slab_batch_no_reverse(0, &rows).unwrap();
+        for list in index.forward.values() {
+            assert!(list.is_bitmap(), "expected Bitmap for dense bulk key");
+        }
+        let use_ = IndexUse {
+            def: index.def.clone(),
+            eqs: vec![("wing".into(), Value::String(Arc::from("rag")))],
+            range: None,
+        };
+        assert_eq!(index.seek_count(&use_, 0), 5_000);
+        index.swap_remove_rows(0, &rows[0], 9_999, &rows[9_999]);
+        assert_eq!(index.seek_count(&use_, 0), 4_999);
     }
 }
