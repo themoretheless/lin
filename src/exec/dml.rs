@@ -2547,7 +2547,11 @@ fn build_insert_rows(
             txs
         });
         if !workers.is_empty() {
-            let chunk_size = 64usize;
+            let chunk_size = if std::env::var_os("LIN_BENCH_INSERT_BUILD_CHUNKS").is_some() {
+                if n < 4096 { 128 } else { 256 }
+            } else {
+                64
+            };
             let total_chunks = n.div_ceil(chunk_size);
             let mut rows: Vec<Row> = Vec::with_capacity(n);
             let spare = &mut rows.spare_capacity_mut()[..n];

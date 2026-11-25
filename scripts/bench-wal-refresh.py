@@ -46,11 +46,11 @@ for n in (1000, 10000):
                     env.pop("LIN_BENCH_AVX2_WIDE", None)
                     if role in ("wide", "candidate"):
                         env["LIN_BENCH_AVX2_SERIAL"] = "1"
-                    env.pop("LIN_BENCH_DIRECT_WAL_LARGE", None)
+                    env.pop("LIN_BENCH_INSERT_BUILD_CHUNKS", None)
                     if role in ("wide", "candidate"):
                         env["LIN_BENCH_AVX2_WIDE"] = "1"
                     if role == "candidate":
-                        env["LIN_BENCH_DIRECT_WAL_LARGE"] = "1"
+                        env["LIN_BENCH_INSERT_BUILD_CHUNKS"] = "1"
                     if role in ("wide", "candidate"):
                         env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
