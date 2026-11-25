@@ -118,6 +118,10 @@ fn measure_insert(
             None => Db::empty(),
         };
         open_ns.push(open.elapsed().as_nanos() as u64);
+        if durable.is_some() && std::env::var_os("LIN_BENCH_WAL_DICTIONARY").is_some() {
+            db.set_wal_dictionary(Some(true));
+            assert!(db.wal_dictionary_enabled());
+        }
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()

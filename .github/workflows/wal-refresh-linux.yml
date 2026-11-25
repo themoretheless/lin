@@ -20,6 +20,7 @@ jobs:
           - {runner: ubuntu-22.04, replica: amd-6}
           - {runner: ubuntu-22.04, replica: amd-7}
           - {runner: ubuntu-22.04, replica: amd-8}
+          - {runner: ubuntu-24.04-arm, replica: arm64}
     steps:
       - uses: actions/checkout@v4
       - name: Record CPU and select target hosts
@@ -45,13 +46,12 @@ jobs:
           lscpu >> wal-provenance.txt
           rustc -Vv >> wal-provenance.txt
           sha256sum target/release/lin-peer-worker >> wal-provenance.txt
-          cc -O2 -shared -fPIC -Wall -Wextra scripts/wal-sync-trace.c -ldl -o wal-sync-trace.so
-          python3 scripts/profile-wal-sync.py target/release/lin-peer-worker wal-sync-trace.so wal-sync.json
+          python3 scripts/bench-wal-refresh.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wal-epyc-${{ matrix.replica }}
           path: |
             runner-cpu.txt
-            wal-sync.json
+            wal-results.json
             wal-provenance.txt
