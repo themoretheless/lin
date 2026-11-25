@@ -42,12 +42,13 @@ jobs:
           lscpu >> wal-provenance.txt
           rustc -Vv >> wal-provenance.txt
           sha256sum target/release/lin-peer-worker >> wal-provenance.txt
-          python3 scripts/bench-wal-refresh.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
+          cc -O2 -shared -fPIC -Wall -Wextra scripts/wal-sync-trace.c -ldl -o wal-sync-trace.so
+          python3 scripts/profile-wal-sync.py target/release/lin-peer-worker wal-sync-trace.so wal-sync.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wal-epyc-${{ matrix.replica }}
           path: |
             runner-cpu.txt
-            wal-results.json
+            wal-sync.json
             wal-provenance.txt
