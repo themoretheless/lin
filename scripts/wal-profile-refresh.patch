@@ -1,55 +1,3 @@
-commit fdcba6411ae21a961e316e97220e0c6a673a0675
-Author: Denis Mezhov <d.o.mezhov@gmail.com>
-Date:   Wed Nov 18 16:14:48 2026 +0400
-
-    Profile WAL FULL insert phases on Linux
-
-diff --git a/src/persist/codec.rs b/src/persist/codec.rs
-index 1dc3e041c..ea2875920 100644
---- a/src/persist/codec.rs
-+++ b/src/persist/codec.rs
-@@ -1541,6 +1541,20 @@ pub(crate) fn encode_insert_rows_direct_ext(
-     rows: &[Row],
-     uniform_keys: bool,
-     buf: &mut Vec<u8>,
-+) -> Option<([u8; 4], Vec<String>)> {
-+    let start = std::time::Instant::now();
-+    let result = encode_insert_rows_direct_profile_inner(rec_gen, next_id, collection, rows, uniform_keys, buf);
-+    eprintln!("WAL_ENCODE {} {} {} {}", rows.len(), start.elapsed().as_nanos(), result.is_some(), buf.len());
-+    result
-+}
-+
-+fn encode_insert_rows_direct_profile_inner(
-+    rec_gen: u64,
-+    next_id: u64,
-+    collection: &str,
-+    rows: &[Row],
-+    uniform_keys: bool,
-+    buf: &mut Vec<u8>,
- ) -> Option<([u8; 4], Vec<String>)> {
-     if rows.is_empty() {
-         return None;
-diff --git a/src/persist/wal.rs b/src/persist/wal.rs
-index 8560d8376..1d24d3512 100644
---- a/src/persist/wal.rs
-+++ b/src/persist/wal.rs
-@@ -601,11 +601,16 @@ pub(crate) fn write_frame_precomputed(
-         return Err(io_err("log record exceeds 16MiB"));
-     };
-     let codec = magic[3];
-+    let start = std::time::Instant::now();
-     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
-+    let write_ns = start.elapsed().as_nanos();
- 
-+    let start = std::time::Instant::now();
-     if sync == SyncMode::Full {
-         durable_sync(log).map_err(io_err)?;
-     }
-+    let sync_ns = start.elapsed().as_nanos();
-+    eprintln!("WAL_FRAME {} {} {} {:?}", payload.len(), write_ns, sync_ns, sync);
-     *log_bytes += 8 + len as u64;
-     Ok(())
- }
 diff --git a/src/exec/dml.rs b/src/exec/dml.rs
 index c5f95d122..a08dbf9cd 100644
 --- a/src/exec/dml.rs
@@ -84,3 +32,65 @@ index c5f95d122..a08dbf9cd 100644
              built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
              maintenance?;
              Some(staged)
+diff --git a/src/persist/codec.rs b/src/persist/codec.rs
+index 5548b5ade..a295b4072 100644
+--- a/src/persist/codec.rs
++++ b/src/persist/codec.rs
+@@ -1608,6 +1608,21 @@ fn encode_insert_rows_direct_at(
+     rows: &[Row],
+     uniform_keys: bool,
+     buf: &mut Vec<u8>,
++) -> Option<([u8; 4], Vec<String>)> {
++    let start = std::time::Instant::now();
++    let result = encode_insert_rows_direct_profile_inner(start_off, rec_gen, next_id, collection, rows, uniform_keys, buf);
++    eprintln!("WAL_ENCODE {} {} {} {}", rows.len(), start.elapsed().as_nanos(), result.is_some(), buf.len().saturating_sub(start_off));
++    result
++}
++
++fn encode_insert_rows_direct_profile_inner(
++    start_off: usize,
++    rec_gen: u64,
++    next_id: u64,
++    collection: &str,
++    rows: &[Row],
++    uniform_keys: bool,
++    buf: &mut Vec<u8>,
+ ) -> Option<([u8; 4], Vec<String>)> {
+     if rows.is_empty() {
+         return None;
+diff --git a/src/persist/wal.rs b/src/persist/wal.rs
+index af20a7bad..5ad7e4d5f 100644
+--- a/src/persist/wal.rs
++++ b/src/persist/wal.rs
+@@ -620,10 +620,14 @@ pub(super) fn write_in_place_frame_buf(
+     if framed.len() >= 64 * 1024 + 13 {
+         reserve_wal_space(log, framed.len(), false);
+     }
++    let write_start = std::time::Instant::now();
+     log.write_all(framed).map_err(io_err)?;
++    let write_ns = write_start.elapsed().as_nanos();
++    let sync_start = std::time::Instant::now();
+     if sync == SyncMode::Full {
+         durable_sync(log).map_err(io_err)?;
+     }
++    eprintln!("WAL_FRAME {} {write_ns} {} {:?}", framed.len().saturating_sub(13), sync_start.elapsed().as_nanos(), sync);
+     *log_bytes += framed.len() as u64;
+     Ok(())
+ }
+@@ -664,11 +668,16 @@ pub(crate) fn write_frame_precomputed(
+         return Err(io_err("log record exceeds 16MiB"));
+     };
+     let codec = magic[3];
++    let start = std::time::Instant::now();
+     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
++    let write_ns = start.elapsed().as_nanos();
+ 
++    let start = std::time::Instant::now();
+     if sync == SyncMode::Full {
+         durable_sync(log).map_err(io_err)?;
+     }
++    let sync_ns = start.elapsed().as_nanos();
++    eprintln!("WAL_FRAME {} {} {} {:?}", payload.len(), write_ns, sync_ns, sync);
+     *log_bytes += 8 + len as u64;
+     Ok(())
+ }
