@@ -46,7 +46,7 @@ for n in (1000, 10000):
                         "LIN_BENCH_AVX2_SERIAL",
                         "LIN_BENCH_AVX2_WIDE",
                     )
-                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE", "LIN_BENCH_WAL_DICT_AVX2", "LIN_BENCH_WAL_DICT_PACK", "LIN_BENCH_WAL_DICT_LOOKUP", "LIN_BENCH_WAL_DICT_SCAN32", "LIN_BENCH_WAL_DICT_SCAN64", "LIN_BENCH_WAL_DICT_SKIP_EMPTY"):
+                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE", "LIN_BENCH_WAL_DICT_AVX2", "LIN_BENCH_WAL_DICT_PACK", "LIN_BENCH_WAL_DICT_LOOKUP", "LIN_BENCH_WAL_DICT_SCAN32", "LIN_BENCH_WAL_DICT_SCAN64", "LIN_BENCH_WAL_DICT_FIRST_HIT"):
                         env.pop(flag, None)
                     if role in ("wide", "candidate"):
                         for flag in fast_flags:
@@ -59,7 +59,7 @@ for n in (1000, 10000):
                         env["LIN_BENCH_WAL_DICT_SCAN32"] = "1"
                         env["LIN_BENCH_WAL_DICT_SCAN64"] = "1"
                         if role == "candidate":
-                            env["LIN_BENCH_WAL_DICT_SKIP_EMPTY"] = "1"
+                            env["LIN_BENCH_WAL_DICT_FIRST_HIT"] = "1"
                     elif role == "candidate" and n >= 4096:
                         env["LIN_BENCH_WAL_DICTIONARY"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
