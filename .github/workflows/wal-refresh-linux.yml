@@ -18,7 +18,7 @@ jobs:
         with:
           toolchain: '1.96.0'
       - name: Build locked release worker
-        run: cargo build --locked --release -p lin-peer-worker
+        run: cargo build --locked --release -p lin-peer-worker --bin lin-peer-worker
       - name: Measure WAL FULL with paired controls
         run: |
           set -o pipefail
@@ -35,3 +35,14 @@ jobs:
           path: |
             wal-results.json
             wal-provenance.txt
+      - name: Profile WAL in a separate build
+        run: |
+          set -euo pipefail
+          git apply scripts/wal-profile-refresh.patch
+          cargo build --locked --release -p lin-peer-worker --bin fresh_wal_profile
+          python3 scripts/bench-wal-profile.py target/release/fresh_wal_profile wal-profile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-profile-refresh-linux-${{ matrix.runner }}
+          path: wal-profile/

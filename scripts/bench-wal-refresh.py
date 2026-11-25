@@ -26,8 +26,8 @@ report = {
 }
 for n in (1000, 10000):
     rows = module.fixture(n)
-    for block in range(8):
-        orders = list(permutations(("base", "control", "sqlite")))
+    for block in range(2):
+        orders = list(permutations(("base", "control", "serial", "sqlite")))
         rng.shuffle(orders)
         for order in orders:
             results = {}
@@ -37,8 +37,12 @@ for n in (1000, 10000):
                     if role == "sqlite":
                         results[role] = {"insert_ns": module.run_sqlite(path, rows)}
                         continue
+                    env = dict(os.environ)
+                    env.pop("LIN_BENCH_SERIAL_WAL_VECTORS", None)
+                    if role == "serial":
+                        env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
-                    data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True))
+                    data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True, env=env))
                     assert [tuple(row) for row in data["result"]] == rows
                     assert data["embedding_hash"] is not None
                     hashes.add(data["embedding_hash"])
