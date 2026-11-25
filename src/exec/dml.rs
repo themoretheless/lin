@@ -1415,8 +1415,11 @@ impl Db {
         // exactly (missing fields, mixed types) are logged row by row after the insert.
         let direct_large_batch = n >= 4096
             && std::env::var_os("LIN_BENCH_DIRECT_WAL_LARGE").is_some();
+        let direct_small_batch = (512..2048).contains(&n)
+            && std::env::var_os("LIN_BENCH_DIRECT_WAL_SMALL").is_some();
         let staged = if allow_preencode
             && !direct_large_batch
+            && !direct_small_batch
             && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()
