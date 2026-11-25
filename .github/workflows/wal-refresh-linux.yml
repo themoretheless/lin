@@ -23,7 +23,7 @@ jobs:
         id: cpu
         run: |
           lscpu > runner-cpu.txt
-          if [[ "$(uname -m)" = aarch64 ]] || grep -q 'AMD EPYC' runner-cpu.txt; then
+          if [[ "$(uname -m)" = aarch64 ]] || grep -q 'AMD EPYC 9V74' runner-cpu.txt; then
             echo 'matched=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@master
