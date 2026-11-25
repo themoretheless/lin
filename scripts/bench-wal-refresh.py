@@ -26,8 +26,11 @@ report = {
 }
 for n in (1000, 10000):
     rows = module.fixture(n)
-    for block in range(2):
-        orders = list(permutations(("base", "control", "serial", "sqlite")))
+    for block in range(1):
+        roles = ("base", "control", "serial", "candidate", "sqlite")
+        rank = {role: i for i, role in enumerate(roles)}
+        orders = [o for o in permutations(roles)
+                  if sum(rank[a] > rank[b] for i, a in enumerate(o) for b in o[i+1:]) % 2 == 0]
         rng.shuffle(orders)
         for order in orders:
             results = {}
@@ -39,7 +42,10 @@ for n in (1000, 10000):
                         continue
                     env = dict(os.environ)
                     env.pop("LIN_BENCH_SERIAL_WAL_VECTORS", None)
-                    if role == "serial":
+                    env.pop("LIN_BENCH_AVX2_SERIAL", None)
+                    if role == "candidate":
+                        env["LIN_BENCH_AVX2_SERIAL"] = "1"
+                    if role in ("serial", "candidate"):
                         env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True, env=env))
