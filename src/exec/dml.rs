@@ -1413,7 +1413,10 @@ impl Db {
         let uniform_keys = all_uniform && !needs_id;
         // The pre-encoded record is the compact columnar one; rows it cannot represent
         // exactly (missing fields, mixed types) are logged row by row after the insert.
+        let direct_large_batch = n >= 4096
+            && std::env::var_os("LIN_BENCH_DIRECT_WAL_LARGE").is_some();
         let staged = if allow_preencode
+            && !direct_large_batch
             && (512..=16384).contains(&n)
             && edges.is_empty()
             && self.persist.is_some()
