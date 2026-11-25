@@ -1,4 +1,4 @@
-name: EPYC 9V74 WAL FULL phase comparison
+name: Current local main WAL FULL benchmark
 on:
   push:
     branches: [codex/wal-refresh-20261126]
@@ -16,35 +16,38 @@ jobs:
           - {runner: ubuntu-22.04, replica: amd-2}
           - {runner: ubuntu-22.04, replica: amd-3}
           - {runner: ubuntu-22.04, replica: amd-4}
-          - {runner: ubuntu-22.04, replica: amd-5}
-          - {runner: ubuntu-22.04, replica: amd-6}
+          - {runner: ubuntu-24.04-arm, replica: arm64}
     steps:
       - uses: actions/checkout@v4
       - name: Record CPU and select target hosts
         id: cpu
         run: |
           lscpu > runner-cpu.txt
-          if grep -q 'AMD EPYC 9V74' runner-cpu.txt; then
+          if [[ "$(uname -m)" = aarch64 ]] || grep -q 'AMD EPYC' runner-cpu.txt; then
             echo 'matched=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@master
         if: steps.cpu.outputs.matched == 'true'
         with:
           toolchain: '1.96.0'
-      - name: Profile WAL build, maintenance and sync
+      - name: Build locked release worker
+        if: steps.cpu.outputs.matched == 'true'
+        run: cargo build --locked --release -p lin-peer-worker --bin lin-peer-worker
+      - name: Measure WAL FULL with paired controls
         if: steps.cpu.outputs.matched == 'true'
         run: |
-          set -euo pipefail
-          git apply scripts/wal-profile-refresh.patch
-          cargo build --locked --release -p lin-peer-worker --bin fresh_wal_profile
-          git rev-parse HEAD > profile-revision.txt
-          sha256sum target/release/fresh_wal_profile >> profile-revision.txt
-          python3 scripts/profile-wal-9v74.py target/release/fresh_wal_profile
+          set -o pipefail
+          git rev-parse HEAD > wal-provenance.txt
+          uname -a >> wal-provenance.txt
+          lscpu >> wal-provenance.txt
+          rustc -Vv >> wal-provenance.txt
+          sha256sum target/release/lin-peer-worker >> wal-provenance.txt
+          python3 scripts/bench-wal-refresh.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wal-9v74-profile-${{ matrix.replica }}
+          name: wal-epyc-${{ matrix.replica }}
           path: |
             runner-cpu.txt
-            profile-revision.txt
-            wal-9v74.json
+            wal-results.json
+            wal-provenance.txt

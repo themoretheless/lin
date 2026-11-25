@@ -27,7 +27,7 @@ report = {
 for n in (1000, 10000):
     rows = module.fixture(n)
     for block in range(1):
-        roles = ("base", "control", "avx8", "candidate", "sqlite")
+        roles = ("base", "control", "wide", "candidate", "sqlite")
         rank = {role: i for i, role in enumerate(roles)}
         orders = [o for o in permutations(roles)
                   if sum(rank[a] > rank[b] for i, a in enumerate(o) for b in o[i+1:]) % 2 == 0]
@@ -44,11 +44,14 @@ for n in (1000, 10000):
                     env.pop("LIN_BENCH_SERIAL_WAL_VECTORS", None)
                     env.pop("LIN_BENCH_AVX2_SERIAL", None)
                     env.pop("LIN_BENCH_AVX2_WIDE", None)
-                    if role in ("avx8", "candidate"):
+                    if role in ("wide", "candidate"):
                         env["LIN_BENCH_AVX2_SERIAL"] = "1"
-                    if role == "candidate":
+                    env.pop("LIN_BENCH_SHARED_INSERT_SHAPE", None)
+                    if role in ("wide", "candidate"):
                         env["LIN_BENCH_AVX2_WIDE"] = "1"
-                    if role in ("avx8", "candidate"):
+                    if role == "candidate":
+                        env["LIN_BENCH_SHARED_INSERT_SHAPE"] = "1"
+                    if role in ("wide", "candidate"):
                         env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True, env=env))

@@ -2455,6 +2455,7 @@ fn build_insert_rows(
             now: i64,
             needs_embed: bool,
             hashing_dim: Option<usize>,
+            shape_plan: Option<InsertShapePlan>,
             next_chunk: AtomicUsize,
             done_chunks: AtomicUsize,
             neg_flags: AtomicU8,
@@ -2486,10 +2487,10 @@ fn build_insert_rows(
                 let mut guard = ChunkDone(task, is_caller, true);
                 let start = c * task.chunk_size;
                 let end = (start + task.chunk_size).min(task.n);
-                let recs = unsafe {
-                    &std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)
-                        [start..end]
+                let records = unsafe {
+                    std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)
                 };
+                let recs = &records[start..end];
                 let out = unsafe {
                     &mut std::slice::from_raw_parts_mut(
                         task.out_ptr as *mut std::mem::MaybeUninit<Row>,
@@ -2503,6 +2504,7 @@ fn build_insert_rows(
                     task.needs_embed,
                     task.hashing_dim,
                     task.n,
+                    task.shape_plan.as_ref().map(|plan| (&records[0], plan)),
                 );
                 let mask = u8::from(!u) | (u8::from(!e) << 1) | (u8::from(!l) << 2);
                 if mask != 0 {
@@ -2555,6 +2557,11 @@ fn build_insert_rows(
                 now,
                 needs_embed,
                 hashing_dim,
+                shape_plan: if std::env::var_os("LIN_BENCH_SHARED_INSERT_SHAPE").is_some() {
+                    prepare_insert_shape(&records[0], needs_embed, hashing_dim)
+                } else {
+                    None
+                },
                 next_chunk: AtomicUsize::new(0),
                 done_chunks: AtomicUsize::new(0),
                 neg_flags: AtomicU8::new(0),
@@ -2631,29 +2638,33 @@ fn build_insert_rows(
     let mut rows: Vec<Row> = Vec::with_capacity(n);
     let spare = &mut rows.spare_capacity_mut()[..n];
     let (all_uniform, all_embedded, lossless_cols) =
-        build_batch_shape_rows_into(spare, records, now, needs_embed, hashing_dim, n);
+        build_batch_shape_rows_into(spare, records, now, needs_embed, hashing_dim, n, None);
     unsafe {
         rows.set_len(n);
     }
     (rows, all_uniform, all_embedded, lossless_cols)
 }
 
-fn build_batch_shape_rows_into(
-    out: &mut [std::mem::MaybeUninit<Row>],
-    records: &[Record],
-    now: i64,
-    needs_embed: bool,
-    hashing_dim: Option<usize>,
-    total_n: usize,
-) -> (bool, bool, bool) {
-    let Some(first) = records.first() else {
-        return (false, !needs_embed, false);
-    };
-    if total_n < 128 || first.fields.is_empty() || first.fields.len() > 32 {
-        for (slot_out, record) in out.iter_mut().zip(records) {
-            slot_out.write(record_row(record, now));
-        }
-        return (false, !needs_embed, false);
+#[derive(Clone, Copy)]
+enum ShapeSlot {
+    Source(usize),
+    Body(usize),
+    Hash(usize),
+    Embed,
+}
+
+struct InsertShapePlan {
+    shape: Arc<crate::store::row::Shape>,
+    slots: Vec<ShapeSlot>,
+    title_idx: Option<usize>,
+    body_idx: Option<usize>,
+    snippet_idx: Option<usize>,
+    can_inline_embed: bool,
+}
+
+fn prepare_insert_shape(first: &Record, needs_embed: bool, hashing_dim: Option<usize>) -> Option<InsertShapePlan> {
+    if first.fields.is_empty() || first.fields.len() > 32 {
+        return None;
     }
     let body_idx = first.fields.iter().rposition(|(k, _)| k == "body");
     let has_hash = first.fields.iter().any(|(k, _)| k == "hash");
@@ -2674,17 +2685,7 @@ fn build_batch_shape_rows_into(
     if needs_embed {
         template.insert("embedding", Cell::Null);
     }
-    let Some(shape) = template.shape_arc().cloned() else {
-        return (false, !needs_embed, false);
-    };
-
-    #[derive(Clone, Copy)]
-    enum ShapeSlot {
-        Source(usize),
-        Body(usize),
-        Hash(usize),
-        Embed,
-    }
+    let shape = template.shape_arc().cloned()?;
 
     let slots = template
         .keys()
@@ -2707,13 +2708,52 @@ fn build_batch_shape_rows_into(
             }
         })
         .collect::<Vec<_>>();
-    let width = slots.len();
-    if width > 32 {
+    (slots.len() <= 32).then_some(InsertShapePlan {
+        shape, slots, title_idx, body_idx, snippet_idx, can_inline_embed,
+    })
+}
+
+fn build_batch_shape_rows_into(
+    out: &mut [std::mem::MaybeUninit<Row>],
+    records: &[Record],
+    now: i64,
+    needs_embed: bool,
+    hashing_dim: Option<usize>,
+    total_n: usize,
+    shared: Option<(&Record, &InsertShapePlan)>,
+) -> (bool, bool, bool) {
+    let Some(first) = records.first() else {
+        return (false, !needs_embed, false);
+    };
+    if total_n < 128 || first.fields.is_empty() || first.fields.len() > 32 {
         for (slot_out, record) in out.iter_mut().zip(records) {
             slot_out.write(record_row(record, now));
         }
         return (false, !needs_embed, false);
     }
+    let local_plan;
+    let plan = match shared {
+        Some((source, plan))
+            if first.fields.len() == source.fields.len()
+                && first.fields.iter().zip(&source.fields).all(|(a, b)| a.0 == b.0) =>
+        {
+            plan
+        }
+        _ => {
+            local_plan = prepare_insert_shape(first, needs_embed, hashing_dim);
+            let Some(plan) = &local_plan else {
+                for (slot_out, record) in out.iter_mut().zip(records) {
+                    slot_out.write(record_row(record, now));
+                }
+                return (false, !needs_embed, false);
+            };
+            plan
+        }
+    };
+    let InsertShapePlan { shape, slots, title_idx, body_idx, snippet_idx, can_inline_embed } = plan;
+    let (title_idx, body_idx, snippet_idx, can_inline_embed) =
+        (*title_idx, *body_idx, *snippet_idx, *can_inline_embed);
+    let width = slots.len();
 
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
@@ -2824,7 +2864,7 @@ fn build_batch_shape_rows_into(
                         cells.push(cell);
                     }
                 }
-                slot_out.write(Row::from_parts(Arc::clone(&shape), cells));
+                slot_out.write(Row::from_parts(Arc::clone(shape), cells));
             } else {
                 let mut cells = Vec::with_capacity(width);
                 if !have_first_kinds {
@@ -2847,7 +2887,7 @@ fn build_batch_shape_rows_into(
                         cells.push(cell);
                     }
                 }
-                slot_out.write(Row::from_vec_parts(Arc::clone(&shape), cells));
+                slot_out.write(Row::from_vec_parts(Arc::clone(shape), cells));
             }
         }
     };
@@ -2873,7 +2913,7 @@ pub(super) fn append_batch_shape_rows(
     rows.reserve(n);
     let old_len = rows.len();
     let spare = &mut rows.spare_capacity_mut()[..n];
-    let (all_same, _, _) = build_batch_shape_rows_into(spare, records, now, needs_embed, None, n);
+    let (all_same, _, _) = build_batch_shape_rows_into(spare, records, now, needs_embed, None, n, None);
     unsafe {
         rows.set_len(old_len + n);
     }
