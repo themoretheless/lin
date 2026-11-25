@@ -1287,7 +1287,7 @@ fn collect_nz_and_dict_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool>(
+fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize>(
     emb: &[f32],
     nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
@@ -1296,12 +1296,23 @@ fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool>(
 
     let mut distinct = 0;
     let mut raw = false;
-    for (block, values) in emb.chunks(8).enumerate() {
-        let mut mask = if values.len() == 8 {
-            // SAFETY: the full block has exactly 32 readable bytes.
-            let bits = unsafe { _mm256_loadu_si256(values.as_ptr().cast()) };
-            let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
-            !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+    let mask8 = |values: &[f32]| {
+        debug_assert!(values.len() >= 8);
+        // SAFETY: callers pass at least eight readable values.
+        let bits = unsafe { _mm256_loadu_si256(values.as_ptr().cast()) };
+        let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
+        !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+    };
+    for (block, values) in emb.chunks(WIDTH).enumerate() {
+        let mut mask = if values.len() == WIDTH {
+            let first = mask8(values);
+            if WIDTH == 32 {
+                first | (mask8(&values[8..]) << 8)
+                    | (mask8(&values[16..]) << 16)
+                    | (mask8(&values[24..]) << 24)
+            } else {
+                first
+            }
         } else {
             values.iter().enumerate().fold(0, |mask, (i, value)| {
                 mask | (u32::from(value.to_bits() != 0) << i)
@@ -1344,7 +1355,7 @@ fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool>(
                     distinct - 1
                 }
             };
-            nz.push(((block * 8 + offset) as u32, ordinal as u32));
+            nz.push(((block * WIDTH + offset) as u32, ordinal as u32));
         }
     }
     (distinct, raw)
@@ -1364,6 +1375,8 @@ pub(super) fn append_dictionary_rows_counted<'a>(
     let use_avx2 = false;
     #[cfg(target_arch = "x86_64")]
     let simd_lookup = use_avx2 && std::env::var_os("LIN_BENCH_WAL_DICT_LOOKUP").is_some();
+    #[cfg(target_arch = "x86_64")]
+    let wide_scan = simd_lookup && std::env::var_os("LIN_BENCH_WAL_DICT_SCAN32").is_some();
     let pack_ordinals = use_avx2
         && std::env::var_os("LIN_BENCH_WAL_DICT_PACK").is_some();
     // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
@@ -1395,10 +1408,12 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         let (d, raw) = if use_avx2 {
             // SAFETY: guarded by runtime AVX2 detection above.
             unsafe {
-                if simd_lookup {
-                    collect_nz_and_dict_avx2::<true>(emb, &mut nz, &mut dictionary)
+                if wide_scan {
+                    collect_nz_and_dict_avx2::<true, 32>(emb, &mut nz, &mut dictionary)
+                } else if simd_lookup {
+                    collect_nz_and_dict_avx2::<true, 8>(emb, &mut nz, &mut dictionary)
                 } else {
-                    collect_nz_and_dict_avx2::<false>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<false, 8>(emb, &mut nz, &mut dictionary)
                 }
             }
         } else {
