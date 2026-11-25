@@ -709,6 +709,9 @@ impl Db {
             return Ok(db);
         }
         let (store, persist, store_phases) = Store::open_with_profiled(dir, &catalog, cfg)?;
+        if std::env::var_os("LIN_BENCH_WARM_INSERT_BUILD").is_some() {
+            dml::warm_insert_build_workers();
+        }
         let mut catalog = catalog;
         store.merge_extras_into(&mut catalog);
         let embedder = Self::default_embedder(&catalog);

@@ -46,7 +46,7 @@ for n in (1000, 10000):
                         "LIN_BENCH_AVX2_SERIAL",
                         "LIN_BENCH_AVX2_WIDE",
                     )
-                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE", "LIN_BENCH_WAL_DICT_AVX2", "LIN_BENCH_WAL_DICT_PACK", "LIN_BENCH_WAL_DICT_LOOKUP", "LIN_BENCH_WAL_DICT_SCAN32", "LIN_BENCH_WAL_DICT_SCAN64", "LIN_BENCH_WAL_REUSE_DENSE_SIZE"):
+                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE", "LIN_BENCH_WAL_DICT_AVX2", "LIN_BENCH_WAL_DICT_PACK", "LIN_BENCH_WAL_DICT_LOOKUP", "LIN_BENCH_WAL_DICT_SCAN32", "LIN_BENCH_WAL_DICT_SCAN64", "LIN_BENCH_WARM_INSERT_BUILD"):
                         env.pop(flag, None)
                     if role in ("wide", "candidate"):
                         for flag in fast_flags:
@@ -58,10 +58,10 @@ for n in (1000, 10000):
                         env["LIN_BENCH_WAL_DICT_LOOKUP"] = "1"
                         env["LIN_BENCH_WAL_DICT_SCAN32"] = "1"
                         env["LIN_BENCH_WAL_DICT_SCAN64"] = "1"
-                        if role == "candidate":
-                            env["LIN_BENCH_WAL_REUSE_DENSE_SIZE"] = "1"
                     elif role == "candidate" and n >= 4096:
                         env["LIN_BENCH_WAL_DICTIONARY"] = "1"
+                    if role == "candidate":
+                        env["LIN_BENCH_WARM_INSERT_BUILD"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True, env=env))
                     assert [tuple(row) for row in data["result"]] == rows
