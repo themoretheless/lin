@@ -1311,15 +1311,19 @@ fn collect_nz_and_dict_avx2(
             let offset = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let bits = values[offset].to_bits();
-            nz.push(((block * 8 + offset) as u32, bits));
-            if !raw && !dictionary[..distinct].contains(&bits) {
-                if distinct == DICTIONARY_MAX_VALUES {
-                    raw = true;
-                } else {
-                    dictionary[distinct] = bits;
-                    distinct += 1;
-                }
-            }
+            let ordinal = if raw {
+                0
+            } else if let Some(ordinal) = dictionary[..distinct].iter().position(|&value| value == bits) {
+                ordinal
+            } else if distinct == DICTIONARY_MAX_VALUES {
+                raw = true;
+                0
+            } else {
+                dictionary[distinct] = bits;
+                distinct += 1;
+                distinct - 1
+            };
+            nz.push(((block * 8 + offset) as u32, ordinal as u32));
         }
     }
     (distinct, raw)
@@ -1335,6 +1339,9 @@ pub(super) fn append_dictionary_rows_counted<'a>(
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = std::env::var_os("LIN_BENCH_WAL_DICT_AVX2").is_some()
         && std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+    // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
     let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
     let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
     let mut exact_sparse_bytes = 0usize;
@@ -1376,7 +1383,8 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         if raw {
             out.push(0);
             out.reserve(nz.len() * 8);
-            for &(index, bits) in &nz {
+            for &(index, entry) in &nz {
+                let bits = if use_avx2 { emb[index as usize].to_bits() } else { entry };
                 out.extend_from_slice(&index.to_le_bytes());
                 out.extend_from_slice(&bits.to_le_bytes());
             }
@@ -1394,8 +1402,12 @@ pub(super) fn append_dictionary_rows_counted<'a>(
             } else {
                 out.extend_from_slice(&index.to_le_bytes());
             }
-            // Present by construction: every nonzero pattern of the row is in the table.
-            let ordinal = dictionary[..d].iter().position(|b| *b == bits).unwrap_or(0);
+            let ordinal = if use_avx2 {
+                bits as usize
+            } else {
+                // Present by construction: every nonzero pattern is in the table.
+                dictionary[..d].iter().position(|b| *b == bits).unwrap_or(0)
+            };
             out.push(ordinal as u8);
         }
     }
