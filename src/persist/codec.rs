@@ -1287,7 +1287,7 @@ fn collect_nz_and_dict_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-fn collect_nz_and_dict_avx2(
+fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool>(
     emb: &[f32],
     nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
@@ -1313,15 +1313,36 @@ fn collect_nz_and_dict_avx2(
             let bits = values[offset].to_bits();
             let ordinal = if raw {
                 0
-            } else if let Some(ordinal) = dictionary[..distinct].iter().position(|&value| value == bits) {
-                ordinal
-            } else if distinct == DICTIONARY_MAX_VALUES {
-                raw = true;
-                0
             } else {
-                dictionary[distinct] = bits;
-                distinct += 1;
-                distinct - 1
+                let found = if SIMD_LOOKUP {
+                    let needle = _mm256_set1_epi32(bits as i32);
+                    // SAFETY: the initialized dictionary has exactly sixteen u32 values.
+                    let (first, second) = unsafe {
+                        let ptr = dictionary.as_ptr();
+                        (_mm256_loadu_si256(ptr.cast()), _mm256_loadu_si256(ptr.add(8).cast()))
+                    };
+                    let low = _mm256_movemask_ps(_mm256_castsi256_ps(
+                        _mm256_cmpeq_epi32(first, needle),
+                    )) as u32;
+                    let high = _mm256_movemask_ps(_mm256_castsi256_ps(
+                        _mm256_cmpeq_epi32(second, needle),
+                    )) as u32;
+                    let index = (low | (high << 8)).trailing_zeros() as usize;
+                    // Only the prefix belongs to this row.
+                    (index < distinct).then_some(index)
+                } else {
+                    dictionary[..distinct].iter().position(|&value| value == bits)
+                };
+                if let Some(index) = found {
+                    index
+                } else if distinct == DICTIONARY_MAX_VALUES {
+                    raw = true;
+                    0
+                } else {
+                    dictionary[distinct] = bits;
+                    distinct += 1;
+                    distinct - 1
+                }
             };
             nz.push(((block * 8 + offset) as u32, ordinal as u32));
         }
@@ -1341,6 +1362,8 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         && std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
+    #[cfg(target_arch = "x86_64")]
+    let simd_lookup = use_avx2 && std::env::var_os("LIN_BENCH_WAL_DICT_LOOKUP").is_some();
     let pack_ordinals = use_avx2
         && std::env::var_os("LIN_BENCH_WAL_DICT_PACK").is_some();
     // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
@@ -1371,7 +1394,13 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         #[cfg(target_arch = "x86_64")]
         let (d, raw) = if use_avx2 {
             // SAFETY: guarded by runtime AVX2 detection above.
-            unsafe { collect_nz_and_dict_avx2(emb, &mut nz, &mut dictionary) }
+            unsafe {
+                if simd_lookup {
+                    collect_nz_and_dict_avx2::<true>(emb, &mut nz, &mut dictionary)
+                } else {
+                    collect_nz_and_dict_avx2::<false>(emb, &mut nz, &mut dictionary)
+                }
+            }
         } else {
             collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary)
         };
