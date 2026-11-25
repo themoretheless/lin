@@ -558,10 +558,8 @@ impl<'a> SlowRow<'a> {
             }
             return Some(&raw[s..e]);
         }
-        if let Some((dk, db, ref block)) = self.text_block
-            && dk == key
-            && db == bidx
-        {
+        if self.text_block.as_ref().is_some_and(|(dk, db, _)| *dk == key && *db == bidx) {
+            let block = &self.text_block.as_ref().unwrap().2;
             if e > block.len() {
                 self.err = Some(io_err("corrupt in-block text slice"));
                 return None;
