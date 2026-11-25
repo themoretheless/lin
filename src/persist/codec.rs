@@ -390,7 +390,7 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub(super) unsafe fn append_sparse_iter_avx2<'a>(
+pub(super) unsafe fn append_sparse_iter_avx2<'a, const WIDE: bool>(
     iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
@@ -416,18 +416,27 @@ pub(super) unsafe fn append_sparse_iter_avx2<'a>(
             let start_ptr = buf.as_mut_ptr().add(base);
             std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
             let mut cur = start_ptr.add(8);
-            for (block, values) in emb.chunks(8).enumerate() {
-                let mut mask = if values.len() == 8 {
-                    let bits = _mm256_loadu_si256(values.as_ptr().cast());
-                    let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
-                    !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+            let width = if WIDE { 32 } else { 8 };
+            let vector_mask = |values: &[f32]| {
+                let bits = _mm256_loadu_si256(values.as_ptr().cast());
+                let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
+                !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+            };
+            for (block, values) in emb.chunks(width).enumerate() {
+                let mut mask = if values.len() == width {
+                    let first = vector_mask(values);
+                    if WIDE {
+                        first | (vector_mask(&values[8..]) << 8)
+                            | (vector_mask(&values[16..]) << 16)
+                            | (vector_mask(&values[24..]) << 24)
+                    } else {
+                        first
+                    }
                 } else {
-                    values
-                        .iter()
-                        .enumerate()
+                    values.iter().enumerate()
                         .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
                 };
-                let base_idx = (block * 8) as u32;
+                let base_idx = (block * width) as u32;
                 while mask != 0 {
                     let offset = mask.trailing_zeros() as usize;
                     let index = base_idx + (offset as u32);
@@ -1505,7 +1514,13 @@ fn append_vec_rows_field_parallel(
                 _ => None,
             });
             // SAFETY: the detected feature covers full eight-element loads.
-            unsafe { append_sparse_iter_avx2(iter, buf)? };
+            unsafe {
+                if std::env::var_os("LIN_BENCH_AVX2_WIDE").is_some() {
+                    append_sparse_iter_avx2::<true>(iter, buf)?;
+                } else {
+                    append_sparse_iter_avx2::<false>(iter, buf)?;
+                }
+            }
             let bytes = buf.len() - payload_start;
             return Ok((bytes < give_up_bytes, bytes));
         }
