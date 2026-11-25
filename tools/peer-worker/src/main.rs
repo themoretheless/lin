@@ -72,6 +72,7 @@ fn measure_insert(
     samples: usize,
     timestamp: i64,
     durable: Option<&std::path::Path>,
+    wal_dictionary: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
@@ -107,14 +108,21 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut open_ns = Vec::new();
     let mut reopen_ns = Vec::new();
     let mut wal_bytes = Vec::new();
     let mut embedding_hash = None;
     for _ in 0..samples {
+        let open = Instant::now();
         let mut db = match durable {
             Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
             None => Db::empty(),
         };
+        open_ns.push(open.elapsed().as_nanos() as u64);
+        if durable.is_some() && wal_dictionary {
+            db.set_wal_dictionary(Some(true));
+            assert!(db.wal_dictionary_enabled());
+        }
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()
@@ -185,7 +193,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,"embedding_hash":embedding_hash,
+    Ok(json!({"samples_ns":timings,"result":result,"open_ns":open_ns,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,"embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
@@ -208,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp, durable)?
+                measure_insert(n as usize, samples as usize, timestamp, durable, request["wal_dictionary"].as_bool().unwrap_or(false))?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -255,7 +263,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456, None).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, None, false).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);
