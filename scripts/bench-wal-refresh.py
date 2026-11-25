@@ -41,18 +41,18 @@ for n in (1000, 10000):
                         results[role] = {"insert_ns": module.run_sqlite(path, rows)}
                         continue
                     env = dict(os.environ)
-                    env.pop("LIN_BENCH_SERIAL_WAL_VECTORS", None)
-                    env.pop("LIN_BENCH_AVX2_SERIAL", None)
-                    env.pop("LIN_BENCH_AVX2_WIDE", None)
+                    fast_flags = (
+                        "LIN_BENCH_SERIAL_WAL_VECTORS",
+                        "LIN_BENCH_AVX2_SERIAL",
+                        "LIN_BENCH_AVX2_WIDE",
+                    )
+                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE"):
+                        env.pop(flag, None)
                     if role in ("wide", "candidate"):
-                        env["LIN_BENCH_AVX2_SERIAL"] = "1"
-                    env.pop("LIN_BENCH_WAL_DICTIONARY", None)
-                    if role in ("wide", "candidate"):
-                        env["LIN_BENCH_AVX2_WIDE"] = "1"
-                    if role == "candidate":
+                        for flag in fast_flags:
+                            env[flag] = "1"
+                    if role == "candidate" and n >= 4096:
                         env["LIN_BENCH_WAL_DICTIONARY"] = "1"
-                    if role in ("wide", "candidate"):
-                        env["LIN_BENCH_SERIAL_WAL_VECTORS"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True, env=env))
                     assert [tuple(row) for row in data["result"]] == rows
