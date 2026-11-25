@@ -1202,9 +1202,9 @@ const DICTIONARY_MAX_VALUES: usize = 16;
 /// value.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn collect_nz_and_dict_neon(
+unsafe fn collect_nz_and_dict_neon<A: smallvec::Array<Item = (u32, u32)>>(
     emb: &[f32],
-    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    nz: &mut smallvec::SmallVec<A>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
 ) -> (usize, bool) {
     let mut d = 0usize;
@@ -1250,9 +1250,9 @@ unsafe fn collect_nz_and_dict_neon(
 }
 
 #[inline]
-fn collect_nz_and_dict_scalar(
+fn collect_nz_and_dict_scalar<A: smallvec::Array<Item = (u32, u32)>>(
     emb: &[f32],
-    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    nz: &mut smallvec::SmallVec<A>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
 ) -> (usize, bool) {
     let mut d = 0usize;
@@ -1287,9 +1287,9 @@ fn collect_nz_and_dict_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize, const FIRST_HIT: bool>(
+fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize, A: smallvec::Array<Item = (u32, u32)>>(
     emb: &[f32],
-    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    nz: &mut smallvec::SmallVec<A>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
 ) -> (usize, bool) {
     use std::arch::x86_64::*;
@@ -1333,9 +1333,7 @@ fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize, const F
             let ordinal = if raw {
                 0
             } else {
-                let found = if FIRST_HIT && distinct != 0 && dictionary[0] == bits {
-                    Some(0)
-                } else if SIMD_LOOKUP {
+                let found = if SIMD_LOOKUP {
                     let needle = _mm256_set1_epi32(bits as i32);
                     // SAFETY: the initialized dictionary has exactly sixteen u32 values.
                     let (first, second) = unsafe {
@@ -1376,6 +1374,18 @@ pub(super) fn append_dictionary_rows_counted<'a>(
     out: &mut Vec<u8>,
     give_up_at: usize,
 ) -> Result<(bool, usize), Error> {
+    if std::env::var_os("LIN_BENCH_WAL_DICT_STACK64").is_some() {
+        append_dictionary_rows_with_scratch::<[(u32, u32); 64]>(rows, out, give_up_at)
+    } else {
+        append_dictionary_rows_with_scratch::<[(u32, u32); 32]>(rows, out, give_up_at)
+    }
+}
+
+fn append_dictionary_rows_with_scratch<'a, A: smallvec::Array<Item = (u32, u32)>>(
+    rows: impl Iterator<Item = Option<&'a [f32]>>,
+    out: &mut Vec<u8>,
+    give_up_at: usize,
+) -> Result<(bool, usize), Error> {
     #[cfg(target_arch = "aarch64")]
     let use_neon = std::arch::is_aarch64_feature_detected!("neon");
     #[cfg(target_arch = "x86_64")]
@@ -1389,12 +1399,10 @@ pub(super) fn append_dictionary_rows_counted<'a>(
     let wide_scan = simd_lookup && std::env::var_os("LIN_BENCH_WAL_DICT_SCAN32").is_some();
     #[cfg(target_arch = "x86_64")]
     let scan64 = wide_scan && std::env::var_os("LIN_BENCH_WAL_DICT_SCAN64").is_some();
-    #[cfg(target_arch = "x86_64")]
-    let first_hit = scan64 && std::env::var_os("LIN_BENCH_WAL_DICT_FIRST_HIT").is_some();
     let pack_ordinals = use_avx2
         && std::env::var_os("LIN_BENCH_WAL_DICT_PACK").is_some();
     // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
-    let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
+    let mut nz: smallvec::SmallVec<A> = smallvec::SmallVec::new();
     let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
     let mut exact_sparse_bytes = 0usize;
     for row in rows {
@@ -1422,16 +1430,14 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         let (d, raw) = if use_avx2 {
             // SAFETY: guarded by runtime AVX2 detection above.
             unsafe {
-                if first_hit {
-                    collect_nz_and_dict_avx2::<true, 64, true>(emb, &mut nz, &mut dictionary)
-                } else if scan64 {
-                    collect_nz_and_dict_avx2::<true, 64, false>(emb, &mut nz, &mut dictionary)
+                if scan64 {
+                    collect_nz_and_dict_avx2::<true, 64, A>(emb, &mut nz, &mut dictionary)
                 } else if wide_scan {
-                    collect_nz_and_dict_avx2::<true, 32, false>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<true, 32, A>(emb, &mut nz, &mut dictionary)
                 } else if simd_lookup {
-                    collect_nz_and_dict_avx2::<true, 8, false>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<true, 8, A>(emb, &mut nz, &mut dictionary)
                 } else {
-                    collect_nz_and_dict_avx2::<false, 8, false>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<false, 8, A>(emb, &mut nz, &mut dictionary)
                 }
             }
         } else {
