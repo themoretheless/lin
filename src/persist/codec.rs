@@ -388,6 +388,81 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn append_sparse_iter_avx2<'a, const WIDE: bool>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    use std::arch::x86_64::*;
+    for row in iter {
+        let Some(emb) = row else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        };
+        let dim = u32::try_from(emb.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
+        let max_bytes = emb
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+        let base = buf.len();
+        buf.reserve(max_bytes);
+        let mut count = 0u32;
+        unsafe {
+            let start_ptr = buf.as_mut_ptr().add(base);
+            std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
+            let mut cur = start_ptr.add(8);
+            let width = if WIDE { 32 } else { 8 };
+            let vector_mask = |values: &[f32]| {
+                let bits = _mm256_loadu_si256(values.as_ptr().cast());
+                let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
+                !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+            };
+            for (block, values) in emb.chunks(width).enumerate() {
+                let mut mask = if values.len() == width {
+                    let first = vector_mask(values);
+                    if WIDE {
+                        first | (vector_mask(&values[8..]) << 8)
+                            | (vector_mask(&values[16..]) << 16)
+                            | (vector_mask(&values[24..]) << 24)
+                    } else {
+                        first
+                    }
+                } else {
+                    values.iter().enumerate()
+                        .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
+                };
+                let base_idx = (block * width) as u32;
+                while mask != 0 {
+                    let offset = mask.trailing_zeros() as usize;
+                    let index = base_idx + (offset as u32);
+                    let bits = values[offset].to_bits();
+                    #[cfg(target_endian = "little")]
+                    {
+                        let packed = (index as u64) | ((bits as u64) << 32);
+                        std::ptr::write_unaligned(cur as *mut u64, packed);
+                    }
+                    #[cfg(not(target_endian = "little"))]
+                    {
+                        std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), cur, 4);
+                        std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), cur.add(4), 4);
+                    }
+                    cur = cur.add(8);
+                    count += 1;
+                    mask &= mask - 1;
+                }
+            }
+            std::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), start_ptr.add(4), 4);
+            buf.set_len(cur.offset_from(buf.as_ptr()) as usize);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn append_sparse_worker(
     buf: &mut Vec<u8>,
     right: &[Option<std::sync::Arc<[f32]>>],
@@ -1127,9 +1202,9 @@ const DICTIONARY_MAX_VALUES: usize = 16;
 /// value.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn collect_nz_and_dict_neon(
+unsafe fn collect_nz_and_dict_neon<A: smallvec::Array<Item = (u32, u32)>>(
     emb: &[f32],
-    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    nz: &mut smallvec::SmallVec<A>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
 ) -> (usize, bool) {
     let mut d = 0usize;
@@ -1175,9 +1250,9 @@ unsafe fn collect_nz_and_dict_neon(
 }
 
 #[inline]
-fn collect_nz_and_dict_scalar(
+fn collect_nz_and_dict_scalar<A: smallvec::Array<Item = (u32, u32)>>(
     emb: &[f32],
-    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    nz: &mut smallvec::SmallVec<A>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
 ) -> (usize, bool) {
     let mut d = 0usize;
@@ -1210,6 +1285,90 @@ fn collect_nz_and_dict_scalar(
     (d, raw)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize, A: smallvec::Array<Item = (u32, u32)>>(
+    emb: &[f32],
+    nz: &mut smallvec::SmallVec<A>,
+    dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
+) -> (usize, bool) {
+    use std::arch::x86_64::*;
+
+    let mut distinct = 0;
+    let mut raw = false;
+    let mask8 = |values: &[f32]| {
+        debug_assert!(values.len() >= 8);
+        // SAFETY: callers pass at least eight readable values.
+        let bits = unsafe { _mm256_loadu_si256(values.as_ptr().cast()) };
+        let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
+        !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u64) & 0xff
+    };
+    for (block, values) in emb.chunks(WIDTH).enumerate() {
+        let mut mask = if values.len() == WIDTH {
+            let first = mask8(values);
+            if WIDTH == 64 {
+                first | (mask8(&values[8..]) << 8)
+                    | (mask8(&values[16..]) << 16)
+                    | (mask8(&values[24..]) << 24)
+                    | (mask8(&values[32..]) << 32)
+                    | (mask8(&values[40..]) << 40)
+                    | (mask8(&values[48..]) << 48)
+                    | (mask8(&values[56..]) << 56)
+            } else if WIDTH == 32 {
+                first | (mask8(&values[8..]) << 8)
+                    | (mask8(&values[16..]) << 16)
+                    | (mask8(&values[24..]) << 24)
+            } else {
+                first
+            }
+        } else {
+            values.iter().enumerate().fold(0, |mask, (i, value)| {
+                mask | (u64::from(value.to_bits() != 0) << i)
+            })
+        };
+        while mask != 0 {
+            let offset = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let bits = values[offset].to_bits();
+            let ordinal = if raw {
+                0
+            } else {
+                let found = if SIMD_LOOKUP {
+                    let needle = _mm256_set1_epi32(bits as i32);
+                    // SAFETY: the initialized dictionary has exactly sixteen u32 values.
+                    let (first, second) = unsafe {
+                        let ptr = dictionary.as_ptr();
+                        (_mm256_loadu_si256(ptr.cast()), _mm256_loadu_si256(ptr.add(8).cast()))
+                    };
+                    let low = _mm256_movemask_ps(_mm256_castsi256_ps(
+                        _mm256_cmpeq_epi32(first, needle),
+                    )) as u32;
+                    let high = _mm256_movemask_ps(_mm256_castsi256_ps(
+                        _mm256_cmpeq_epi32(second, needle),
+                    )) as u32;
+                    let index = (low | (high << 8)).trailing_zeros() as usize;
+                    // Only the prefix belongs to this row.
+                    (index < distinct).then_some(index)
+                } else {
+                    dictionary[..distinct].iter().position(|&value| value == bits)
+                };
+                if let Some(index) = found {
+                    index
+                } else if distinct == DICTIONARY_MAX_VALUES {
+                    raw = true;
+                    0
+                } else {
+                    dictionary[distinct] = bits;
+                    distinct += 1;
+                    distinct - 1
+                }
+            };
+            nz.push(((block * WIDTH + offset) as u32, ordinal as u32));
+        }
+    }
+    (distinct, raw)
+}
+
 pub(super) fn append_dictionary_rows_counted<'a>(
     rows: impl Iterator<Item = Option<&'a [f32]>>,
     out: &mut Vec<u8>,
@@ -1217,6 +1376,11 @@ pub(super) fn append_dictionary_rows_counted<'a>(
 ) -> Result<(bool, usize), Error> {
     #[cfg(target_arch = "aarch64")]
     let use_neon = std::arch::is_aarch64_feature_detected!("neon");
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+    // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
     let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
     let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
     let mut exact_sparse_bytes = 0usize;
@@ -1241,7 +1405,16 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         } else {
             collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary)
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        let (d, raw) = if use_avx2 {
+            // SAFETY: guarded by runtime AVX2 detection above.
+            unsafe {
+                collect_nz_and_dict_avx2::<true, 64, _>(emb, &mut nz, &mut dictionary)
+            }
+        } else {
+            collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary)
+        };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let (d, raw) = collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary);
         let count = nz.len() as u32;
         exact_sparse_bytes = exact_sparse_bytes
@@ -1251,7 +1424,8 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         if raw {
             out.push(0);
             out.reserve(nz.len() * 8);
-            for &(index, bits) in &nz {
+            for &(index, entry) in &nz {
+                let bits = if use_avx2 { emb[index as usize].to_bits() } else { entry };
                 out.extend_from_slice(&index.to_le_bytes());
                 out.extend_from_slice(&bits.to_le_bytes());
             }
@@ -1262,6 +1436,23 @@ pub(super) fn append_dictionary_rows_counted<'a>(
             out.extend_from_slice(&bits.to_le_bytes());
         }
         let narrow = d > 0 && emb.len() <= 65536;
+        if narrow && use_avx2 {
+            let bytes = nz.len() * 3;
+            let end = out.len() + bytes;
+            out.reserve(bytes);
+            for (triple, &(index, ordinal)) in out.spare_capacity_mut()[..bytes]
+                .chunks_exact_mut(3)
+                .zip(&nz)
+            {
+                let [lo, hi] = (index as u16).to_le_bytes();
+                triple[0].write(lo);
+                triple[1].write(hi);
+                triple[2].write(ordinal as u8);
+            }
+            // SAFETY: the loop initialized exactly three spare bytes per entry.
+            unsafe { out.set_len(end) };
+            continue;
+        }
         out.reserve(nz.len() * if narrow { 3 } else { 5 });
         for &(index, bits) in &nz {
             if narrow {
@@ -1269,8 +1460,12 @@ pub(super) fn append_dictionary_rows_counted<'a>(
             } else {
                 out.extend_from_slice(&index.to_le_bytes());
             }
-            // Present by construction: every nonzero pattern of the row is in the table.
-            let ordinal = dictionary[..d].iter().position(|b| *b == bits).unwrap_or(0);
+            let ordinal = if use_avx2 {
+                bits as usize
+            } else {
+                // Present by construction: every nonzero pattern is in the table.
+                dictionary[..d].iter().position(|b| *b == bits).unwrap_or(0)
+            };
             out.push(ordinal as u8);
         }
     }
@@ -1411,7 +1606,13 @@ fn append_vec_rows_field_parallel(
     buf: &mut Vec<u8>,
 ) -> Result<(bool, usize), Error> {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    if num_rows < 128 {
+    let short_serial = !dict_mode && (512..2048).contains(&num_rows);
+    #[cfg(target_arch = "x86_64")]
+    let short_dictionary_serial =
+        dict_mode && (512..2048).contains(&num_rows) && std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let short_dictionary_serial = false;
+    if num_rows < 128 || short_serial || short_dictionary_serial {
         if dict_mode {
             let payload_start = buf.len();
             let iter = rows[..num_rows].iter().map(|r| {
@@ -1427,6 +1628,21 @@ fn append_vec_rows_field_parallel(
             );
         }
         let payload_start = buf.len();
+        #[cfg(target_arch = "x86_64")]
+        if short_serial
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            let iter = rows[..num_rows].iter().map(|row| match row.cells_slice().get(fi) {
+                Some(Cell::Vec(vector)) => Some(vector.as_ref()),
+                _ => None,
+            });
+            // SAFETY: the detected feature covers full eight-element loads.
+            unsafe {
+                append_sparse_iter_avx2::<true>(iter, buf)?;
+            }
+            let bytes = buf.len() - payload_start;
+            return Ok((bytes < give_up_bytes, bytes));
+        }
         append_sparse_rows_field_serial(rows, fi, num_rows, buf)?;
         let bytes = buf.len() - payload_start;
         return Ok((bytes < give_up_bytes, bytes));
