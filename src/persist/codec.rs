@@ -1341,6 +1341,8 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         && std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
+    let pack_ordinals = use_avx2
+        && std::env::var_os("LIN_BENCH_WAL_DICT_PACK").is_some();
     // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
     let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
     let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
@@ -1395,6 +1397,23 @@ pub(super) fn append_dictionary_rows_counted<'a>(
             out.extend_from_slice(&bits.to_le_bytes());
         }
         let narrow = d > 0 && emb.len() <= 65536;
+        if narrow && pack_ordinals {
+            let bytes = nz.len() * 3;
+            let end = out.len() + bytes;
+            out.reserve(bytes);
+            for (triple, &(index, ordinal)) in out.spare_capacity_mut()[..bytes]
+                .chunks_exact_mut(3)
+                .zip(&nz)
+            {
+                let [lo, hi] = (index as u16).to_le_bytes();
+                triple[0].write(lo);
+                triple[1].write(hi);
+                triple[2].write(ordinal as u8);
+            }
+            // SAFETY: the loop initialized exactly three spare bytes per entry.
+            unsafe { out.set_len(end) };
+            continue;
+        }
         out.reserve(nz.len() * if narrow { 3 } else { 5 });
         for &(index, bits) in &nz {
             if narrow {
