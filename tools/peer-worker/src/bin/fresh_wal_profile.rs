@@ -19,6 +19,7 @@ fn canonical(rows: &[lin::Row], fields: &[String]) -> Value {
                             };
                             match cell {
                                 Some(Cell::Text(v)) => json!(v.as_ref()),
+                                Some(Cell::SmallText(v)) => json!(v.as_str()),
                                 Some(Cell::Int(v)) | Some(Cell::Time(v)) => json!(v),
                                 Some(Cell::Float(v)) => json!(v),
                                 Some(Cell::Bool(v)) => json!(v),

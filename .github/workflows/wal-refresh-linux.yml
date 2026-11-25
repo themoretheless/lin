@@ -17,24 +17,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.96.0'
-      - name: Build locked release worker
-        run: cargo build --locked --release -p lin-peer-worker --bin lin-peer-worker
-      - name: Measure WAL FULL with paired controls
-        run: |
-          set -o pipefail
-          git rev-parse HEAD > wal-provenance.txt
-          uname -a >> wal-provenance.txt
-          lscpu >> wal-provenance.txt
-          rustc -Vv >> wal-provenance.txt
-          sha256sum target/release/lin-peer-worker >> wal-provenance.txt
-          python3 scripts/bench-wal-refresh.py target/release/lin-peer-worker scripts/bench-wal-full.py wal-results.json
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: wal-refresh-linux-${{ matrix.runner }}
-          path: |
-            wal-results.json
-            wal-provenance.txt
       - name: Profile WAL in a separate build
         run: |
           set -euo pipefail
