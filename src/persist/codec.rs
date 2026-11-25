@@ -2141,15 +2141,26 @@ fn encode_insert_rows_direct_at(
                         let storage = rows
                             .len()
                             .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())?;
-                        let mut next_decoded = sparse_decoded_bytes.checked_add(storage)?;
-                        for r in rows {
-                            if let Cell::Vec(emb) = &r.cells_slice()[fi] {
-                                let bytes = emb.len().checked_mul(4)?;
-                                next_decoded = next_decoded
-                                    .checked_add(bytes)
-                                    .filter(|&b| b <= MAX_SPARSE_DECODED_BYTES)?;
+                        let next_decoded = if std::env::var_os("LIN_BENCH_WAL_REUSE_DENSE_SIZE").is_some() {
+                            // The preflight adds one u32 length per row to the float payload.
+                            // A saturated dense size still exceeds the decoded budget.
+                            let length_headers = rows.len().checked_mul(4)?;
+                            sparse_decoded_bytes
+                                .checked_add(storage)?
+                                .checked_add(dense.checked_sub(length_headers)?)
+                                .filter(|&bytes| bytes <= MAX_SPARSE_DECODED_BYTES)?
+                        } else {
+                            let mut next_decoded = sparse_decoded_bytes.checked_add(storage)?;
+                            for r in rows {
+                                if let Cell::Vec(emb) = &r.cells_slice()[fi] {
+                                    let bytes = emb.len().checked_mul(4)?;
+                                    next_decoded = next_decoded
+                                        .checked_add(bytes)
+                                        .filter(|&b| b <= MAX_SPARSE_DECODED_BYTES)?;
+                                }
                             }
-                        }
+                            next_decoded
+                        };
                         sparse_decoded_bytes = next_decoded;
                         sparse_codec = true;
                         dictionary_codec |= used_dict;
