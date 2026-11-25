@@ -11,15 +11,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        include:
+          - {runner: ubuntu-22.04, replica: amd-1}
+          - {runner: ubuntu-22.04, replica: amd-2}
+          - {runner: ubuntu-22.04, replica: amd-3}
+          - {runner: ubuntu-22.04, replica: amd-4}
+          - {runner: ubuntu-24.04-arm, replica: arm64}
     steps:
       - uses: actions/checkout@v4
+      - name: Record CPU and select target hosts
+        id: cpu
+        run: |
+          lscpu > runner-cpu.txt
+          if [[ "$(uname -m)" = aarch64 ]] || grep -q 'AMD EPYC' runner-cpu.txt; then
+            echo 'matched=true' >> "$GITHUB_OUTPUT"
+          fi
       - uses: dtolnay/rust-toolchain@master
+        if: steps.cpu.outputs.matched == 'true'
         with:
           toolchain: '1.96.0'
       - name: Build locked release worker
+        if: steps.cpu.outputs.matched == 'true'
         run: cargo build --locked --release -p lin-peer-worker --bin lin-peer-worker
       - name: Measure WAL FULL with paired controls
+        if: steps.cpu.outputs.matched == 'true'
         run: |
           set -o pipefail
           git rev-parse HEAD > wal-provenance.txt
@@ -31,7 +46,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wal-refresh-linux-${{ matrix.runner }}
+          name: wal-epyc-${{ matrix.replica }}
           path: |
+            runner-cpu.txt
             wal-results.json
             wal-provenance.txt
