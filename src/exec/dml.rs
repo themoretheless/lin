@@ -2754,6 +2754,7 @@ fn build_batch_shape_rows_into(
     let (title_idx, body_idx, snippet_idx, can_inline_embed) =
         (*title_idx, *body_idx, *snippet_idx, *can_inline_embed);
     let width = slots.len();
+    let direct_cells = std::env::var_os("LIN_BENCH_DIRECT_INSERT_CELLS").is_some();
 
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
@@ -2841,7 +2842,21 @@ fn build_batch_shape_rows_into(
                 };
             }
 
-            if width <= 8 {
+            if direct_cells {
+                let row = Row::build_cells(Arc::clone(shape), |ci| {
+                    let cell = eval_slot_cell!(&slots[ci]);
+                    if !have_first_kinds {
+                        let kind = cell_lossless_kind(&cell);
+                        first_kinds[ci] = kind;
+                        lossless_cols &= kind != 0;
+                    } else if lossless_cols && cell_lossless_kind(&cell) != first_kinds[ci] {
+                        lossless_cols = false;
+                    }
+                    cell
+                });
+                have_first_kinds = true;
+                slot_out.write(row);
+            } else if width <= 8 {
                 let mut cells: smallvec::SmallVec<[Cell; 8]> =
                     smallvec::SmallVec::with_capacity(width);
                 if !have_first_kinds {

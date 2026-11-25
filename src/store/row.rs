@@ -364,6 +364,16 @@ impl Row {
     }
 
     #[inline]
+    pub(crate) fn build_cells(shape: Arc<Shape>, mut cell_at: impl FnMut(usize) -> Cell) -> Self {
+        let width = shape.names.len();
+        let mut cells = Cells::with_capacity(width);
+        for index in 0..width {
+            cells.push(cell_at(index));
+        }
+        Self { shape: Some(shape), cells }
+    }
+
+    #[inline]
     pub fn from_vec_parts(shape: Arc<Shape>, vec: Vec<Cell>) -> Self {
         debug_assert_eq!(vec.len(), shape.names.len());
         Row {
