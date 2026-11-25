@@ -620,6 +620,27 @@ pub(super) fn write_in_place_frame_buf(
     if framed.len() >= 64 * 1024 + 13 {
         reserve_wal_space(log, framed.len(), false);
     }
+    #[cfg(target_os = "linux")]
+    if sync == SyncMode::Full
+        && (128 * 1024..512 * 1024).contains(&framed.len())
+        && std::env::var_os("LIN_BENCH_WAL_EARLY_WRITEBACK").is_some()
+        && let Ok(offset) = libc::off64_t::try_from(*log_bytes)
+    {
+        use std::os::fd::AsRawFd;
+        const PREFIX: usize = 64 * 1024;
+        let (prefix, tail) = framed.split_at(PREFIX);
+        log.write_all(prefix).map_err(io_err)?;
+        // SAFETY: the live file descriptor is borrowed and the range is already written.
+        // This is a best-effort writeback hint. FULL sync still follows the complete frame.
+        let _ = unsafe {
+            libc::sync_file_range(log.as_raw_fd(), offset, PREFIX as libc::off64_t,
+                                  libc::SYNC_FILE_RANGE_WRITE)
+        };
+        log.write_all(tail).map_err(io_err)?;
+    } else {
+        log.write_all(framed).map_err(io_err)?;
+    }
+    #[cfg(not(target_os = "linux"))]
     log.write_all(framed).map_err(io_err)?;
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
