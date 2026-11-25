@@ -1285,6 +1285,46 @@ fn collect_nz_and_dict_scalar(
     (d, raw)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn collect_nz_and_dict_avx2(
+    emb: &[f32],
+    nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
+    dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
+) -> (usize, bool) {
+    use std::arch::x86_64::*;
+
+    let mut distinct = 0;
+    let mut raw = false;
+    for (block, values) in emb.chunks(8).enumerate() {
+        let mut mask = if values.len() == 8 {
+            // SAFETY: the full block has exactly 32 readable bytes.
+            let bits = unsafe { _mm256_loadu_si256(values.as_ptr().cast()) };
+            let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
+            !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+        } else {
+            values.iter().enumerate().fold(0, |mask, (i, value)| {
+                mask | (u32::from(value.to_bits() != 0) << i)
+            })
+        };
+        while mask != 0 {
+            let offset = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let bits = values[offset].to_bits();
+            nz.push(((block * 8 + offset) as u32, bits));
+            if !raw && !dictionary[..distinct].contains(&bits) {
+                if distinct == DICTIONARY_MAX_VALUES {
+                    raw = true;
+                } else {
+                    dictionary[distinct] = bits;
+                    distinct += 1;
+                }
+            }
+        }
+    }
+    (distinct, raw)
+}
+
 pub(super) fn append_dictionary_rows_counted<'a>(
     rows: impl Iterator<Item = Option<&'a [f32]>>,
     out: &mut Vec<u8>,
@@ -1292,6 +1332,9 @@ pub(super) fn append_dictionary_rows_counted<'a>(
 ) -> Result<(bool, usize), Error> {
     #[cfg(target_arch = "aarch64")]
     let use_neon = std::arch::is_aarch64_feature_detected!("neon");
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::env::var_os("LIN_BENCH_WAL_DICT_AVX2").is_some()
+        && std::arch::is_x86_feature_detected!("avx2");
     let mut nz: smallvec::SmallVec<[(u32, u32); 32]> = smallvec::SmallVec::new();
     let mut dictionary = [0u32; DICTIONARY_MAX_VALUES];
     let mut exact_sparse_bytes = 0usize;
@@ -1316,7 +1359,14 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         } else {
             collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary)
         };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        let (d, raw) = if use_avx2 {
+            // SAFETY: guarded by runtime AVX2 detection above.
+            unsafe { collect_nz_and_dict_avx2(emb, &mut nz, &mut dictionary) }
+        } else {
+            collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary)
+        };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let (d, raw) = collect_nz_and_dict_scalar(emb, &mut nz, &mut dictionary);
         let count = nz.len() as u32;
         exact_sparse_bytes = exact_sparse_bytes
@@ -1488,7 +1538,9 @@ fn append_vec_rows_field_parallel(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let short_serial = !dict_mode && (512..2048).contains(&num_rows)
         && std::env::var_os("LIN_BENCH_SERIAL_WAL_VECTORS").is_some();
-    if num_rows < 128 || short_serial {
+    let short_dictionary_serial = dict_mode && (512..2048).contains(&num_rows)
+        && std::env::var_os("LIN_BENCH_WAL_DICT_AVX2").is_some();
+    if num_rows < 128 || short_serial || short_dictionary_serial {
         if dict_mode {
             let payload_start = buf.len();
             let iter = rows[..num_rows].iter().map(|r| {

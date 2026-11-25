@@ -46,13 +46,16 @@ for n in (1000, 10000):
                         "LIN_BENCH_AVX2_SERIAL",
                         "LIN_BENCH_AVX2_WIDE",
                     )
-                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE"):
+                    for flag in (*fast_flags, "LIN_BENCH_WAL_DICTIONARY", "LIN_BENCH_DIRECT_WAL_LARGE", "LIN_BENCH_WAL_DICT_AVX2"):
                         env.pop(flag, None)
                     if role in ("wide", "candidate"):
                         for flag in fast_flags:
                             env[flag] = "1"
-                    if role == "candidate" and n >= 4096:
-                        env["LIN_BENCH_WAL_DICTIONARY"] = "1"
+                    if role == "candidate":
+                        if n >= 4096 or platform.machine() == "x86_64":
+                            env["LIN_BENCH_WAL_DICTIONARY"] = "1"
+                        if platform.machine() == "x86_64":
+                            env["LIN_BENCH_WAL_DICT_AVX2"] = "1"
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456, durable_dir=path)
                     data = json.loads(subprocess.check_output([worker], input=json.dumps(req)+"\n", text=True, env=env))
                     assert [tuple(row) for row in data["result"]] == rows
