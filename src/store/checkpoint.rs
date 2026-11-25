@@ -412,6 +412,10 @@ impl Store {
             },
         )?;
         persist::truncate_log_with_sync(&mut log, end, opts.sync)?;
+        #[cfg(target_os = "linux")]
+        if end == 0 && std::env::var_os("LIN_BENCH_WAL_RESERVE_4M").is_some() {
+            persist::reserve_wal_space(&log, 4 * 1024 * 1024, true);
+        }
         phases.wal_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();

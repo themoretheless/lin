@@ -107,14 +107,17 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut open_ns = Vec::new();
     let mut reopen_ns = Vec::new();
     let mut wal_bytes = Vec::new();
     let mut embedding_hash = None;
     for _ in 0..samples {
+        let open = Instant::now();
         let mut db = match durable {
             Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
             None => Db::empty(),
         };
+        open_ns.push(open.elapsed().as_nanos() as u64);
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()
@@ -185,7 +188,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,"embedding_hash":embedding_hash,
+    Ok(json!({"samples_ns":timings,"result":result,"open_ns":open_ns,"reopen_ns":reopen_ns,"wal_bytes":wal_bytes,"embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }

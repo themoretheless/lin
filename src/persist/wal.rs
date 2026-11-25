@@ -390,15 +390,7 @@ pub(crate) fn open_log_unreserved(dir: &Path) -> Result<File, Error> {
 
 pub fn open_log(dir: &Path) -> Result<File, Error> {
     let file = open_log_file(dir)?;
-    #[cfg(target_os = "linux")]
-    let reserve_bytes = if std::env::var_os("LIN_BENCH_WAL_RESERVE_4M").is_some() {
-        4 * 1024 * 1024
-    } else {
-        1024 * 1024
-    };
-    #[cfg(not(target_os = "linux"))]
-    let reserve_bytes = 1024 * 1024;
-    reserve_wal_space(&file, reserve_bytes, true);
+    reserve_wal_space(&file, 1024 * 1024, true);
     Ok(file)
 }
 

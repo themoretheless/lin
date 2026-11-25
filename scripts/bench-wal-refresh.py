@@ -59,7 +59,7 @@ for n in (1000, 10000):
                     assert data["embedding_hash"] is not None
                     hashes.add(data["embedding_hash"])
                     results[role] = {k: data[src][0] for k, src in [
-                        ("insert_ns", "samples_ns"), ("reopen_ns", "reopen_ns"), ("wal_bytes", "wal_bytes")]}
+                        ("insert_ns", "samples_ns"), ("open_ns", "open_ns"), ("reopen_ns", "reopen_ns"), ("wal_bytes", "wal_bytes")]}
             assert len(hashes) == 1, "WAL replay embeddings differ"
             report["samples"].append(dict(rows=n, block=block, order=order, measurements=results))
             report["load_latest"] = os.getloadavg()
