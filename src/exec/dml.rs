@@ -2434,6 +2434,109 @@ pub(crate) struct BuiltShape {
     pub now: i64,
 }
 
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+struct BuildTask {
+    records_ptr: usize,
+    out_ptr: usize,
+    n: usize,
+    chunk_size: usize,
+    total_chunks: usize,
+    now: i64,
+    needs_embed: bool,
+    hashing_dim: Option<usize>,
+    next_chunk: AtomicUsize,
+    done_chunks: AtomicUsize,
+    neg_flags: AtomicU8,
+    panicked: AtomicBool,
+    finished: AtomicBool,
+    caller: std::thread::Thread,
+}
+fn run_build_chunks(task: &BuildTask, is_caller: bool) {
+    loop {
+        let c = task.next_chunk.fetch_add(1, Ordering::AcqRel);
+        if c >= task.total_chunks {
+            break;
+        }
+        struct ChunkDone<'a>(&'a BuildTask, bool, bool);
+        impl Drop for ChunkDone<'_> {
+            fn drop(&mut self) {
+                if self.2 {
+                    self.0.panicked.store(true, Ordering::Release);
+                }
+                if self.0.done_chunks.fetch_add(1, Ordering::AcqRel) + 1
+                    == self.0.total_chunks
+                    && !self.1
+                {
+                    self.0.finished.store(true, Ordering::Release);
+                    self.0.caller.unpark();
+                }
+            }
+        }
+        let mut guard = ChunkDone(task, is_caller, true);
+        let start = c * task.chunk_size;
+        let end = (start + task.chunk_size).min(task.n);
+        let recs = unsafe {
+            &std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)[start..end]
+        };
+        let out = unsafe {
+            &mut std::slice::from_raw_parts_mut(
+                task.out_ptr as *mut std::mem::MaybeUninit<Row>,
+                task.n,
+            )[start..end]
+        };
+        let (u, e, l) = build_batch_shape_rows_into(
+            out,
+            recs,
+            task.now,
+            task.needs_embed,
+            task.hashing_dim,
+            task.n,
+        );
+        let mask = u8::from(!u) | (u8::from(!e) << 1) | (u8::from(!l) << 2);
+        if mask != 0 {
+            task.neg_flags.fetch_or(mask, Ordering::Relaxed);
+        }
+        guard.2 = false;
+    }
+}
+
+fn insert_build_workers() -> &'static [std::sync::mpsc::SyncSender<Arc<BuildTask>>] {
+    static BUILD_WORKERS: std::sync::OnceLock<
+        Vec<std::sync::mpsc::SyncSender<std::sync::Arc<BuildTask>>>,
+    > = std::sync::OnceLock::new();
+    BUILD_WORKERS.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(8);
+        if threads <= 1 {
+            return Vec::new();
+        }
+        let num_workers = threads - 1;
+        let mut txs = Vec::with_capacity(num_workers);
+        for idx in 0..num_workers {
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<std::sync::Arc<BuildTask>>(16);
+            if std::thread::Builder::new()
+                .name(format!("lin-build-{idx}"))
+                .spawn(move || {
+                    while let Ok(task) = rx.recv() {
+                        run_build_chunks(&task, false);
+                    }
+                })
+                .is_ok()
+            {
+                txs.push(tx);
+            }
+        }
+        txs
+    })
+}
+
+pub(super) fn warm_insert_build_workers() {
+    let _ = insert_build_workers();
+}
+
 fn build_insert_rows(
     records: &[Record],
     now: i64,
@@ -2445,102 +2548,7 @@ fn build_insert_rows(
         return (Vec::new(), false, !needs_embed, false);
     }
     if n >= 512 {
-        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-        struct BuildTask {
-            records_ptr: usize,
-            out_ptr: usize,
-            n: usize,
-            chunk_size: usize,
-            total_chunks: usize,
-            now: i64,
-            needs_embed: bool,
-            hashing_dim: Option<usize>,
-            next_chunk: AtomicUsize,
-            done_chunks: AtomicUsize,
-            neg_flags: AtomicU8,
-            panicked: AtomicBool,
-            finished: AtomicBool,
-            caller: std::thread::Thread,
-        }
-        fn run_build_chunks(task: &BuildTask, is_caller: bool) {
-            loop {
-                let c = task.next_chunk.fetch_add(1, Ordering::AcqRel);
-                if c >= task.total_chunks {
-                    break;
-                }
-                struct ChunkDone<'a>(&'a BuildTask, bool, bool);
-                impl Drop for ChunkDone<'_> {
-                    fn drop(&mut self) {
-                        if self.2 {
-                            self.0.panicked.store(true, Ordering::Release);
-                        }
-                        if self.0.done_chunks.fetch_add(1, Ordering::AcqRel) + 1
-                            == self.0.total_chunks
-                            && !self.1
-                        {
-                            self.0.finished.store(true, Ordering::Release);
-                            self.0.caller.unpark();
-                        }
-                    }
-                }
-                let mut guard = ChunkDone(task, is_caller, true);
-                let start = c * task.chunk_size;
-                let end = (start + task.chunk_size).min(task.n);
-                let recs = unsafe {
-                    &std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)
-                        [start..end]
-                };
-                let out = unsafe {
-                    &mut std::slice::from_raw_parts_mut(
-                        task.out_ptr as *mut std::mem::MaybeUninit<Row>,
-                        task.n,
-                    )[start..end]
-                };
-                let (u, e, l) = build_batch_shape_rows_into(
-                    out,
-                    recs,
-                    task.now,
-                    task.needs_embed,
-                    task.hashing_dim,
-                    task.n,
-                );
-                let mask = u8::from(!u) | (u8::from(!e) << 1) | (u8::from(!l) << 2);
-                if mask != 0 {
-                    task.neg_flags.fetch_or(mask, Ordering::Relaxed);
-                }
-                guard.2 = false;
-            }
-        }
-        static BUILD_WORKERS: std::sync::OnceLock<
-            Vec<std::sync::mpsc::SyncSender<std::sync::Arc<BuildTask>>>,
-        > = std::sync::OnceLock::new();
-        let workers = BUILD_WORKERS.get_or_init(|| {
-            let threads = std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .min(8);
-            if threads <= 1 {
-                return Vec::new();
-            }
-            let num_workers = threads - 1;
-            let mut txs = Vec::with_capacity(num_workers);
-            for idx in 0..num_workers {
-                let (tx, rx) =
-                    std::sync::mpsc::sync_channel::<std::sync::Arc<BuildTask>>(16);
-                if std::thread::Builder::new()
-                    .name(format!("lin-build-{idx}"))
-                    .spawn(move || {
-                        while let Ok(task) = rx.recv() {
-                            run_build_chunks(&task, false);
-                        }
-                    })
-                    .is_ok()
-                {
-                    txs.push(tx);
-                }
-            }
-            txs
-        });
+        let workers = insert_build_workers();
         if !workers.is_empty() {
             let chunk_size = 64usize;
             let total_chunks = n.div_ceil(chunk_size);
