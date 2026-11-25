@@ -1287,7 +1287,7 @@ fn collect_nz_and_dict_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize>(
+fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize, const SKIP_EMPTY: bool>(
     emb: &[f32],
     nz: &mut smallvec::SmallVec<[(u32, u32); 32]>,
     dictionary: &mut [u32; DICTIONARY_MAX_VALUES],
@@ -1305,6 +1305,21 @@ fn collect_nz_and_dict_avx2<const SIMD_LOOKUP: bool, const WIDTH: usize>(
     };
     for (block, values) in emb.chunks(WIDTH).enumerate() {
         let mut mask = if values.len() == WIDTH {
+            if SKIP_EMPTY && WIDTH == 64 {
+                let ptr = values.as_ptr();
+                // SAFETY: this branch has 64 readable f32 values.
+                let aggregate = unsafe {
+                    let load = |i| _mm256_loadu_si256(ptr.add(i).cast());
+                    let a = _mm256_or_si256(load(0), load(8));
+                    let b = _mm256_or_si256(load(16), load(24));
+                    let c = _mm256_or_si256(load(32), load(40));
+                    let d = _mm256_or_si256(load(48), load(56));
+                    _mm256_or_si256(_mm256_or_si256(a, b), _mm256_or_si256(c, d))
+                };
+                if _mm256_testz_si256(aggregate, aggregate) != 0 {
+                    continue;
+                }
+            }
             let first = mask8(values);
             if WIDTH == 64 {
                 first | (mask8(&values[8..]) << 8)
@@ -1387,6 +1402,8 @@ pub(super) fn append_dictionary_rows_counted<'a>(
     let wide_scan = simd_lookup && std::env::var_os("LIN_BENCH_WAL_DICT_SCAN32").is_some();
     #[cfg(target_arch = "x86_64")]
     let scan64 = wide_scan && std::env::var_os("LIN_BENCH_WAL_DICT_SCAN64").is_some();
+    #[cfg(target_arch = "x86_64")]
+    let skip_empty = scan64 && std::env::var_os("LIN_BENCH_WAL_DICT_SKIP_EMPTY").is_some();
     let pack_ordinals = use_avx2
         && std::env::var_os("LIN_BENCH_WAL_DICT_PACK").is_some();
     // AVX2 retains the ordinal in the second tuple field. Other collectors retain bits.
@@ -1418,14 +1435,16 @@ pub(super) fn append_dictionary_rows_counted<'a>(
         let (d, raw) = if use_avx2 {
             // SAFETY: guarded by runtime AVX2 detection above.
             unsafe {
-                if scan64 {
-                    collect_nz_and_dict_avx2::<true, 64>(emb, &mut nz, &mut dictionary)
+                if skip_empty {
+                    collect_nz_and_dict_avx2::<true, 64, true>(emb, &mut nz, &mut dictionary)
+                } else if scan64 {
+                    collect_nz_and_dict_avx2::<true, 64, false>(emb, &mut nz, &mut dictionary)
                 } else if wide_scan {
-                    collect_nz_and_dict_avx2::<true, 32>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<true, 32, false>(emb, &mut nz, &mut dictionary)
                 } else if simd_lookup {
-                    collect_nz_and_dict_avx2::<true, 8>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<true, 8, false>(emb, &mut nz, &mut dictionary)
                 } else {
-                    collect_nz_and_dict_avx2::<false, 8>(emb, &mut nz, &mut dictionary)
+                    collect_nz_and_dict_avx2::<false, 8, false>(emb, &mut nz, &mut dictionary)
                 }
             }
         } else {
