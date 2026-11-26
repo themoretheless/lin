@@ -6,7 +6,7 @@
 //! them and only rebuilds missing / mismatched collections. WAL replay then
 //! updates postings incrementally.
 
-use hashbrown::hash_map::RawEntryMut;
+use hashbrown::hash_map::{Entry, RawEntryMut};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::{SmallVec, smallvec};
 use std::fs::{self, File};
@@ -154,21 +154,12 @@ impl FtsIndex {
                 if slot_mask == 0 {
                     return;
                 }
-                let mut scratch = String::with_capacity(256);
-                for (i, row) in rows.iter().enumerate() {
-                    let row_idx = start + i;
-                    let cells = row.cells_slice();
-                    let mut m = slot_mask;
-                    while m != 0 {
-                        let pos = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        if let Some(text) = cells[pos].text() {
-                            let lowered = lowercased(text, &mut scratch);
-                            for_each_word(lowered, |tok| {
-                                add_posting(&mut self.postings, tok, row_idx);
-                            });
-                        }
-                    }
+                if rows.len() >= 4096
+                    && std::thread::available_parallelism().is_ok_and(|cpus| cpus.get() >= 4)
+                {
+                    append_parallel_postings(&mut self.postings, start, rows, slot_mask);
+                } else {
+                    append_uniform_postings(&mut self.postings, start, rows, slot_mask);
                 }
                 return;
             }
@@ -735,6 +726,35 @@ pub(crate) fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str)) {
     }
 }
 
+#[inline]
+fn for_each_lower_ascii_word(text: &str, scratch: &mut String, mut visit: impl FnMut(&str)) {
+    debug_assert!(text.is_ascii());
+    let bytes = text.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() {
+        while end < bytes.len() && is_ascii_unicode_ws(bytes[end]) {
+            end += 1;
+        }
+        let start = end;
+        let mut uppercase = false;
+        while end < bytes.len() && !is_ascii_unicode_ws(bytes[end]) {
+            uppercase |= bytes[end].is_ascii_uppercase();
+            end += 1;
+        }
+        if start != end {
+            let token = &text[start..end];
+            if uppercase {
+                scratch.clear();
+                scratch.push_str(token);
+                scratch.make_ascii_lowercase();
+                visit(scratch);
+            } else {
+                visit(token);
+            }
+        }
+    }
+}
+
 /// Text of every field an index tokenizes: the `fts` fields, plus `snippet`
 /// when it is not one of them (lex scoring reads it).
 #[cfg(test)]
@@ -884,6 +904,81 @@ fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_id
         map.remove(tok);
     }
     true
+}
+
+fn append_uniform_postings(
+    postings: &mut Postings,
+    start: usize,
+    rows: &[Row],
+    slot_mask: u64,
+) {
+    let mut scratch = String::with_capacity(256);
+    for (i, row) in rows.iter().enumerate() {
+        let row_idx = start + i;
+        let cells = row.cells_slice();
+        let mut m = slot_mask;
+        while m != 0 {
+            let pos = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if let Some(text) = cells[pos].text() {
+                if text.is_ascii() {
+                    for_each_lower_ascii_word(text, &mut scratch, |tok| {
+                        add_posting(postings, tok, row_idx);
+                    });
+                } else {
+                    let lowered = lowercased(text, &mut scratch);
+                    for_each_word(lowered, |tok| {
+                        add_posting(postings, tok, row_idx);
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn append_parallel_postings(
+    postings: &mut Postings,
+    start: usize,
+    rows: &[Row],
+    slot_mask: u64,
+) {
+    let mid = rows.len().div_ceil(2);
+    let (left, right) = rows.split_at(mid);
+    let build_tail = || {
+        let mut tail = Postings::default();
+        tail.reserve(right.len());
+        append_uniform_postings(&mut tail, start + mid, right, slot_mask);
+        tail
+    };
+    let mut append_left = || append_uniform_postings(postings, start, left, slot_mask);
+    let tail = std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new().spawn_scoped(scope, build_tail);
+        append_left();
+        worker.ok().map(|worker| worker.join().expect("FTS append worker panicked"))
+    });
+    let Some(tail) = tail else {
+        append_uniform_postings(postings, start + mid, right, slot_mask);
+        return;
+    };
+    for (term, indexes) in tail {
+        match postings.entry(term) {
+            Entry::Vacant(entry) => {
+                entry.insert(indexes);
+            }
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.last().is_none_or(|last| *last < indexes[0]) {
+                    existing.extend(indexes);
+                } else {
+                    for index in indexes {
+                        if let Err(position) = existing.binary_search(&index) {
+                            existing.insert(position, index);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Add `row_idx` to a token's sorted list, allocating a posting list only when
@@ -1136,6 +1231,37 @@ pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::store::{Cell, row_text};
+
+    #[test]
+    fn parallel_postings_match_serial_with_overlapping_rows() {
+        let rows: Vec<_> = (0..4097)
+            .map(|i| Row::from([("title", Cell::text_arc(format!("Common {i} ΟΔΟΣ common")))]))
+            .collect();
+        let mut serial = Postings::default();
+        let mut parallel = Postings::default();
+        for (start, rows) in [(30, &rows[..64]), (0, rows.as_slice())] {
+            append_uniform_postings(&mut serial, start, rows, 1);
+            append_parallel_postings(&mut parallel, start, rows, 1);
+        }
+        assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn fused_ascii_tokens_match_reference() {
+        let mut cases = vec![String::new(), "A b A".to_string(), "  MiXeD!  ".to_string()];
+        cases.extend((0u8..128).map(|byte| format!("A{0}b {0}XYZ{0}", char::from(byte))));
+        let mut scratch = String::new();
+        let mut reference_scratch = String::new();
+        for text in cases {
+            let mut actual = Vec::new();
+            for_each_lower_ascii_word(&text, &mut scratch, |token| actual.push(token.to_owned()));
+            let mut expected = Vec::new();
+            for_each_word(lowercased(&text, &mut reference_scratch), |token| {
+                expected.push(token.to_owned());
+            });
+            assert_eq!(actual, expected, "{text:?}");
+        }
+    }
 
     #[test]
     fn snippet_mutations_match_rebuilt_index() {
