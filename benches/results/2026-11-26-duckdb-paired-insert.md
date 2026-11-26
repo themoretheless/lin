@@ -131,3 +131,9 @@ The ordinary release binary ran before profiling instrumentation was applied. Ce
 | Neoverse-N2 | THP | 7.82 / 23.17 (25/25) | 4.79 / 23.19 (25/25) | 74.58 / 216.42 (25/25) | 60.06 / 216.60 (25/25) |
 
 [Uninstrumented paired measurements and runner identities](https://github.com/themoretheless/lin/actions/runs/45798842879)
+
+## Byte-pair content hash formatting
+
+Candidate `026ac1b11` still lost all 50 default first-100k comparisons against DuckDB on the two EPYC 7763 hosts. Lin / DuckDB medians were 193.50 / 165.33 ms and 194.42 / 167.83 ms. Against the baseline Lin build, median paired first-100k differences were −3.63 and −1.78 ms on those hosts, −0.63 ms on EPYC 9V45, and +1.08 ms on ARM64. The candidate won 19 of 32 first-100k pairs against baseline. The original formatter was retained because the full-operation gain did not reproduce across architectures.
+
+[Paired benchmark and raw measurements](https://github.com/themoretheless/lin/actions/runs/45801207174)

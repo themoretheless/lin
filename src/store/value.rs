@@ -915,18 +915,10 @@ pub fn content_hash_inline(body: &str) -> InlineStr {
     let mut buf = [0u8; 22];
     buf[0] = b'h';
     buf[1] = b':';
-    const HEX_PAIRS: [[u8; 2]; 256] = {
-        let digits = b"0123456789abcdef";
-        let mut pairs = [[0; 2]; 256];
-        let mut i = 0;
-        while i < pairs.len() {
-            pairs[i] = [digits[i >> 4], digits[i & 15]];
-            i += 1;
-        }
-        pairs
-    };
-    for (out, byte) in buf[2..18].chunks_exact_mut(2).zip(h.to_be_bytes()) {
-        out.copy_from_slice(&HEX_PAIRS[usize::from(byte)]);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..16 {
+        let shift = (15 - i) * 4;
+        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
     }
     InlineStr { len: 18, buf }
 }
