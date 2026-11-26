@@ -108,3 +108,17 @@ Engine 0add1938e, workflow revision 78465b33e. Each pair uses fresh databases an
 | Neoverse-N2 (wal-full-arm64) | 10000 | 16.294 | 25.029 | -8.774 | 24/24 |
 
 Lin won 225/240 comparisons. [Linux artifacts and hardware provenance](https://github.com/themoretheless/lin/actions/runs/45848667483)
+
+## Linux x64 TCMalloc candidate
+
+Only the x64 Lin candidate loaded TCMalloc; SQLite and the same-binary Lin control kept their default allocation. ARM64 used default allocation throughout. Every sample used a fresh durable database and checked the six projected fields after reopening. Median paired differences in milliseconds are candidate minus peer. Each cell in parentheses gives candidate wins out of 24.
+
+| Runner | 1k vs SQLite | 10k vs SQLite | 1k vs Lin control | 10k vs Lin control |
+|---|---:|---:|---:|---:|
+| EPYC 7763 / 1 | −0.798 (24) | −14.493 (24) | −0.230 (23) | −6.010 (24) |
+| EPYC 9V74 / 2 | −0.520 (23) | −7.830 (24) | −0.267 (23) | −4.500 (23) |
+| EPYC 9V45 / 3 | −0.595 (24) | −9.301 (24) | +0.011 (11) | −0.781 (17) |
+| EPYC 9V74 / 4 | −0.504 (22) | −9.712 (22) | −0.279 (22) | −4.490 (22) |
+| Neoverse-N2 | −0.371 (24) | −7.082 (24) | −0.056 (16) | +0.047 (10) |
+
+[Allocator provenance, samples and recovery checks](https://github.com/themoretheless/lin/actions/runs/45865979433)

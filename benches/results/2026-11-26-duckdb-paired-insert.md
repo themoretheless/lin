@@ -511,3 +511,5 @@ Release engine 0add1938e. With TCMalloc preloaded into both engines, Lin won eac
 With default allocation the same three EPYC hosts lost the first 100k by 27.269, 18.886 and 26.771 ms respectively, winning 1/75 pairs in total. TCMalloc improved Lin's own first 100k by 23.462–30.289 ms on EPYC. On N2 it slowed Lin's first 100k by 9.722 ms (all 25 pairs) and first 10k by 0.942 ms (22/25 losses), although Lin still beat DuckDB. The experiment changes the allocator through the process environment. Default Linux behavior remains an open performance gap on EPYC.
 
 [Paired samples, CPU and allocator provenance](https://github.com/themoretheless/lin/actions/runs/45864248068)
+
+Comparing the TCMalloc Lin process with the default DuckDB process in those same randomized blocks, first 100k wins were 20/25, 24/25 and 22/25 on amd-1, amd-2 and amd-3 respectively. Median paired Lin advantages were 3.388, 4.343 and 3.587 ms. First 10k won 74/75 and repeat inserts won 150/150 across these EPYC hosts. The separate [WAL/FULL qualification](2026-11-26-sqlite-wal-full.md#linux-x64-tcmalloc-candidate) used the same x64-only allocator setting.
