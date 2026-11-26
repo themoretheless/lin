@@ -351,3 +351,14 @@ Eight fresh processes per host and mode. Each process measured three transaction
 In default mode every host had a zero median for AnonHugePages before and after both first and repeat inserts. With the glibc hint, part of the process was already on huge pages after preparation, and repeat transactions started with markedly greater huge-page residency. The process-wide counter covers allocator arenas, prepared input and other anonymous mappings.
 
 [Snapshots and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45835991931)
+
+In the same profile, pair THP and default processes by trial number and subtract THP from default. Each cell is the median of eight paired differences. Row-build time and process minor faults cover the ten non-overlapping build intervals of the first 100k transaction. The residual is transaction time minus build time within each process. For repeats, average the two repeat transactions per process before pairing.
+
+| Host | First transaction saving ms | Row-build saving ms | Residual saving ms | Fewer row-build minor faults, first | Repeat transaction saving ms |
+|---|---:|---:|---:|---:|---:|
+| EPYC 7763 amd-2 | 58.37 | 49.37 | 8.63 | 50028.5 | 1.06 |
+| EPYC 9V45 amd-3 | 9.52 | 10.37 | −0.70 | 38222 | 2.13 |
+| EPYC 7763 amd-4 | 60.32 | 49.82 | 9.68 | 49681 | −1.05 |
+| ARM64 Neoverse-N2 | 24.01 | 18.72 | 5.24 | 45609 | 0.21 |
+
+All 32 first transactions were faster with THP. Only 7 of 16 repeat pairs improved across the two 7763 hosts. These are diagnostic-build timings. The separate peer runs above measure release performance against DuckDB.
