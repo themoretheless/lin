@@ -2805,8 +2805,8 @@ fn build_batch_shape_rows_into(
                 };
             }
 
-            if width <= 8 {
-                let mut cells: smallvec::SmallVec<[Cell; 8]> =
+            if width <= 4 {
+                let mut cells: smallvec::SmallVec<[Cell; 4]> =
                     smallvec::SmallVec::with_capacity(width);
                 if !have_first_kinds {
                     for (ci, slot) in slots.iter().enumerate() {
