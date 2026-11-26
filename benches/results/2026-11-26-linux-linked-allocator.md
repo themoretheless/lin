@@ -15,3 +15,9 @@ Median paired Lin minus peer time in milliseconds, with paired Lin wins in paren
 | Neoverse-N2 / arm64 | -13.636 (25/25) | -18.813 (25/25) | -119.118 (25/25) | -160.808 (25/25) | -0.324 (22/24) | -6.998 (24/24) |
 
 [CI and raw samples](https://github.com/themoretheless/lin/actions/runs/45867410306/attempts/1)
+
+## Attempt 2
+
+The same revision ran on three EPYC 9V45 hosts and one Neoverse-N2. One Xeon runner skipped timing. With default pages, Lin won all 400 DuckDB pairs (two sizes, first and repeat). On EPYC the first 100k advantage ranged from 53.522 to 59.248 ms. On N2 it was 120.406 ms. Lin won 184 of 192 SQLite comparisons and all eight host-size medians after recovery. No EPYC 7763 timings were collected in either attempt.
+
+[CI and raw samples](https://github.com/themoretheless/lin/actions/runs/45867410306/attempts/2)
