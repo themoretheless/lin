@@ -2051,7 +2051,8 @@ fn encode_insert_rows_direct_at(
                     let mut accepted_sparse = false;
                     let mut used_dict = false;
                     let mark = buf.len();
-                    let mut try_raw_sparse = !dictionary_writer_enabled();
+                    // Snapshot LCOL headers do not support the WAL-only dictionary codec.
+                    let mut try_raw_sparse = start_off != 0 || !dictionary_writer_enabled();
                     if !try_raw_sparse {
                         let dict_give_up = if has_empty {
                             usize::MAX
