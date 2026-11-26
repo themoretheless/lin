@@ -137,3 +137,22 @@ The ordinary release binary ran before profiling instrumentation was applied. Ce
 Candidate `026ac1b11` still lost all 50 default first-100k comparisons against DuckDB on the two EPYC 7763 hosts. Lin / DuckDB medians were 193.50 / 165.33 ms and 194.42 / 167.83 ms. Against the baseline Lin build, median paired first-100k differences were −3.63 and −1.78 ms on those hosts, −0.63 ms on EPYC 9V45, and +1.08 ms on ARM64. The candidate won 19 of 32 first-100k pairs against baseline. The original formatter was retained because the full-operation gain did not reproduce across architectures.
 
 [Paired benchmark and raw measurements](https://github.com/themoretheless/lin/actions/runs/45801207174)
+
+## First-touch faults during row construction
+
+Release timings below are Lin / DuckDB median milliseconds, with Lin wins in parentheses. Each pair uses the same allocator setting. Fault counts and row-build milliseconds come from a separate instrumented build, summed across ten batches for the first 100k insert and summarized by the median of eight processes. Faults are process-wide minor faults during the build intervals.
+
+| Runner | Mode | 10k first | 10k repeat | 100k first | 100k repeat | Build faults | Build ms |
+|---|---|---:|---:|---:|---:|---:|---:|
+| AMD EPYC 7763 64-Core Processor (amd-1) | default | 17.85 / 19.21 (25/25) | 7.55 / 18.84 (25/25) | 187.94 / 167.07 (1/25) | 99.77 / 165.54 (25/25) | 80,358.5 | 123.52 |
+| AMD EPYC 7763 64-Core Processor (amd-1) | thp | 12.68 / 19.10 (25/25) | 8.16 / 18.85 (25/25) | 129.79 / 164.28 (25/25) | 99.48 / 166.62 (25/25) | 30,269.0 | 75.18 |
+| AMD EPYC 9V74 80-Core Processor (amd-2) | default | 15.23 / 15.96 (22/25) | 6.61 / 15.77 (25/25) | 163.87 / 138.39 (0/25) | 95.52 / 137.98 (25/25) | 80,358.0 | 101.22 |
+| AMD EPYC 9V74 80-Core Processor (amd-2) | thp | 10.38 / 16.01 (25/25) | 6.94 / 15.83 (25/25) | 110.79 / 138.14 (25/25) | 90.75 / 137.95 (25/25) | 28,200.0 | 56.91 |
+| AMD EPYC 9V74 80-Core Processor (amd-3) | default | 15.28 / 16.05 (21/25) | 6.54 / 15.86 (25/25) | 165.63 / 138.80 (0/25) | 95.15 / 138.76 (25/25) | 80,360.0 | 100.18 |
+| AMD EPYC 9V74 80-Core Processor (amd-3) | thp | 10.23 / 15.97 (25/25) | 6.75 / 15.87 (25/25) | 110.61 / 138.78 (25/25) | 90.80 / 138.64 (25/25) | 28,224.5 | 55.76 |
+| AMD EPYC 7763 64-Core Processor (amd-4) | default | 19.05 / 19.40 (19/25) | 7.85 / 19.20 (25/25) | 196.47 / 168.46 (0/25) | 106.00 / 167.93 (25/25) | 80,358.5 | 137.17 |
+| AMD EPYC 7763 64-Core Processor (amd-4) | thp | 13.64 / 19.34 (25/25) | 8.43 / 19.13 (25/25) | 136.55 / 167.82 (25/25) | 104.89 / 167.58 (25/25) | 30,019.5 | 83.81 |
+| Neoverse-N2 (arm64) | default | 9.62 / 23.10 (25/25) | 4.36 / 23.03 (25/25) | 99.17 / 216.67 (25/25) | 61.25 / 216.79 (25/25) | 80,357.0 | 61.01 |
+| Neoverse-N2 (arm64) | thp | 7.58 / 23.03 (25/25) | 4.57 / 22.96 (25/25) | 74.05 / 217.16 (25/25) | 60.08 / 216.34 (25/25) | 34,317.5 | 39.78 |
+
+[Paired release measurements and instrumented profiles](https://github.com/themoretheless/lin/actions/runs/45803896427)
