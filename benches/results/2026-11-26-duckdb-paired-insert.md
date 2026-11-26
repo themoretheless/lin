@@ -170,3 +170,19 @@ Candidate `7bbab9732` won 20 of 32 first-100k pairs against the previous worker.
 ## Scope of a huge-page hint on the output vector
 
 A local arm64 macOS layout probe on the restored constructor measured 112 bytes per Row and 24 per Cell. The public worker splits 100k records into ten 10k statements, so each row-builder output vector requests 1,120,000 bytes at this layout. Such a vector cannot contain a complete 2 MiB page. Its storage also excludes separately allocated row cells and vectors. Across 100k records the ten output requests total 11.2 MB, while the EPYC 7763 heap profile above attributed 308.8 MB to embedding construction. These figures concern requested storage rather than elapsed time. No engine change or Linux speedup is claimed from the layout probe.
+
+## First-transaction premium outside row building
+
+Using the instrumented fault-profile run under default settings, subtract the sum of ten row-build intervals from each 100k transaction. Within each of eight processes, subtract the median residual of its two repeats from the first residual. Times below are medians of those eight differences. Total premium compares the transaction times in the same way.
+
+| CPU | Runner | Total premium ms | Premium outside row building ms |
+|---|---|---:|---:|
+| EPYC 7763 | amd-1 | 75.58 | 11.51 |
+| EPYC 7763 | amd-4 | 86.49 | 12.82 |
+| EPYC 9V74 | amd-2 | 63.67 | 10.99 |
+| EPYC 9V74 | amd-3 | 60.57 | 10.46 |
+| Neoverse N2 | arm64 | 36.20 | 6.79 |
+
+The residual includes every stage outside the row builder. These within-Lin first/repeat differences do not measure the duration of an individual stage or a Lin/DuckDB gap.
+
+[Per-process transaction and row-build intervals](https://github.com/themoretheless/lin/actions/runs/45803896427)
