@@ -43,6 +43,13 @@ fn build_fts_slots(fields: &[String]) -> SmallVec<[OwnedFieldSlot; 4]> {
     slots
 }
 
+#[derive(Debug, Clone, Default)]
+struct FtsInner {
+    postings: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+}
+
 /// Inverted index: token → sorted unique row indices, plus pending edits.
 ///
 /// `postings` is the folded base; `adds` / `dels` hold changes not yet merged
@@ -50,13 +57,14 @@ fn build_fts_slots(fields: &[String]) -> SmallVec<[OwnedFieldSlot; 4]> {
 /// [`Self::candidate_idxs`] reads. The three sets may overlap — an entry the
 /// live set already has, or one it never had, is inert — but a position is
 /// never in `adds` and `dels` at the same time.
+///
+/// The three posting maps live behind `Arc<FtsInner>` so `FtsIndex::clone()`
+/// in `Store::clone_mem()` is `O(1)` copy-on-write (`Arc::clone`).
 #[derive(Debug, Clone)]
 pub struct FtsIndex {
     pub fields: Vec<String>,
     slots: SmallVec<[OwnedFieldSlot; 4]>,
-    postings: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
-    dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
-    adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    inner: Arc<FtsInner>,
 }
 
 impl Default for FtsIndex {
@@ -65,53 +73,15 @@ impl Default for FtsIndex {
     }
 }
 
-impl FtsIndex {
-    pub fn empty(fields: &[String]) -> Self {
-        Self {
-            fields: fields.to_vec(),
-            slots: build_fts_slots(fields),
-            postings: FxHashMap::default(),
-            dels: FxHashMap::default(),
-            adds: FxHashMap::default(),
-        }
-    }
-
-    pub fn build(rows: &[Row], fields: &[String]) -> Self {
-        let mut idx = Self::empty(fields);
-        idx.postings.reserve(rows.len());
-        idx.append_slab(0, rows);
-        idx
-    }
-
-    pub fn rebuild_in_place(&mut self, rows: &[Row], fields: &[String]) {
-        if self.fields != fields {
-            self.fields.clear();
-            self.fields.extend_from_slice(fields);
-            self.slots = build_fts_slots(fields);
-        }
-        self.dels.clear();
-        self.adds.clear();
-        for list in self.postings.values_mut() {
-            list.clear();
-        }
-        if self.postings.capacity() < rows.len() {
-            self.postings.reserve(rows.len() - self.postings.len());
-        }
-        self.append_slab(0, rows);
-        self.postings.retain(|_, list| !list.is_empty());
-    }
-
-    /// Post a row whose position is new at the tail of the collection: written
-    /// straight into the base list, which keeps appends allocation-cheap.
-    #[allow(dead_code)]
-    pub fn append_row(&mut self, row_idx: usize, row: &Row) {
-        // Caller should provide scratch buffer if batching; single-row path uses one-off.
-        let mut scratch = String::with_capacity(128);
-        self.append_row_with_scratch(row_idx, row, &mut scratch);
-    }
-
-    fn append_row_with_scratch(&mut self, row_idx: usize, row: &Row, scratch: &mut String) {
-        for slot in &mut self.slots {
+impl FtsInner {
+    fn append_row_with_scratch(
+        &mut self,
+        slots: &mut [OwnedFieldSlot],
+        row_idx: usize,
+        row: &Row,
+        scratch: &mut String,
+    ) {
+        for slot in slots {
             if let Some(text) = slot.get(row).and_then(Cell::text) {
                 let lowered = lowercased(text, scratch);
                 for_each_word(lowered, |tok| {
@@ -119,85 +89,6 @@ impl FtsIndex {
                 });
             }
         }
-    }
-
-    /// Append fresh collection positions. Pending edits require the general path
-    /// because a recycled tail position can still occur in an old base posting.
-    pub fn append_slab(&mut self, start: usize, rows: &[Row]) {
-        if self.adds.is_empty() && self.dels.is_empty() && !rows.is_empty() {
-            let first = &rows[0];
-            // The slot mask below is computed from the first row's field positions, so
-            // every row must have the same fields, not merely as many (rows with one
-            // shape share it, which makes the common case a pointer comparison).
-            let same_fields = |r: &Row| match (r.shape(), first.shape()) {
-                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
-                _ => r.len() == first.len() && r.keys().eq(first.keys()),
-            };
-            let uniform = rows[1..].iter().all(same_fields);
-            if uniform && first.len() <= 64 {
-                let has_snippet = self.fields.iter().any(|f| f == "snippet");
-                let mut target_fields: SmallVec<[&str; 4]> =
-                    self.fields.iter().map(|s| s.as_str()).collect();
-                if !has_snippet {
-                    target_fields.push("snippet");
-                }
-                let mut slot_mask: u64 = 0;
-                for (pos, (k, _)) in first.iter().enumerate().take(64) {
-                    if target_fields.contains(&k.as_str()) {
-                        slot_mask |= 1u64 << pos;
-                    }
-                }
-                if slot_mask == 0 {
-                    return;
-                }
-                let mut scratch = String::with_capacity(256);
-                for (i, row) in rows.iter().enumerate() {
-                    let row_idx = start + i;
-                    let cells = row.cells_slice();
-                    let mut m = slot_mask;
-                    while m != 0 {
-                        let pos = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        if let Some(text) = cells[pos].text() {
-                            let lowered = lowercased(text, &mut scratch);
-                            for_each_word(lowered, |tok| {
-                                add_posting(&mut self.postings, tok, row_idx);
-                            });
-                        }
-                    }
-                }
-                return;
-            }
-            let mut scratch = String::with_capacity(256);
-            for (i, row) in rows.iter().enumerate() {
-                self.append_row_with_scratch(start + i, row, &mut scratch);
-            }
-        } else {
-            for (i, row) in rows.iter().enumerate() {
-                self.insert_row(start + i, row);
-            }
-        }
-    }
-
-    /// Post a row at a position chosen by the writer rather than by the row
-    /// count: an ordinary insert still lands as an append, while a position a
-    /// base list already references (a swap-move or an undo restore) is
-    /// registered through the delta set.
-    pub fn insert_row(&mut self, row_idx: usize, row: &Row) {
-        collect_row_tokens(row, &mut self.slots);
-        with_collected_tokens(|tok| {
-            self.note_add(tok, row_idx);
-        });
-    }
-
-    /// Drop one row's postings, given the row that produced them: only its own
-    /// tokens are visited, so the cost is per-row rather than per-vocabulary.
-    /// Callers must invoke it while `row` still sits at `row_idx`.
-    pub fn remove_row(&mut self, row_idx: usize, row: &Row) {
-        collect_row_tokens(row, &mut self.slots);
-        with_collected_tokens(|tok| {
-            self.note_del(tok, row_idx);
-        });
     }
 
     /// Record that `tok` matches `row_idx` from now on.
@@ -354,25 +245,194 @@ impl FtsIndex {
         }
     }
 
-    /// Fold every term; call before serializing so the file format stays base-only.
-    pub fn fold_all(&mut self) {
+    fn fold_all(&mut self) {
         let terms: Vec<Arc<str>> = self.dels.keys().chain(self.adds.keys()).cloned().collect();
         for tok in terms {
             self.fold_term(&tok);
         }
     }
+}
+
+impl FtsIndex {
+    pub fn empty(fields: &[String]) -> Self {
+        Self {
+            fields: fields.to_vec(),
+            slots: build_fts_slots(fields),
+            inner: Arc::new(FtsInner::default()),
+        }
+    }
+
+    pub fn build(rows: &[Row], fields: &[String]) -> Self {
+        let mut idx = Self::empty(fields);
+        Arc::make_mut(&mut idx.inner).postings.reserve(rows.len());
+        idx.append_slab(0, rows);
+        idx
+    }
+
+    pub fn rebuild_in_place(&mut self, rows: &[Row], fields: &[String]) {
+        if self.fields != fields {
+            self.fields.clear();
+            self.fields.extend_from_slice(fields);
+            self.slots = build_fts_slots(fields);
+        }
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.dels.clear();
+            inner.adds.clear();
+            for list in inner.postings.values_mut() {
+                list.clear();
+            }
+            if inner.postings.capacity() < rows.len() {
+                inner.postings.reserve(rows.len() - inner.postings.len());
+            }
+            self.append_slab(0, rows);
+            Arc::make_mut(&mut self.inner)
+                .postings
+                .retain(|_, list| !list.is_empty());
+        } else {
+            self.inner = Arc::new(FtsInner {
+                postings: FxHashMap::with_capacity_and_hasher(rows.len(), Default::default()),
+                dels: FxHashMap::default(),
+                adds: FxHashMap::default(),
+            });
+            self.append_slab(0, rows);
+        }
+    }
+
+    /// Post a row whose position is new at the tail of the collection: written
+    /// straight into the base list, which keeps appends allocation-cheap.
+    #[allow(dead_code)]
+    pub fn append_row(&mut self, row_idx: usize, row: &Row) {
+        // Caller should provide scratch buffer if batching; single-row path uses one-off.
+        let mut scratch = String::with_capacity(128);
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.append_row_with_scratch(&mut self.slots, row_idx, row, &mut scratch);
+    }
+
+    /// Append fresh collection positions. Pending edits require the general path
+    /// because a recycled tail position can still occur in an old base posting.
+    pub fn append_slab(&mut self, start: usize, rows: &[Row]) {
+        if rows.is_empty() {
+            return;
+        }
+        if self.inner.adds.is_empty() && self.inner.dels.is_empty() {
+            let first = &rows[0];
+            // The slot mask below is computed from the first row's field positions, so
+            // every row must have the same fields, not merely as many (rows with one
+            // shape share it, which makes the common case a pointer comparison).
+            let same_fields = |r: &Row| match (r.shape(), first.shape()) {
+                (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+                _ => r.len() == first.len() && r.keys().eq(first.keys()),
+            };
+            let uniform = rows[1..].iter().all(same_fields);
+            if uniform && first.len() <= 64 {
+                let has_snippet = self.fields.iter().any(|f| f == "snippet");
+                let mut target_fields: SmallVec<[&str; 4]> =
+                    self.fields.iter().map(|s| s.as_str()).collect();
+                if !has_snippet {
+                    target_fields.push("snippet");
+                }
+                let mut slot_mask: u64 = 0;
+                for (pos, (k, _)) in first.iter().enumerate().take(64) {
+                    if target_fields.contains(&k.as_str()) {
+                        slot_mask |= 1u64 << pos;
+                    }
+                }
+                if slot_mask == 0 {
+                    return;
+                }
+                let inner = Arc::make_mut(&mut self.inner);
+                let mut scratch = String::with_capacity(256);
+                for (i, row) in rows.iter().enumerate() {
+                    let row_idx = start + i;
+                    let cells = row.cells_slice();
+                    let mut m = slot_mask;
+                    while m != 0 {
+                        let pos = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        if let Some(text) = cells[pos].text() {
+                            let lowered = lowercased(text, &mut scratch);
+                            for_each_word(lowered, |tok| {
+                                add_posting(&mut inner.postings, tok, row_idx);
+                            });
+                        }
+                    }
+                }
+                return;
+            }
+            let inner = Arc::make_mut(&mut self.inner);
+            let mut scratch = String::with_capacity(256);
+            for (i, row) in rows.iter().enumerate() {
+                inner.append_row_with_scratch(&mut self.slots, start + i, row, &mut scratch);
+            }
+        } else {
+            let inner = Arc::make_mut(&mut self.inner);
+            for (i, row) in rows.iter().enumerate() {
+                collect_row_tokens(row, &mut self.slots);
+                with_collected_tokens(|tok| {
+                    inner.note_add(tok, start + i);
+                });
+            }
+        }
+    }
+
+    /// Post a row at a position chosen by the writer rather than by the row
+    /// count: an ordinary insert still lands as an append, while a position a
+    /// base list already references (a swap-move or an undo restore) is
+    /// registered through the delta set.
+    pub fn insert_row(&mut self, row_idx: usize, row: &Row) {
+        collect_row_tokens(row, &mut self.slots);
+        let inner = Arc::make_mut(&mut self.inner);
+        with_collected_tokens(|tok| {
+            inner.note_add(tok, row_idx);
+        });
+    }
+
+    /// Drop one row's postings, given the row that produced them: only its own
+    /// tokens are visited, so the cost is per-row rather than per-vocabulary.
+    /// Callers must invoke it while `row` still sits at `row_idx`.
+    pub fn remove_row(&mut self, row_idx: usize, row: &Row) {
+        collect_row_tokens(row, &mut self.slots);
+        let inner = Arc::make_mut(&mut self.inner);
+        with_collected_tokens(|tok| {
+            inner.note_del(tok, row_idx);
+        });
+    }
+
+    #[cfg(test)]
+    fn note_add(&mut self, tok: &str, row_idx: usize) {
+        Arc::make_mut(&mut self.inner).note_add(tok, row_idx);
+    }
+
+    #[cfg(test)]
+    fn note_del(&mut self, tok: &str, row_idx: usize) {
+        Arc::make_mut(&mut self.inner).note_del(tok, row_idx);
+    }
+
+    /// Fold every term; call before serializing so the file format stays base-only.
+    pub fn fold_all(&mut self) {
+        if self.inner.dels.is_empty() && self.inner.adds.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.inner).fold_all();
+    }
 
     /// Positions where `tok` currently matches, borrowed when no pending edits exist.
     pub fn matches_cow<'a>(&'a self, tok: &str) -> Option<std::borrow::Cow<'a, [usize]>> {
-        let dels = self.dels.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
-        let adds = self.adds.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
+        let dels = self.inner.dels.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
+        let adds = self.inner.adds.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
         if dels.is_empty() && adds.is_empty() {
             return self
+                .inner
                 .postings
                 .get(tok)
                 .map(|list| std::borrow::Cow::Borrowed(list.as_slice()));
         }
-        let base = self.postings.get(tok).map(|v| v.as_slice()).unwrap_or(&[]);
+        let base = self
+            .inner
+            .postings
+            .get(tok)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         Some(std::borrow::Cow::Owned(merge_edits(base, dels, adds)))
     }
 
@@ -382,14 +442,161 @@ impl FtsIndex {
         self.matches_cow(tok).map(std::borrow::Cow::into_owned)
     }
 
+    /// `O(K)` fast-path for single-term lexical top-K queries when every matching row in
+    /// the FTS posting list is guaranteed to achieve the uniform maximum score (`6`) in
+    /// `lex_score_prepared` (tie-broken by ascending row index).
+    ///
+    /// Returns `Some(indices)` (up to `k` ascending live indices `< max_exclusive`) when:
+    /// 1. `self.fields` only contains `"title"`, `"body"`, and/or `"snippet"`;
+    /// 2. `query` lowers to a single non-empty, non-wildcard token `tok` with no leading,
+    ///    trailing, or internal whitespace (`query.to_lowercase() == tok`);
+    /// 3. every character in `tok` satisfies `c.is_alphanumeric() || c == '_'`.
+    #[allow(dead_code)]
+    pub(crate) fn single_alnum_term_first_k(
+        &self,
+        query: &str,
+        k: usize,
+        max_exclusive: usize,
+    ) -> Option<Vec<usize>> {
+        if !self
+            .fields
+            .iter()
+            .all(|f| matches!(f.as_str(), "title" | "body" | "snippet"))
+        {
+            return None;
+        }
+        if query.is_empty() {
+            return None;
+        }
+        let mut stack_buf = [0u8; 128];
+        let mut heap_scratch = String::new();
+        let tok: &str = if query.is_ascii() {
+            let bytes = query.as_bytes();
+            let mut has_upper = false;
+            for &b in bytes {
+                if !(b.is_ascii_alphanumeric() || b == b'_') {
+                    return None;
+                }
+                has_upper |= b.is_ascii_uppercase();
+            }
+            if !has_upper {
+                query
+            } else if bytes.len() <= stack_buf.len() {
+                for (dst, &src) in stack_buf[..bytes.len()].iter_mut().zip(bytes) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                // SAFETY: ASCII bytes remain valid UTF-8 after ASCII lowercasing.
+                unsafe { std::str::from_utf8_unchecked(&stack_buf[..bytes.len()]) }
+            } else {
+                heap_scratch.push_str(query);
+                heap_scratch.make_ascii_lowercase();
+                heap_scratch.as_str()
+            }
+        } else {
+            if query.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let lowered = lowercased(query, &mut heap_scratch);
+            if lowered.is_empty()
+                || !lowered
+                    .chars()
+                    .all(|c| !c.is_whitespace() && (c.is_alphanumeric() || c == '_'))
+            {
+                return None;
+            }
+            lowered
+        };
+
+        if k == 0 || max_exclusive == 0 {
+            return Some(Vec::new());
+        }
+
+        let base = self
+            .inner
+            .postings
+            .get(tok)
+            .map_or(&[][..], |v| v.as_slice());
+        let adds = self
+            .inner
+            .adds
+            .get(tok)
+            .map_or(&[][..], |v| v.as_slice());
+        if base.is_empty() && adds.is_empty() {
+            return Some(Vec::new());
+        }
+        let dels = self
+            .inner
+            .dels
+            .get(tok)
+            .map_or(&[][..], |v| v.as_slice());
+        if dels.is_empty() && adds.is_empty() {
+            let cap = base.len().min(k);
+            let end = if cap == 0 || base[cap - 1] < max_exclusive {
+                cap
+            } else {
+                base[..cap].partition_point(|&idx| idx < max_exclusive)
+            };
+            return Some(base[..end].to_vec());
+        }
+
+        let mut out = Vec::with_capacity(k.min(base.len() + adds.len()));
+        let (mut i, mut j, mut a_idx) = (0, 0, 0);
+        while out.len() < k {
+            while i < base.len() {
+                let b_val = base[i];
+                if b_val >= max_exclusive {
+                    i = base.len();
+                    break;
+                }
+                while j < dels.len() && dels[j] < b_val {
+                    j += 1;
+                }
+                if j < dels.len() && dels[j] == b_val {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let next_base = base.get(i).copied().filter(|&x| x < max_exclusive);
+            let next_add = adds.get(a_idx).copied().filter(|&x| x < max_exclusive);
+            let picked = match (next_base, next_add) {
+                (Some(bv), Some(av)) if bv < av => {
+                    i += 1;
+                    bv
+                }
+                (Some(bv), Some(av)) if bv == av => {
+                    i += 1;
+                    a_idx += 1;
+                    bv
+                }
+                (Some(_), Some(av)) => {
+                    a_idx += 1;
+                    av
+                }
+                (Some(bv), None) => {
+                    i += 1;
+                    bv
+                }
+                (None, Some(av)) => {
+                    a_idx += 1;
+                    av
+                }
+                (None, None) => break,
+            };
+            out.push(picked);
+        }
+        Some(out)
+    }
+
     /// Re-point a row's postings from `from` to `to`. The token set is the row's
     /// own and does not change, so it is computed once instead of per edit —
     /// which is what a swap-move needs, since it moves one row between slots.
     pub fn move_row(&mut self, from: usize, to: usize, row: &Row) {
         collect_row_tokens(row, &mut self.slots);
+        let inner = Arc::make_mut(&mut self.inner);
         with_collected_tokens(|tok| {
-            self.note_del(tok, from);
-            self.note_add(tok, to);
+            inner.note_del(tok, from);
+            inner.note_add(tok, to);
         });
     }
 
@@ -400,11 +607,13 @@ impl FtsIndex {
     /// is dropped. Tokens common to both `doomed` and `tail` remain present at
     /// slot `p` without any edit.
     pub fn swap_remove_row(&mut self, p: usize, doomed: &Row, last: usize, tail: &Row) {
+        let inner = Arc::make_mut(&mut self.inner);
+        let slots = &mut self.slots;
         FTS_SCRATCH.with(|pair_cell| {
             let mut pair = pair_cell.borrow_mut();
             let FtsScratchPair { a, b } = &mut *pair;
-            a.collect(doomed, &mut self.slots);
-            b.collect(tail, &mut self.slots);
+            a.collect(doomed, slots);
+            b.collect(tail, slots);
 
             let (mut d_pos, mut t_pos) = (0, 0);
             while d_pos < a.tokens.len() && t_pos < b.tokens.len() {
@@ -412,15 +621,15 @@ impl FtsIndex {
                 let t_str = b.token_str(t_pos);
                 match d_str.as_bytes().cmp(t_str.as_bytes()) {
                     std::cmp::Ordering::Less => {
-                        self.note_del(d_str, p);
+                        inner.note_del(d_str, p);
                         d_pos += 1;
                     }
                     std::cmp::Ordering::Greater => {
-                        self.note_move_from_tail(t_str, p, last);
+                        inner.note_move_from_tail(t_str, p, last);
                         t_pos += 1;
                     }
                     std::cmp::Ordering::Equal => {
-                        self.note_del_tail(t_str, last);
+                        inner.note_del_tail(t_str, last);
                         d_pos += 1;
                         t_pos += 1;
                     }
@@ -428,12 +637,12 @@ impl FtsIndex {
             }
             while d_pos < a.tokens.len() {
                 let d_str = a.token_str(d_pos);
-                self.note_del(d_str, p);
+                inner.note_del(d_str, p);
                 d_pos += 1;
             }
             while t_pos < b.tokens.len() {
                 let t_str = b.token_str(t_pos);
-                self.note_move_from_tail(t_str, p, last);
+                inner.note_move_from_tail(t_str, p, last);
                 t_pos += 1;
             }
         });
@@ -450,11 +659,13 @@ impl FtsIndex {
         {
             return;
         }
+        let inner = Arc::make_mut(&mut self.inner);
+        let slots = &mut self.slots;
         FTS_SCRATCH.with(|pair_cell| {
             let mut pair = pair_cell.borrow_mut();
             let FtsScratchPair { a, b } = &mut *pair;
-            a.collect(before, &mut self.slots);
-            b.collect(after, &mut self.slots);
+            a.collect(before, slots);
+            b.collect(after, slots);
 
             let (mut old_pos, mut new_pos) = (0, 0);
             while old_pos < a.tokens.len() && new_pos < b.tokens.len() {
@@ -462,11 +673,11 @@ impl FtsIndex {
                 let new_str = b.token_str(new_pos);
                 match old_str.as_bytes().cmp(new_str.as_bytes()) {
                     std::cmp::Ordering::Less => {
-                        self.note_del(old_str, row_idx);
+                        inner.note_del(old_str, row_idx);
                         old_pos += 1;
                     }
                     std::cmp::Ordering::Greater => {
-                        self.note_add(new_str, row_idx);
+                        inner.note_add(new_str, row_idx);
                         new_pos += 1;
                     }
                     std::cmp::Ordering::Equal => {
@@ -477,12 +688,12 @@ impl FtsIndex {
             }
             while old_pos < a.tokens.len() {
                 let old_str = a.token_str(old_pos);
-                self.note_del(old_str, row_idx);
+                inner.note_del(old_str, row_idx);
                 old_pos += 1;
             }
             while new_pos < b.tokens.len() {
                 let new_str = b.token_str(new_pos);
-                self.note_add(new_str, row_idx);
+                inner.note_add(new_str, row_idx);
                 new_pos += 1;
             }
         });
@@ -498,7 +709,7 @@ impl FtsIndex {
             if let Some(prefix) = tok.strip_suffix('*') {
                 if !prefix.is_empty() {
                     let mut matched_terms: SmallVec<[&str; 16]> = SmallVec::new();
-                    for k in self.postings.keys().chain(self.adds.keys()) {
+                    for k in self.inner.postings.keys().chain(self.inner.adds.keys()) {
                         if k.starts_with(prefix) {
                             matched_terms.push(k.as_ref());
                         }
@@ -549,7 +760,8 @@ impl FtsIndex {
     }
 
     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
-        let mut terms: Vec<(&Arc<str>, &SmallVec<[usize; 2]>)> = self.postings.iter().collect();
+        let mut terms: Vec<(&Arc<str>, &SmallVec<[usize; 2]>)> =
+            self.inner.postings.iter().collect();
         terms.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let fields_bytes: usize = self.fields.iter().map(|f| 4 + f.len()).sum();
         let terms_bytes: usize = terms
@@ -640,9 +852,11 @@ impl FtsIndex {
             Self {
                 fields,
                 slots,
-                postings,
-                dels: FxHashMap::default(),
-                adds: FxHashMap::default(),
+                inner: Arc::new(FtsInner {
+                    postings,
+                    dels: FxHashMap::default(),
+                    adds: FxHashMap::default(),
+                }),
             },
         ))
     }
@@ -1152,7 +1366,10 @@ mod tests {
             index.insert_row(0, &before);
             assert_eq!(index.candidate_idxs("old ёж"), vec![0]);
             index.fold_all();
-            assert_eq!(index.postings, FtsIndex::build(&[before], &fields).postings);
+            assert_eq!(
+                index.inner.postings,
+                FtsIndex::build(&[before], &fields).inner.postings
+            );
         }
     }
 
@@ -1178,7 +1395,10 @@ mod tests {
                 let mut index = FtsIndex::build(&[before.clone()], &fields);
                 index.sync_row(0, &before, &after);
                 index.fold_all();
-                assert_eq!(index.postings, FtsIndex::build(&[after], &fields).postings);
+                assert_eq!(
+                    index.inner.postings,
+                    FtsIndex::build(&[after], &fields).inner.postings
+                );
             }
         }
     }
@@ -1247,9 +1467,9 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             single.append_row(17 + i, row);
         }
-        assert_eq!(slab.postings, single.postings);
-        assert_eq!(slab.adds, single.adds);
-        assert_eq!(slab.dels, single.dels);
+        assert_eq!(slab.inner.postings, single.inner.postings);
+        assert_eq!(slab.inner.adds, single.inner.adds);
+        assert_eq!(slab.inner.dels, single.inner.dels);
     }
 
     #[test]
@@ -1290,7 +1510,7 @@ mod tests {
         }
         fast.fold_all();
         reference.fold_all();
-        assert_eq!(fast.postings, reference.postings);
+        assert_eq!(fast.inner.postings, reference.inner.postings);
     }
 
     #[test]
@@ -1514,7 +1734,9 @@ mod pending_order_tests {
     #[test]
     fn descending_and_random_edits_survive_folding_and_codec() {
         let mut index = FtsIndex::empty(&["body".into()]);
-        index.postings.insert("wal".into(), (0..600).collect());
+        Arc::make_mut(&mut index.inner)
+            .postings
+            .insert("wal".into(), (0..600).collect());
         let mut expected = (0..600).collect::<std::collections::BTreeSet<usize>>();
         for pos in (0..600).rev() {
             index.note_del("wal", pos);
@@ -1554,7 +1776,9 @@ mod pending_order_tests {
     #[test]
     fn out_of_order_pending_edits_match_live_positions() {
         let mut index = FtsIndex::empty(&["body".into()]);
-        index.postings.insert("wal".into(), (0..10).collect());
+        Arc::make_mut(&mut index.inner)
+            .postings
+            .insert("wal".into(), (0..10).collect());
         let mut expected = (0..10).collect::<std::collections::BTreeSet<usize>>();
         for (add, pos) in [
             (false, 8),
@@ -1627,6 +1851,90 @@ mod pending_order_tests {
         );
         index.fold_all();
         assert_eq!(index.matches("alpha"), None);
+    }
+
+    #[test]
+    fn single_alnum_term_first_k_matches_lex_scoring_and_cow_sharing() {
+        use crate::eval::{LexQuery, lex_score_prepared};
+
+        let fields = vec!["title".to_string(), "body".to_string()];
+        let mut rows: Vec<Row> = (0..200)
+            .map(|i| {
+                Row::from([
+                    (
+                        "title",
+                        Cell::from_text(if i % 3 == 0 {
+                            "rust_wal storage"
+                        } else {
+                            "other header"
+                        }),
+                    ),
+                    (
+                        "body",
+                        Cell::from_text(if i % 5 == 0 {
+                            "ЁЖ ΟΔΟΣ rust_wal"
+                        } else {
+                            "plain body"
+                        }),
+                    ),
+                ])
+            })
+            .collect();
+
+        let mut index = FtsIndex::build(&rows, &fields);
+
+        // CoW clone shares inner backing map until mutated.
+        let snapshot = index.clone();
+        assert!(Arc::ptr_eq(&index.inner, &snapshot.inner));
+
+        // Mutate `index` with pending edits (remove + insert + sync) while `snapshot` stays intact.
+        index.remove_row(0, &rows[0]);
+        rows[0] = Row::from([("title", Cell::from_text("removed"))]);
+        index.insert_row(0, &rows[0]);
+
+        let old_7 = rows[7].clone();
+        rows[7] = Row::from([("title", Cell::from_text("rust_wal fresh_hit ЁЖ"))]);
+        index.sync_row(7, &old_7, &rows[7]);
+
+        assert!(!Arc::ptr_eq(&index.inner, &snapshot.inner));
+        assert_eq!(
+            snapshot.single_alnum_term_first_k("rust_wal", 3, 200),
+            Some(vec![0, 3, 5])
+        );
+
+        for q in ["rust_wal", "RUST_WAL", "ёж", "ЁЖ", "οδος", "ΟΔΟΣ", "absent_tok"] {
+            for k in [0, 1, 5, 10, 500] {
+                for max_excl in [0, 10, 50, rows.len()] {
+                    let got = index.single_alnum_term_first_k(q, k, max_excl).unwrap();
+                    let lq = LexQuery::new(q);
+                    let mut expected: Vec<(i64, usize)> = index
+                        .candidate_idxs(q)
+                        .into_iter()
+                        .filter(|&i| i < max_excl)
+                        .filter_map(|i| {
+                            let s = lex_score_prepared(&rows[i], &lq);
+                            (s > 0).then_some((s, i))
+                        })
+                        .collect();
+                    expected.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                    expected.truncate(k);
+                    let exp_idxs: Vec<usize> = expected.into_iter().map(|(_, i)| i).collect();
+                    assert_eq!(got, exp_idxs, "q={q:?} k={k} max={max_excl}");
+                }
+            }
+        }
+
+        // Queries that must decline the fast-path (`None`).
+        for rejected in ["", "  rust_wal", "rust_wal ", "rust wal", "rust*", "rust-wal", "a!b"] {
+            assert_eq!(index.single_alnum_term_first_k(rejected, 10, 200), None, "{rejected:?}");
+        }
+
+        // Non-standard indexed fields outside {title, body, snippet} must also decline (`None`).
+        let custom_fts = FtsIndex::build(
+            &[Row::from([("author", Cell::from_text("alice"))])],
+            &["author".to_string()],
+        );
+        assert_eq!(custom_fts.single_alnum_term_first_k("alice", 10, 1), None);
     }
 }
 

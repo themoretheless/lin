@@ -1660,22 +1660,33 @@ pub fn dequantize_sq8(v: &[i8]) -> Vec<f32> {
     v.iter().map(|&x| (x as f32) * INV).collect()
 }
 
+/// Raw `i32` dot product between two `i8` slices of length `n = a.len().min(b.len())`.
+#[inline]
+fn dot_sq8_raw(a: &[i8], b: &[i8]) -> i32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_sq8_neon(a, b, n) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_sq8_scalar(a, b, n)
+    }
+}
+
 /// Dot product / cosine similarity between two SQ8-quantized vectors.
 ///
 /// Uses ARM NEON integer widening multiply-accumulate on aarch64 and an 8-way
 /// unrolled integer accumulator elsewhere. Scaled by `(127.0 * 127.0)^-1`.
 #[inline]
 pub fn dot_sq8(a: &[i8], b: &[i8]) -> f64 {
-    let n = a.len().min(b.len());
-    if n == 0 {
+    let total = dot_sq8_raw(a, b);
+    if total == 0 {
         return 0.0;
     }
-
-    #[cfg(target_arch = "aarch64")]
-    let total = unsafe { dot_sq8_neon(a, b, n) };
-
-    #[cfg(not(target_arch = "aarch64"))]
-    let total = dot_sq8_scalar(a, b, n);
 
     const SCALE: f64 = 1.0 / (127.0 * 127.0);
     let sim = (total as f64) * SCALE;
@@ -1894,6 +1905,426 @@ impl VectorIndex {
             Self::F32(idx) => idx.search(query, k, ef_search),
             Self::Sq8(idx) => idx.search(query, k, ef_search),
         }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct ApproxCand {
+    approx: f32,
+    idx: usize,
+}
+
+impl PartialEq for ApproxCand {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.approx.to_bits() == other.approx.to_bits() && self.idx == other.idx
+    }
+}
+
+impl Eq for ApproxCand {}
+
+impl PartialOrd for ApproxCand {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ApproxCand {
+    /// Max-heap root is the *worst* retained candidate: lower `approx` first, then larger `idx`.
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .approx
+            .total_cmp(&self.approx)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+#[allow(dead_code)]
+#[inline]
+fn encode_vec_sq8(vec_opt: Option<&[f32]>, out_sq8: &mut [i8]) -> (u8, f32, f32) {
+    let dim = out_sq8.len();
+    let Some(v) = vec_opt.filter(|v| dim > 0 && v.len() == dim) else {
+        out_sq8.fill(0);
+        return (0, 0.0, 0.0);
+    };
+
+    let mut s0 = 0.0f64;
+    let mut s1 = 0.0f64;
+    let mut s2 = 0.0f64;
+    let mut s3 = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut chunks = v.chunks_exact(4);
+    for c in &mut chunks {
+        let (x0, x1, x2, x3) = (c[0], c[1], c[2], c[3]);
+        s0 += (x0 as f64) * (x0 as f64);
+        s1 += (x1 as f64) * (x1 as f64);
+        s2 += (x2 as f64) * (x2 as f64);
+        s3 += (x3 as f64) * (x3 as f64);
+        let m01 = x0.abs().max(x1.abs());
+        let m23 = x2.abs().max(x3.abs());
+        max_abs = max_abs.max(m01.max(m23));
+    }
+    let mut s = (s0 + s1) + (s2 + s3);
+    for &x in chunks.remainder() {
+        s += (x as f64) * (x as f64);
+        max_abs = max_abs.max(x.abs());
+    }
+    if !s.is_finite() || s <= 1e-18 || !max_abs.is_finite() || max_abs == 0.0 {
+        out_sq8.fill(0);
+        return (0, 0.0, 0.0);
+    }
+
+    let norm = s.sqrt();
+    // Unit-normalized per-row SQ8 scale: `max_j |v[j] / norm| / 127.0`.
+    // Notice `norm` cancels in quantization: `(v[j] / norm) / unit_scale == v[j] * 127.0 / max_abs`.
+    let unit_scale = ((max_abs as f64) / (norm * 127.0)) as f32;
+    if !unit_scale.is_finite() || unit_scale == 0.0 {
+        out_sq8.fill(0);
+        return (0, 0.0, 0.0);
+    }
+    let inv_norm = (1.0 / norm) as f32;
+    let quant_mul = 127.0f64 / (max_abs as f64);
+    if quant_mul <= (f32::MAX as f64) * 0.5 {
+        let qm = quant_mul as f32;
+        for (dst, &x) in out_sq8.iter_mut().zip(v.iter()) {
+            *dst = (x * qm).round().clamp(-127.0, 127.0) as i8;
+        }
+    } else {
+        for (dst, &x) in out_sq8.iter_mut().zip(v.iter()) {
+            *dst = ((x as f64) * quant_mul).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (1, unit_scale, inv_norm)
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct FlatVecInner {
+    valid_count: usize,
+    valid: Vec<u8>,
+    sq8: Vec<i8>,
+    unit_scales: Vec<f32>,
+    inv_norms: Vec<f32>,
+}
+
+/// Contiguous collection-aligned SQ8 + inverse-norm matrix for fast two-stage exact top-K
+/// cosine search (`search vec` / `search hybrid`) without pointer-chasing `Row`s.
+///
+/// Backed by `Arc<FlatVecInner>` so `FlatVecMatrix::clone()` in `Store::clone_mem()` is `O(1)`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct FlatVecMatrix {
+    dim: usize,
+    len: usize,
+    inner: Arc<FlatVecInner>,
+}
+
+#[allow(dead_code)]
+impl FlatVecMatrix {
+    #[inline]
+    pub fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            len: 0,
+            inner: Arc::new(FlatVecInner::default()),
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(dim: usize, capacity: usize) -> Self {
+        Self {
+            dim,
+            len: 0,
+            inner: Arc::new(FlatVecInner {
+                valid_count: 0,
+                valid: Vec::with_capacity(capacity),
+                sq8: Vec::with_capacity(capacity.saturating_mul(dim)),
+                unit_scales: Vec::with_capacity(capacity),
+                inv_norms: Vec::with_capacity(capacity),
+            }),
+        }
+    }
+
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn valid_count(&self) -> usize {
+        self.inner.valid_count
+    }
+
+    pub fn clear(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.valid_count = 0;
+            inner.valid.clear();
+            inner.sq8.clear();
+            inner.unit_scales.clear();
+            inner.inv_norms.clear();
+        } else {
+            self.inner = Arc::new(FlatVecInner::default());
+        }
+        self.len = 0;
+    }
+
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        let inner = Arc::make_mut(&mut self.inner);
+        let dropped_valid: usize = inner.valid[new_len..].iter().map(|&v| v as usize).sum();
+        inner.valid_count = inner.valid_count.saturating_sub(dropped_valid);
+        inner.valid.truncate(new_len);
+        inner.unit_scales.truncate(new_len);
+        inner.inv_norms.truncate(new_len);
+        inner.sq8.truncate(new_len * self.dim);
+        self.len = new_len;
+    }
+
+    pub fn build<'a>(
+        len: usize,
+        dim: usize,
+        get_vec: impl Fn(usize) -> Option<&'a [f32]>,
+    ) -> Self {
+        if len == 0 {
+            return Self::new(dim);
+        }
+        let mut valid = vec![0u8; len];
+        let mut sq8 = vec![0i8; len.checked_mul(dim).expect("FlatVecMatrix size overflow")];
+        let mut unit_scales = vec![0.0f32; len];
+        let mut inv_norms = vec![0.0f32; len];
+        let mut valid_count = 0usize;
+
+        if dim > 0 {
+            for i in 0..len {
+                let row_sq8 = &mut sq8[i * dim..(i + 1) * dim];
+                let (v_flag, u_scale, inv_n) = encode_vec_sq8(get_vec(i), row_sq8);
+                valid[i] = v_flag;
+                unit_scales[i] = u_scale;
+                inv_norms[i] = inv_n;
+                valid_count += v_flag as usize;
+            }
+        }
+
+        Self {
+            dim,
+            len,
+            inner: Arc::new(FlatVecInner {
+                valid_count,
+                valid,
+                sq8,
+                unit_scales,
+                inv_norms,
+            }),
+        }
+    }
+
+    pub fn append(&mut self, vec_opt: Option<&[f32]>) {
+        let dim = self.dim;
+        let inner = Arc::make_mut(&mut self.inner);
+        if dim == 0 {
+            inner.valid.push(0);
+            inner.unit_scales.push(0.0);
+            inner.inv_norms.push(0.0);
+            self.len += 1;
+            return;
+        }
+        let start = self.len * dim;
+        inner.sq8.resize(start + dim, 0);
+        let (v_flag, u_scale, inv_n) = encode_vec_sq8(vec_opt, &mut inner.sq8[start..start + dim]);
+        inner.valid.push(v_flag);
+        inner.unit_scales.push(u_scale);
+        inner.inv_norms.push(inv_n);
+        inner.valid_count += v_flag as usize;
+        self.len += 1;
+    }
+
+    pub fn set(&mut self, idx: usize, vec_opt: Option<&[f32]>) {
+        if idx >= self.len {
+            while self.len < idx {
+                self.append(None);
+            }
+            self.append(vec_opt);
+            return;
+        }
+        let dim = self.dim;
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.valid_count -= inner.valid[idx] as usize;
+        if dim == 0 {
+            inner.valid[idx] = 0;
+            inner.unit_scales[idx] = 0.0;
+            inner.inv_norms[idx] = 0.0;
+            return;
+        }
+        let start = idx * dim;
+        let (v_flag, u_scale, inv_n) = encode_vec_sq8(vec_opt, &mut inner.sq8[start..start + dim]);
+        inner.valid[idx] = v_flag;
+        inner.unit_scales[idx] = u_scale;
+        inner.inv_norms[idx] = inv_n;
+        inner.valid_count += v_flag as usize;
+    }
+
+    pub fn swap_remove(&mut self, idx: usize) {
+        if idx >= self.len {
+            return;
+        }
+        let last = self.len - 1;
+        let dim = self.dim;
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.valid_count -= inner.valid[idx] as usize;
+        if idx != last {
+            inner.valid[idx] = inner.valid[last];
+            inner.unit_scales[idx] = inner.unit_scales[last];
+            inner.inv_norms[idx] = inner.inv_norms[last];
+            if dim > 0 {
+                inner
+                    .sq8
+                    .copy_within(last * dim..(last + 1) * dim, idx * dim);
+            }
+        }
+        inner.valid.pop();
+        inner.unit_scales.pop();
+        inner.inv_norms.pop();
+        if dim > 0 {
+            inner.sq8.truncate(last * dim);
+        }
+        self.len = last;
+    }
+
+    pub fn search_top_k<'a>(
+        &self,
+        query: &[f32],
+        k: usize,
+        get_exact: impl Fn(usize) -> Option<&'a [f32]>,
+    ) -> Vec<(f64, usize)> {
+        let dim = self.dim;
+        let inner = &*self.inner;
+        if k == 0
+            || self.len == 0
+            || dim == 0
+            || query.len() != dim
+            || inner.valid_count == 0
+        {
+            return Vec::new();
+        }
+        let q_norm = l2_norm_f64(query);
+        if q_norm == 0.0 {
+            return Vec::new();
+        }
+
+        let cmp_vec = |a: &(f64, usize), b: &(f64, usize)| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        };
+
+        let cand_k = if k <= 128 {
+            (k * 4).clamp(64, 512)
+        } else {
+            k.saturating_mul(2).max(512)
+        };
+
+        // Direct exact pass when k covers at least half the collection or valid rows fit in cand_k.
+        if k >= self.len / 2 || inner.valid_count <= cand_k {
+            let mut scored = Vec::with_capacity(inner.valid_count);
+            for i in 0..self.len {
+                if inner.valid[i] != 0
+                    && let Some(exact_vec) = get_exact(i)
+                {
+                    let score = cosine_with_q_norm(query, q_norm, exact_vec);
+                    if score > 0.01 {
+                        scored.push((score, i));
+                    }
+                }
+            }
+            if scored.len() > k {
+                scored.select_nth_unstable_by(k - 1, cmp_vec);
+                scored.truncate(k);
+            }
+            scored.sort_unstable_by(cmp_vec);
+            return scored;
+        }
+
+        // Normalize and quantize `query` on the stack (`SmallVec<[i8; 1024]>`).
+        let mut q_sq8: smallvec::SmallVec<[i8; 1024]> = smallvec::SmallVec::with_capacity(dim);
+        q_sq8.resize(dim, 0);
+        let (q_valid, q_scale, _) = encode_vec_sq8(Some(query), &mut q_sq8);
+        if q_valid == 0 {
+            return Vec::new();
+        }
+
+        let valid = &inner.valid[..self.len];
+        let scales = &inner.unit_scales[..self.len];
+        let sq8 = &inner.sq8[..self.len * dim];
+
+        let mut heap: BinaryHeap<ApproxCand> = BinaryHeap::with_capacity(cand_k + 1);
+        let mut min_approx: f32 = -0.02;
+
+        for i in 0..self.len {
+            if valid[i] == 0 {
+                continue;
+            }
+            let row_sq8 = &sq8[i * dim..(i + 1) * dim];
+            let dot = dot_sq8_raw(&q_sq8, row_sq8);
+            let approx = (dot as f32) * (q_scale * scales[i]);
+            if heap.len() < cand_k {
+                if approx < -0.02 {
+                    continue;
+                }
+                heap.push(ApproxCand { approx, idx: i });
+                if heap.len() == cand_k {
+                    min_approx = heap.peek().unwrap().approx.max(-0.02);
+                }
+            } else if approx > min_approx {
+                // `i` strictly increases, so equal `approx` always loses tie-break to earlier rows.
+                if let Some(mut worst) = heap.peek_mut() {
+                    *worst = ApproxCand { approx, idx: i };
+                }
+                min_approx = heap.peek().unwrap().approx.max(-0.02);
+            }
+        }
+
+        if heap.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort candidate indices ascending so exact `get_exact(idx)` reads stream forward in memory.
+        let mut cand_idxs: smallvec::SmallVec<[usize; 512]> =
+            heap.into_iter().map(|c| c.idx).collect();
+        cand_idxs.sort_unstable();
+
+        let mut refined = Vec::with_capacity(cand_idxs.len());
+        for idx in cand_idxs {
+            if let Some(exact_vec) = get_exact(idx) {
+                let score = cosine_with_q_norm(query, q_norm, exact_vec);
+                if score > 0.01 {
+                    refined.push((score, idx));
+                }
+            }
+        }
+        if refined.len() > k {
+            refined.select_nth_unstable_by(k - 1, cmp_vec);
+            refined.truncate(k);
+        }
+        refined.sort_unstable_by(cmp_vec);
+        refined
     }
 }
 
@@ -2283,5 +2714,100 @@ mod tests {
         sq8_index.move_id(49, 20);
         let res_sq8_49 = sq8_index.search(&items[49].1, 5, 32);
         assert_eq!(res_sq8_49[0].1, 20);
+    }
+
+    #[test]
+    fn flat_vec_matrix_top_k_and_mutations_match_exact_cosine() {
+        let dim = 768;
+        let embedder = HashingEmbedder::new("nomic-embed-text/768", dim);
+        let mut docs: Vec<Option<Vec<f32>>> = (0..1_500)
+            .map(|i| {
+                if i % 17 == 0 {
+                    None
+                } else if i % 29 == 0 {
+                    // Wrong-dimension or all-zero vectors should be marked invalid and skipped cleanly.
+                    Some(if i % 58 == 0 {
+                        vec![0.0; dim]
+                    } else {
+                        vec![1.0, 2.0, 3.0]
+                    })
+                } else {
+                    // Scale by arbitrary positive factors (0.05 .. 500.0) to test scale invariance.
+                    let scale = 0.05 + ((i % 97) as f32) * 5.1;
+                    let v = embedder.embed(&format!(
+                        "topic_{} document_{i} wal index hybrid vector search",
+                        i % 23
+                    ));
+                    Some(v.iter().map(|&x| x * scale).collect())
+                }
+            })
+            .collect();
+
+        let mut mat = FlatVecMatrix::build(docs.len(), dim, |i| docs[i].as_deref());
+        assert_eq!(mat.len(), docs.len());
+        assert_eq!(mat.dim(), dim);
+
+        // CoW snapshot stays isolated across append / set / swap_remove.
+        let snap = mat.clone();
+        assert!(Arc::ptr_eq(&mat.inner, &snap.inner));
+
+        // Append 2 rows
+        let extra0: Vec<f32> = embedder
+            .embed("special needle alpha omega query")
+            .iter()
+            .copied()
+            .collect();
+        docs.push(Some(extra0.clone()));
+        mat.append(Some(&extra0));
+        docs.push(None);
+        mat.append(None);
+
+        // Overwrite row 10 and swap_remove row 5
+        let updated10: Vec<f32> = embedder
+            .embed("updated row ten with alpha omega")
+            .iter()
+            .map(|&x| x * 12.5)
+            .collect();
+        docs[10] = Some(updated10.clone());
+        mat.set(10, Some(&updated10));
+
+        docs.swap_remove(5);
+        mat.swap_remove(5);
+
+        assert_eq!(mat.len(), docs.len());
+        assert!(!Arc::ptr_eq(&mat.inner, &snap.inner));
+
+        for q_text in [
+            "special needle alpha omega query",
+            "topic_7 wal index",
+            "updated row ten alpha",
+            "completely unrelated token zzz_nonexistent",
+        ] {
+            let qv: Vec<f32> = embedder.embed(q_text).iter().map(|&x| x * 3.7).collect();
+            let q_norm = l2_norm_f64(&qv);
+            for k in [1, 10, 25, 128, 800] {
+                let got = mat.search_top_k(&qv, k, |i| docs[i].as_deref());
+                let mut exact: Vec<(f64, usize)> = docs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v_opt)| {
+                        let v = v_opt.as_deref()?;
+                        let s = cosine_with_q_norm(&qv, q_norm, v);
+                        (s > 0.01).then_some((s, i))
+                    })
+                    .collect();
+                exact.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                exact.truncate(k);
+                assert_eq!(got.len(), exact.len(), "q={q_text:?} k={k}");
+                for ((gs, gi), (es, ei)) in got.iter().zip(exact.iter()) {
+                    assert_eq!(gi, ei, "q={q_text:?} k={k}");
+                    assert!((gs - es).abs() < 1e-12);
+                }
+            }
+        }
     }
 }

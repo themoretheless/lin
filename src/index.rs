@@ -193,6 +193,7 @@ pub struct IndexUse {
     pub def: IndexDef,
     pub eqs: Vec<(String, Value)>,
     pub range: Option<(String, CmpOp, Value)>,
+    pub opposite_bound: Option<(CmpOp, Value)>,
 }
 
 /// Posting list - either SmallVec<[usize; 2]> (standard) or BitSet (for low-cardinality columns)
@@ -220,10 +221,7 @@ impl PostingList {
                 if vec.len() >= 32 && vec.len().is_power_of_two() {
                     let max_pos = vec.iter().copied().max().unwrap_or(0).max(pos);
                     if max_pos <= vec.len().saturating_mul(64) {
-                        let mut set = BitSet::new(max_pos + 1);
-                        for &p in vec.iter() {
-                            set.insert(p);
-                        }
+                        let mut set = BitSet::from_positions(vec, max_pos);
                         set.insert(pos);
                         *self = PostingList::Bitmap(set);
                     } else {
@@ -245,10 +243,7 @@ impl PostingList {
         {
             let max_pos = vec.iter().copied().max().unwrap_or(0);
             if max_pos <= vec.len().saturating_mul(256) {
-                let mut set = BitSet::new(max_pos + 1);
-                for &p in vec.iter() {
-                    set.insert(p);
-                }
+                let set = BitSet::from_positions(vec, max_pos);
                 *self = PostingList::Bitmap(set);
             }
         }
@@ -265,10 +260,7 @@ impl PostingList {
         {
             let max_pos = vec.iter().copied().max().unwrap_or(0);
             if max_pos <= vec.len().saturating_mul(256) {
-                let mut set = BitSet::new(max_pos + 1);
-                for &p in vec.iter() {
-                    set.insert(p);
-                }
+                let set = BitSet::from_positions(vec, max_pos);
                 *self = PostingList::Bitmap(set);
             }
         }
@@ -773,21 +765,366 @@ impl LiveIndex {
             (false, distinct.len())
         });
 
-        // Fast path for bulk building into an empty non-reverse index: flat key extraction,
-        // in-place unstable sort (preserving ascending `orig_idx` order per key), direct
-        // dense `BitSet` construction, and O(K) sorted `BTreeMap::from_iter`.
+        // Fast path for bulk building into an empty non-reverse index:
+        // - Non-unique indexes group positions via a 4-slot MRU register/stack cache (matching
+        //   raw `&Cell`s before constructing `IndexKey`) + overflow `FxHashMap`, then sort ONLY
+        //   the `K` distinct keys instead of `N` `(IndexKey, usize)` pairs.
+        // - Unique indexes extract flat `(IndexKey, usize)` pairs and sort once to detect
+        //   duplicates and build `BTreeMap` in sorted order.
         if self.forward.is_empty()
             && !self.use_reverse
             && self.def.pred.is_none()
             && rows.len() >= 64
         {
-            let mut pairs: Vec<(IndexKey, usize)> = Vec::with_capacity(rows.len());
+            let sample_force_bitmap = bitmap_sample
+                .is_some_and(|(has_bool, count)| has_bool || (count > 0 && count <= 16));
+            let has_bitmap_card_field = self.def.bitmap_card_field.is_some();
             let first = &rows[0];
             let uniform = first.shape_arc().is_some_and(|fs| {
                 rows[1..]
                     .iter()
                     .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs)))
             });
+
+            if !self.def.unique {
+                const NULL_CELL: &Cell = &Cell::Null;
+                let build_posting =
+                    |key: &IndexKey, sv: smallvec::SmallVec<[usize; 2]>| -> PostingList {
+                        let key_has_bool = has_bitmap_card_field
+                            && key
+                                .0
+                                .first()
+                                .is_some_and(|p| matches!(p, IndexPart::Bool(_)));
+                        let m = sv.len();
+                        let max_pos = *sv.last().unwrap_or(&0);
+                        if sample_force_bitmap
+                            || key_has_bool
+                            || (m >= 32 && max_pos <= m.saturating_mul(256))
+                        {
+                            PostingList::Bitmap(BitSet::from_sorted_unique(&sv))
+                        } else {
+                            PostingList::Standard(sv)
+                        }
+                    };
+
+                let mut groups: FxHashMap<IndexKey, smallvec::SmallVec<[usize; 2]>> =
+                    FxHashMap::default();
+                let flush_group =
+                    |groups: &mut FxHashMap<IndexKey, smallvec::SmallVec<[usize; 2]>>,
+                     key: IndexKey,
+                     sv: smallvec::SmallVec<[usize; 2]>| {
+                        groups
+                            .entry(key)
+                            .and_modify(|v| v.extend_from_slice(&sv))
+                            .or_insert(sv);
+                    };
+
+                let mut entries: Vec<(IndexKey, PostingList)> = if uniform {
+                    let fshape = first.shape_arc().unwrap();
+                    match self.def.fields.as_slice() {
+                        [f0] => {
+                            let p0 = fshape.position(f0);
+                            let mut slots: [Option<(
+                                &Cell,
+                                IndexKey,
+                                smallvec::SmallVec<[usize; 2]>,
+                            )>; 4] = [None, None, None, None];
+                            let mut order = [0usize, 1, 2, 3];
+                            let mut cache_len = 0usize;
+
+                            'row1: for (i, row) in rows.iter().enumerate() {
+                                let pos = start + i;
+                                let c0 = p0.map_or(NULL_CELL, |p| &row.cells_slice()[p]);
+                                for r in 0..cache_len {
+                                    let slot_idx = order[r];
+                                    let (sc0, _, sv) = slots[slot_idx].as_mut().unwrap();
+                                    if cells_eq_fast(sc0, c0) {
+                                        sv.push(pos);
+                                        if r > 0 {
+                                            order.copy_within(0..r, 1);
+                                            order[0] = slot_idx;
+                                        }
+                                        continue 'row1;
+                                    }
+                                }
+                                let key = IndexKey(smallvec::smallvec![cell_part(c0)]);
+                                for r in 0..cache_len {
+                                    let slot_idx = order[r];
+                                    let (sc0, sk, sv) = slots[slot_idx].as_mut().unwrap();
+                                    if *sk == key {
+                                        *sc0 = c0;
+                                        sv.push(pos);
+                                        if r > 0 {
+                                            order.copy_within(0..r, 1);
+                                            order[0] = slot_idx;
+                                        }
+                                        continue 'row1;
+                                    }
+                                }
+                                if cache_len < 4 {
+                                    let slot_idx = order[cache_len];
+                                    slots[slot_idx] =
+                                        Some((c0, key, smallvec::smallvec![pos]));
+                                    order.copy_within(0..cache_len, 1);
+                                    order[0] = slot_idx;
+                                    cache_len += 1;
+                                } else {
+                                    let lru = order[3];
+                                    let (_, ev_key, ev_sv) = slots[lru].take().unwrap();
+                                    flush_group(&mut groups, ev_key, ev_sv);
+                                    slots[lru] = Some((c0, key, smallvec::smallvec![pos]));
+                                    order.copy_within(0..3, 1);
+                                    order[0] = lru;
+                                }
+                            }
+
+                            if groups.is_empty() {
+                                let mut out = Vec::with_capacity(cache_len);
+                                for slot in slots.into_iter().flatten() {
+                                    let (_, key, sv) = slot;
+                                    let posting = build_posting(&key, sv);
+                                    out.push((key, posting));
+                                }
+                                out
+                            } else {
+                                for slot in slots.into_iter().flatten() {
+                                    flush_group(&mut groups, slot.1, slot.2);
+                                }
+                                groups
+                                    .into_iter()
+                                    .map(|(k, sv)| {
+                                        let p = build_posting(&k, sv);
+                                        (k, p)
+                                    })
+                                    .collect()
+                            }
+                        }
+                        [f0, f1] => {
+                            let p0 = fshape.position(f0);
+                            let p1 = fshape.position(f1);
+                            let mut slots: [Option<(
+                                &Cell,
+                                &Cell,
+                                IndexKey,
+                                smallvec::SmallVec<[usize; 2]>,
+                            )>; 4] = [None, None, None, None];
+                            let mut order = [0usize, 1, 2, 3];
+                            let mut cache_len = 0usize;
+
+                            'row2: for (i, row) in rows.iter().enumerate() {
+                                let pos = start + i;
+                                let cells = row.cells_slice();
+                                let c0 = p0.map_or(NULL_CELL, |p| &cells[p]);
+                                let c1 = p1.map_or(NULL_CELL, |p| &cells[p]);
+                                for r in 0..cache_len {
+                                    let slot_idx = order[r];
+                                    let (sc0, sc1, _, sv) = slots[slot_idx].as_mut().unwrap();
+                                    if cells_eq_fast(sc0, c0) && cells_eq_fast(sc1, c1) {
+                                        sv.push(pos);
+                                        if r > 0 {
+                                            order.copy_within(0..r, 1);
+                                            order[0] = slot_idx;
+                                        }
+                                        continue 'row2;
+                                    }
+                                }
+                                let key = IndexKey(smallvec::smallvec![
+                                    cell_part(c0),
+                                    cell_part(c1)
+                                ]);
+                                for r in 0..cache_len {
+                                    let slot_idx = order[r];
+                                    let (sc0, sc1, sk, sv) = slots[slot_idx].as_mut().unwrap();
+                                    if *sk == key {
+                                        *sc0 = c0;
+                                        *sc1 = c1;
+                                        sv.push(pos);
+                                        if r > 0 {
+                                            order.copy_within(0..r, 1);
+                                            order[0] = slot_idx;
+                                        }
+                                        continue 'row2;
+                                    }
+                                }
+                                if cache_len < 4 {
+                                    let slot_idx = order[cache_len];
+                                    slots[slot_idx] =
+                                        Some((c0, c1, key, smallvec::smallvec![pos]));
+                                    order.copy_within(0..cache_len, 1);
+                                    order[0] = slot_idx;
+                                    cache_len += 1;
+                                } else {
+                                    let lru = order[3];
+                                    let (_, _, ev_key, ev_sv) = slots[lru].take().unwrap();
+                                    flush_group(&mut groups, ev_key, ev_sv);
+                                    slots[lru] =
+                                        Some((c0, c1, key, smallvec::smallvec![pos]));
+                                    order.copy_within(0..3, 1);
+                                    order[0] = lru;
+                                }
+                            }
+
+                            if groups.is_empty() {
+                                let mut out = Vec::with_capacity(cache_len);
+                                for slot in slots.into_iter().flatten() {
+                                    let (_, _, key, sv) = slot;
+                                    let posting = build_posting(&key, sv);
+                                    out.push((key, posting));
+                                }
+                                out
+                            } else {
+                                for slot in slots.into_iter().flatten() {
+                                    flush_group(&mut groups, slot.2, slot.3);
+                                }
+                                groups
+                                    .into_iter()
+                                    .map(|(k, sv)| {
+                                        let p = build_posting(&k, sv);
+                                        (k, p)
+                                    })
+                                    .collect()
+                            }
+                        }
+                        fields => {
+                            let positions: smallvec::SmallVec<[Option<usize>; 4]> =
+                                fields.iter().map(|f| fshape.position(f)).collect();
+                            let mut slots: [Option<(
+                                IndexKey,
+                                smallvec::SmallVec<[usize; 2]>,
+                            )>; 4] = [None, None, None, None];
+                            let mut order = [0usize, 1, 2, 3];
+                            let mut cache_len = 0usize;
+
+                            'row_n: for (i, row) in rows.iter().enumerate() {
+                                let pos = start + i;
+                                let cells = row.cells_slice();
+                                let mut parts =
+                                    smallvec::SmallVec::with_capacity(positions.len());
+                                for &p_opt in &positions {
+                                    parts.push(cell_part(p_opt.map_or(NULL_CELL, |p| &cells[p])));
+                                }
+                                let key = IndexKey(parts);
+                                for r in 0..cache_len {
+                                    let slot_idx = order[r];
+                                    let (sk, sv) = slots[slot_idx].as_mut().unwrap();
+                                    if *sk == key {
+                                        sv.push(pos);
+                                        if r > 0 {
+                                            order.copy_within(0..r, 1);
+                                            order[0] = slot_idx;
+                                        }
+                                        continue 'row_n;
+                                    }
+                                }
+                                if cache_len < 4 {
+                                    let slot_idx = order[cache_len];
+                                    slots[slot_idx] = Some((key, smallvec::smallvec![pos]));
+                                    order.copy_within(0..cache_len, 1);
+                                    order[0] = slot_idx;
+                                    cache_len += 1;
+                                } else {
+                                    let lru = order[3];
+                                    let (ev_key, ev_sv) = slots[lru].take().unwrap();
+                                    flush_group(&mut groups, ev_key, ev_sv);
+                                    slots[lru] = Some((key, smallvec::smallvec![pos]));
+                                    order.copy_within(0..3, 1);
+                                    order[0] = lru;
+                                }
+                            }
+
+                            if groups.is_empty() {
+                                let mut out = Vec::with_capacity(cache_len);
+                                for slot in slots.into_iter().flatten() {
+                                    let (key, sv) = slot;
+                                    let posting = build_posting(&key, sv);
+                                    out.push((key, posting));
+                                }
+                                out
+                            } else {
+                                for slot in slots.into_iter().flatten() {
+                                    flush_group(&mut groups, slot.0, slot.1);
+                                }
+                                groups
+                                    .into_iter()
+                                    .map(|(k, sv)| {
+                                        let p = build_posting(&k, sv);
+                                        (k, p)
+                                    })
+                                    .collect()
+                            }
+                        }
+                    }
+                } else {
+                    let mut slots: [Option<(IndexKey, smallvec::SmallVec<[usize; 2]>)>; 4] =
+                        [None, None, None, None];
+                    let mut order = [0usize, 1, 2, 3];
+                    let mut cache_len = 0usize;
+
+                    'row_dyn: for (i, row) in rows.iter().enumerate() {
+                        let pos = start + i;
+                        let key = self.key_of(row);
+                        for r in 0..cache_len {
+                            let slot_idx = order[r];
+                            let (sk, sv) = slots[slot_idx].as_mut().unwrap();
+                            if *sk == key {
+                                sv.push(pos);
+                                if r > 0 {
+                                    order.copy_within(0..r, 1);
+                                    order[0] = slot_idx;
+                                }
+                                continue 'row_dyn;
+                            }
+                        }
+                        if cache_len < 4 {
+                            let slot_idx = order[cache_len];
+                            slots[slot_idx] = Some((key, smallvec::smallvec![pos]));
+                            order.copy_within(0..cache_len, 1);
+                            order[0] = slot_idx;
+                            cache_len += 1;
+                        } else {
+                            let lru = order[3];
+                            let (ev_key, ev_sv) = slots[lru].take().unwrap();
+                            flush_group(&mut groups, ev_key, ev_sv);
+                            slots[lru] = Some((key, smallvec::smallvec![pos]));
+                            order.copy_within(0..3, 1);
+                            order[0] = lru;
+                        }
+                    }
+
+                    if groups.is_empty() {
+                        let mut out = Vec::with_capacity(cache_len);
+                        for slot in slots.into_iter().flatten() {
+                            let (key, sv) = slot;
+                            let posting = build_posting(&key, sv);
+                            out.push((key, posting));
+                        }
+                        out
+                    } else {
+                        for slot in slots.into_iter().flatten() {
+                            flush_group(&mut groups, slot.0, slot.1);
+                        }
+                        groups
+                            .into_iter()
+                            .map(|(k, sv)| {
+                                let p = build_posting(&k, sv);
+                                (k, p)
+                            })
+                            .collect()
+                    }
+                };
+
+                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                self.forward = BTreeMap::from_iter(entries);
+                #[cfg(feature = "parallel")]
+                if let Some(ref mut bf) = self.bloom_filter {
+                    for k in self.forward.keys() {
+                        bf.add(k);
+                    }
+                }
+                return Ok(());
+            }
+
+            let mut pairs: Vec<(IndexKey, usize)> = Vec::with_capacity(rows.len());
             if uniform {
                 let fshape = first.shape_arc().unwrap();
                 match self.def.fields.as_slice() {
@@ -832,7 +1169,7 @@ impl LiveIndex {
 
             pairs.sort_unstable();
 
-            if self.def.unique && pairs.windows(2).any(|w| w[0].0 == w[1].0) {
+            if pairs.windows(2).any(|w| w[0].0 == w[1].0) {
                 for (i, row) in rows.iter().enumerate() {
                     let key = self.key_of(row);
                     self.insert_one_slab_key(start + i, row, key, bitmap_sample)?;
@@ -840,44 +1177,17 @@ impl LiveIndex {
                 return Ok(());
             }
 
-            let sample_force_bitmap = bitmap_sample
-                .is_some_and(|(has_bool, count)| has_bool || (count > 0 && count <= 16));
-            let mut entries: Vec<(IndexKey, PostingList)> = Vec::new();
-            let mut iter = pairs.into_iter().peekable();
-            while let Some((key, first_pos)) = iter.next() {
-                let key_has_bool = self.def.bitmap_card_field.is_some()
+            let mut entries: Vec<(IndexKey, PostingList)> = Vec::with_capacity(pairs.len());
+            for (key, first_pos) in pairs {
+                let key_has_bool = has_bitmap_card_field
                     && key
                         .0
                         .first()
                         .is_some_and(|p| matches!(p, IndexPart::Bool(_)));
-                if iter.peek().is_none_or(|(next_k, _)| *next_k != key) {
-                    let posting = if sample_force_bitmap || key_has_bool {
-                        let mut set = BitSet::new((first_pos + 1).max(64));
-                        set.insert(first_pos);
-                        PostingList::Bitmap(set)
-                    } else {
-                        PostingList::Standard(smallvec::smallvec![first_pos])
-                    };
-                    entries.push((key, posting));
-                    continue;
-                }
-                let mut sv: smallvec::SmallVec<[usize; 2]> = smallvec::smallvec![first_pos];
-                while let Some((_, pos)) = iter.next_if(|(next_k, _)| *next_k == key) {
-                    sv.push(pos);
-                }
-                let m = sv.len();
-                let max_pos = *sv.last().unwrap_or(&0);
-                let posting = if sample_force_bitmap
-                    || key_has_bool
-                    || (m >= 32 && max_pos <= m.saturating_mul(256))
-                {
-                    let mut set = BitSet::new(max_pos + 1);
-                    for &p in &sv {
-                        set.insert(p);
-                    }
-                    PostingList::Bitmap(set)
+                let posting = if sample_force_bitmap || key_has_bool {
+                    PostingList::Bitmap(BitSet::from_sorted_unique(&[first_pos]))
                 } else {
-                    PostingList::Standard(sv)
+                    PostingList::Standard(smallvec::smallvec![first_pos])
                 };
                 entries.push((key, posting));
             }
@@ -1238,44 +1548,57 @@ impl LiveIndex {
         while hi.len() < arity {
             hi.push(IndexPart::Max);
         }
+        let mut exclude_lo = false;
+        let mut exclude_hi = false;
         if let Some((field, op, val)) = &use_.range
             && let Some(pos) = self.def.fields.iter().position(|f| f == field)
         {
+            let lower = matches!(op, CmpOp::Gt | CmpOp::Ge);
             let p = value_part(val, now);
-            match op {
-                CmpOp::Gt => {
-                    lo[pos] = p.clone();
-                    lo[pos + 1..].fill(IndexPart::Max);
+            if !lower {
+                // Null has no numeric value and must not enter a covered range.
+                lo[pos] = match p {
+                    IndexPart::Num(_, _) => IndexPart::Num(0, i32::MIN),
+                    IndexPart::Time(_) => IndexPart::Time(i64::MIN),
+                    _ => lo[pos].clone(),
+                };
+            }
+            for (op, value) in std::iter::once((*op, val))
+                .chain(use_.opposite_bound.iter().map(|(op, value)| (*op, value)))
+            {
+                match op {
+                    CmpOp::Gt | CmpOp::Ge => {
+                        lo[pos] = value_part(value, now);
+                        exclude_lo = op == CmpOp::Gt;
+                        if exclude_lo {
+                            lo[pos + 1..].fill(IndexPart::Max);
+                        }
+                    }
+                    CmpOp::Lt | CmpOp::Le => {
+                        hi[pos] = value_part(value, now);
+                        exclude_hi = op == CmpOp::Lt;
+                        if exclude_hi {
+                            hi[pos + 1..].fill(IndexPart::Min);
+                        }
+                    }
+                    CmpOp::Eq | CmpOp::Ne => {}
                 }
-                CmpOp::Ge => lo[pos] = p.clone(),
-                CmpOp::Lt => {
-                    hi[pos] = p.clone();
-                    hi[pos + 1..].fill(IndexPart::Min);
-                    // Null has no numeric value and must not enter a covered range.
-                    lo[pos] = match p {
-                        IndexPart::Num(_, _) => IndexPart::Num(0, i32::MIN),
-                        IndexPart::Time(_) => IndexPart::Time(i64::MIN),
-                        _ => lo[pos].clone(),
-                    };
-                }
-                CmpOp::Le => {
-                    hi[pos] = p.clone();
-                    lo[pos] = match p {
-                        IndexPart::Num(_, _) => IndexPart::Num(0, i32::MIN),
-                        IndexPart::Time(_) => IndexPart::Time(i64::MIN),
-                        _ => lo[pos].clone(),
-                    };
-                }
-                CmpOp::Eq | CmpOp::Ne => {}
             }
         }
-        let start = match &use_.range {
-            Some((_, CmpOp::Gt, _)) => Bound::Excluded(IndexKey(lo)),
-            _ => Bound::Included(IndexKey(lo)),
+        // BTreeMap::range panics on reversed bounds and on equal excluded bounds.
+        if lo > hi || (lo == hi && (exclude_lo || exclude_hi)) {
+            let empty = IndexKey(smallvec::smallvec![IndexPart::Max]);
+            return (Bound::Included(empty.clone()), Bound::Included(empty));
+        }
+        let start = if exclude_lo {
+            Bound::Excluded(IndexKey(lo))
+        } else {
+            Bound::Included(IndexKey(lo))
         };
-        let end = match &use_.range {
-            Some((_, CmpOp::Lt, _)) => Bound::Excluded(IndexKey(hi)),
-            _ => Bound::Included(IndexKey(hi)),
+        let end = if exclude_hi {
+            Bound::Excluded(IndexKey(hi))
+        } else {
+            Bound::Included(IndexKey(hi))
         };
         (start, end)
     }
@@ -1416,14 +1739,14 @@ impl LiveIndex {
     pub fn seek_ordered_limit(&self, use_: &IndexUse, now: i64, desc: bool, mut f: impl FnMut(usize) -> bool) {
         if let Some(key) = self.exact_eq_key(use_, now) {
             if let Some(list) = self.lookup_exact(&key) {
-                let _ = list.for_each_ordered(desc, &mut f);
+                let _ = list.for_each_ordered(false, &mut f);
             }
             return;
         }
         let (start, end) = self.bounds(use_, now);
         if desc {
             for (_, list) in self.forward.range((start, end)).rev() {
-                if !list.for_each_ordered(true, &mut f) {
+                if !list.for_each_ordered(false, &mut f) {
                     break;
                 }
             }
@@ -1473,6 +1796,20 @@ fn numeric_part(n: f64, integer: Option<i64>) -> IndexPart {
 }
 
 #[inline(always)]
+fn cells_eq_fast(a: &Cell, b: &Cell) -> bool {
+    match (a, b) {
+        (Cell::SmallText(x), Cell::SmallText(y)) => x == y,
+        (Cell::Int(x), Cell::Int(y)) => *x == *y,
+        (Cell::Time(x), Cell::Time(y)) => *x == *y,
+        (Cell::Bool(x), Cell::Bool(y)) => *x == *y,
+        (Cell::Text(x), Cell::Text(y)) => Arc::ptr_eq(x, y) || x == y,
+        (Cell::Null, Cell::Null) => true,
+        (Cell::Float(x), Cell::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
+    }
+}
+
+#[inline(always)]
 fn cell_part(c: &Cell) -> IndexPart {
     match c {
         Cell::Null => IndexPart::Null,
@@ -1519,13 +1856,33 @@ fn value_part(v: &Value, now: i64) -> IndexPart {
     }
 }
 
-/// Simple bitset using Vec<u64> - no external dependency required
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Simple bitset using Vec<u64> - no external dependency required.
+///
+/// Maintains exact `len` in `O(1)` across all single-element and bulk operations so
+/// `count()` and `is_empty()` are 1-instruction `O(1)`.
+#[derive(Debug, Clone)]
 pub struct BitSet {
     bits: Vec<u64>,
     capacity: usize,
-    count: usize,
+    len: usize,
 }
+
+impl PartialEq for BitSet {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        let common = self.bits.len().min(other.bits.len());
+        if self.bits[..common] != other.bits[..common] {
+            return false;
+        }
+        self.bits[common..].iter().all(|&w| w == 0)
+            && other.bits[common..].iter().all(|&w| w == 0)
+    }
+}
+
+impl Eq for BitSet {}
 
 impl BitSet {
     pub fn new(capacity: usize) -> Self {
@@ -1533,7 +1890,60 @@ impl BitSet {
         Self {
             bits: vec![0u64; num_words],
             capacity,
-            count: 0,
+            len: 0,
+        }
+    }
+
+    /// Build a `BitSet` in one word-coalesced pass from strictly ascending, unique positions.
+    #[inline]
+    pub fn from_sorted_unique(positions: &[usize]) -> Self {
+        let Some(&max_pos) = positions.last() else {
+            return Self::new(0);
+        };
+        let capacity = (max_pos + 1).max(64);
+        let num_words = capacity.div_ceil(64);
+        let mut bits = vec![0u64; num_words];
+        let mut cur_word_idx = positions[0] >> 6;
+        let mut cur_word = 0u64;
+        for &pos in positions {
+            let w = pos >> 6;
+            if w != cur_word_idx {
+                bits[cur_word_idx] = cur_word;
+                cur_word_idx = w;
+                cur_word = 0;
+            }
+            cur_word |= 1u64 << (pos & 63);
+        }
+        bits[cur_word_idx] = cur_word;
+        Self {
+            bits,
+            capacity,
+            len: positions.len(),
+        }
+    }
+
+    /// Build a `BitSet` from arbitrary positions bounded by `max_pos` (`pos <= max_pos`).
+    #[inline]
+    pub fn from_positions(positions: &[usize], max_pos: usize) -> Self {
+        if positions.is_empty() {
+            return Self::new(0);
+        }
+        let capacity = (max_pos + 1).max(64);
+        let num_words = capacity.div_ceil(64);
+        let mut bits = vec![0u64; num_words];
+        let mut len = 0usize;
+        for &pos in positions {
+            let w = pos >> 6;
+            let mask = 1u64 << (pos & 63);
+            if (bits[w] & mask) == 0 {
+                bits[w] |= mask;
+                len += 1;
+            }
+        }
+        Self {
+            bits,
+            capacity,
+            len,
         }
     }
 
@@ -1551,7 +1961,7 @@ impl BitSet {
         let mask = 1u64 << bit_idx;
         if (self.bits[word_idx] & mask) == 0 {
             self.bits[word_idx] |= mask;
-            self.count += 1;
+            self.len += 1;
         }
     }
 
@@ -1565,7 +1975,7 @@ impl BitSet {
         let mask = 1u64 << bit_idx;
         if (self.bits[word_idx] & mask) != 0 {
             self.bits[word_idx] &= !mask;
-            self.count -= 1;
+            self.len -= 1;
         }
     }
 
@@ -1585,17 +1995,17 @@ impl BitSet {
         (self.bits[word_idx] & (1u64 << bit_idx)) != 0
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn count(&self) -> usize {
-        self.count
+        self.len
     }
 
     /// Append set positions directly into destination vector without intermediate allocations
     pub fn extend_into(&self, out: &mut Vec<usize>) {
-        if self.count == 0 {
+        if self.len == 0 {
             return;
         }
-        out.reserve(self.count);
+        out.reserve(self.len);
         for (word_idx, &word) in self.bits.iter().enumerate() {
             if word == 0 {
                 continue;
@@ -1604,10 +2014,7 @@ impl BitSet {
             let mut w = word;
             while w != 0 {
                 let bit_idx = w.trailing_zeros() as usize;
-                let pos = base_pos + bit_idx;
-                if pos < self.capacity {
-                    out.push(pos);
-                }
+                out.push(base_pos + bit_idx);
                 w &= w - 1;
             }
         }
@@ -1615,7 +2022,7 @@ impl BitSet {
 
     /// Invoke closure for each set position without allocating vectors
     pub fn for_each(&self, mut f: impl FnMut(usize)) {
-        if self.count == 0 {
+        if self.len == 0 {
             return;
         }
         for (word_idx, &word) in self.bits.iter().enumerate() {
@@ -1626,10 +2033,7 @@ impl BitSet {
             let mut w = word;
             while w != 0 {
                 let bit_idx = w.trailing_zeros() as usize;
-                let pos = base_pos + bit_idx;
-                if pos < self.capacity {
-                    f(pos);
-                }
+                f(base_pos + bit_idx);
                 w &= w - 1;
             }
         }
@@ -1637,7 +2041,7 @@ impl BitSet {
 
     /// Invoke closure in ascending or descending position order, stopping early when `f` returns `false`.
     pub fn for_each_ordered(&self, desc: bool, mut f: impl FnMut(usize) -> bool) -> bool {
-        if self.count == 0 {
+        if self.len == 0 {
             return true;
         }
         if desc {
@@ -1649,8 +2053,7 @@ impl BitSet {
                 let mut w = word;
                 while w != 0 {
                     let bit_idx = 63 - (w.leading_zeros() as usize);
-                    let pos = base_pos + bit_idx;
-                    if pos < self.capacity && !f(pos) {
+                    if !f(base_pos + bit_idx) {
                         return false;
                     }
                     w &= !(1u64 << bit_idx);
@@ -1665,8 +2068,7 @@ impl BitSet {
                 let mut w = word;
                 while w != 0 {
                     let bit_idx = w.trailing_zeros() as usize;
-                    let pos = base_pos + bit_idx;
-                    if pos < self.capacity && !f(pos) {
+                    if !f(base_pos + bit_idx) {
                         return false;
                     }
                     w &= w - 1;
@@ -1678,42 +2080,55 @@ impl BitSet {
 
     /// Convert to Vec<usize> of set positions
     pub fn to_indices(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.count);
+        let mut out = Vec::with_capacity(self.len);
         self.extend_into(&mut out);
         out
     }
 
     /// Bitwise AND (intersection) - modifies self
     pub fn and_assign(&mut self, other: &BitSet) {
-        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
-            *a &= b;
+        if self.len == 0 {
+            return;
         }
-        if self.bits.len() > other.bits.len() {
-            for a in &mut self.bits[other.bits.len()..] {
-                *a = 0;
-            }
+        let common = self.bits.len().min(other.bits.len());
+        let mut new_len = 0usize;
+        for (a, &b) in self.bits[..common].iter_mut().zip(&other.bits[..common]) {
+            let w = *a & b;
+            *a = w;
+            new_len += w.count_ones() as usize;
         }
-        self.count = self.bits.iter().map(|w| w.count_ones() as usize).sum();
+        if self.len > new_len && self.bits.len() > common {
+            self.bits[common..].fill(0);
+        }
+        self.len = new_len;
     }
 
     /// Bitwise OR (union) - modifies self
     pub fn or_assign(&mut self, other: &BitSet) {
+        if other.len == 0 {
+            return;
+        }
         if other.bits.len() > self.bits.len() {
             self.bits.resize(other.bits.len(), 0);
         }
         if other.capacity > self.capacity {
             self.capacity = other.capacity;
         }
-        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
-            *a |= b;
+        let mut delta = 0usize;
+        for (a, &b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            if b != 0 {
+                let added = b & !*a;
+                *a |= b;
+                delta += added.count_ones() as usize;
+            }
         }
-        self.count = self.bits.iter().map(|w| w.count_ones() as usize).sum();
+        self.len += delta;
     }
 
     /// Check if any bits are set
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.len == 0
     }
 
     /// Check if all bits would be within capacity
@@ -1880,6 +2295,7 @@ fn pick_conjunct_atoms(indexes: &[&IndexDef], atoms: &[std::borrow::Cow<'_, Pred
         }
         let mut eqs = Vec::new();
         let mut range = None;
+        let mut opposite_bound = None;
         let mut n = 0usize;
         for field in &def.fields {
             if let Some(v) = find_eq_atoms(atoms, field) {
@@ -1889,14 +2305,35 @@ fn pick_conjunct_atoms(indexes: &[&IndexDef], atoms: &[std::borrow::Cow<'_, Pred
             }
             if let Some((op, v)) = find_range_atoms(atoms, field) {
                 range = Some((field.clone(), op, v.clone()));
+                opposite_bound = atoms.iter().find_map(|atom| match atom.as_ref() {
+                    Pred::Cmp {
+                        field: other,
+                        op: other_op,
+                        value,
+                    } if other.as_cow_str().as_ref() == field
+                        && matches!(op, CmpOp::Gt | CmpOp::Ge)
+                            != matches!(other_op, CmpOp::Gt | CmpOp::Ge)
+                        && matches!(other_op, CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le)
+                        && matches!(
+                            (v, value),
+                            (Value::Int(_), Value::Int(_))
+                                | (Value::Timestamp(_), Value::Timestamp(_))
+                        ) =>
+                    {
+                        Some((*other_op, value.clone()))
+                    }
+                    _ => None,
+                });
+
                 n += 1;
             }
             break;
         }
-        if n == 0 {
-            continue;
-        }
-        if eqs.is_empty() && def.fields.len() > 1 {
+        if n == 0
+            || (eqs.is_empty()
+                && def.fields.len() > 1
+                && !matches!(range, Some((_, _, Value::Int(_) | Value::Timestamp(_)))))
+        {
             continue;
         }
         if n > best_n {
@@ -1905,6 +2342,7 @@ fn pick_conjunct_atoms(indexes: &[&IndexDef], atoms: &[std::borrow::Cow<'_, Pred
                 def: (*def).clone(),
                 eqs,
                 range,
+                opposite_bound,
             });
         }
     }
@@ -1961,7 +2399,13 @@ fn index_covers_atoms(atoms: &[std::borrow::Cow<'_, Pred>], use_: &IndexUse) -> 
                 let Some((rf, rop, rv)) = &use_.range else {
                     return false;
                 };
-                if rf.as_str() != field.as_cow_str().as_ref() || rop != op || rv != value {
+                if rf.as_str() != field.as_cow_str().as_ref()
+                    || ((rop, rv) != (op, value)
+                        && !use_
+                            .opposite_bound
+                            .as_ref()
+                            .is_some_and(|(o, v)| (o, v) == (op, value)))
+                {
                     return false;
                 }
             }
@@ -2559,9 +3003,115 @@ mod bitmap_sample_once_tests {
             def: index.def.clone(),
             eqs: vec![("wing".into(), Value::String(Arc::from("rag")))],
             range: None,
+            opposite_bound: None,
         };
         assert_eq!(index.seek_count(&use_, 0), 5_000);
         index.swap_remove_rows(0, &rows[0], 9_999, &rows[9_999]);
         assert_eq!(index.seek_count(&use_, 0), 4_999);
+    }
+
+    #[test]
+    fn bulk_slab_no_reverse_mru_cache_matches_reference_across_cardinalities_and_arities() {
+        for arity in [1usize, 2, 3] {
+            let fields: Vec<String> = match arity {
+                1 => vec!["wing".into()],
+                2 => vec!["wing".into(), "ts".into()],
+                _ => vec!["wing".into(), "ts".into(), "tier".into()],
+            };
+            for card in [1usize, 2, 3, 4, 8, 64, 500] {
+                let rows: Vec<Row> = (0..1_000)
+                    .map(|i| {
+                        let k = i % card;
+                        Row::from([
+                            ("wing", Cell::from_text(format!("w{}", k % 5))),
+                            ("ts", Cell::Time(1_700_000_000 + (k as i64) * 10)),
+                            ("tier", Cell::Int((k / 2) as i64)),
+                        ])
+                    })
+                    .collect();
+
+                let def = IndexDef {
+                    collection: "docs".into(),
+                    unique: false,
+                    fields: fields.clone(),
+                    pred: None,
+                    bitmap_card_field: None,
+                };
+                let mut fast = LiveIndex::new(def.clone());
+                fast.insert_slab_batch_no_reverse(10, &rows).unwrap();
+
+                let mut reference = LiveIndex::new(def);
+                reference.insert_slab_batch_reference(10, &rows).unwrap();
+
+                assert_eq!(fast.forward.len(), reference.forward.len());
+                for ((ka, la), (kb, lb)) in fast.forward.iter().zip(reference.forward.iter()) {
+                    assert_eq!(ka, kb);
+                    assert_eq!(la.to_indices(), lb.to_indices());
+                }
+            }
+        }
+
+        // Cross-variant numeric key equivalence (`Cell::Int(5)` vs `Cell::Float(5.0)`).
+        let mixed_rows: Vec<Row> = (0..128)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Row::from([("v", Cell::Int((i % 3) as i64))])
+                } else {
+                    Row::from([("v", Cell::Float((i % 3) as f64))])
+                }
+            })
+            .collect();
+        let def = IndexDef {
+            collection: "nums".into(),
+            unique: false,
+            fields: vec!["v".into()],
+            pred: None,
+            bitmap_card_field: None,
+        };
+        let mut fast = LiveIndex::new(def.clone());
+        fast.insert_slab_batch_no_reverse(0, &mixed_rows).unwrap();
+        let mut reference = LiveIndex::new(def);
+        reference.insert_slab_batch_reference(0, &mixed_rows).unwrap();
+        assert_eq!(fast.forward.len(), 3);
+        for ((ka, la), (kb, lb)) in fast.forward.iter().zip(reference.forward.iter()) {
+            assert_eq!(ka, kb);
+            assert_eq!(la.to_indices(), lb.to_indices());
+        }
+    }
+
+    #[test]
+    fn bitset_o1_len_and_trailing_zero_equality() {
+        let mut a = BitSet::new(64);
+        let mut b = BitSet::new(4096);
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+        assert_eq!(a, b);
+
+        a.insert(5);
+        a.insert(63);
+        b.insert(5);
+        b.insert(63);
+        assert_eq!(a.count(), 2);
+        assert_eq!(b.count(), 2);
+        assert_eq!(a, b);
+
+        b.insert(2048);
+        assert_ne!(a, b);
+        b.remove(2048);
+        assert_eq!(b.count(), 2);
+        assert_eq!(a, b);
+
+        let c = BitSet::from_sorted_unique(&[5, 63, 130, 500]);
+        assert_eq!(c.count(), 4);
+        assert_eq!(c.to_indices(), vec![5, 63, 130, 500]);
+
+        let mut u = a.clone();
+        u.or_assign(&c);
+        assert_eq!(u.count(), 4);
+        assert_eq!(u, c);
+
+        u.and_assign(&a);
+        assert_eq!(u.count(), 2);
+        assert_eq!(u, a);
     }
 }
