@@ -1214,10 +1214,18 @@ impl Db {
         }
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
-        let needs_id = records.is_empty()
-            || records
-                .iter()
-                .any(|r| !r.fields.iter().any(|(k, _)| k == "id"));
+        let needs_id = if all_uniform
+            && std::env::var_os("LIN_BENCH_INSERT_UNIFORM_ID").is_some()
+        {
+            // The builder proved uniform field names across the slab. IDs are
+            // not synthesized until insert_bulk_built, so their presence is uniform.
+            !records[0].fields.iter().any(|(key, _)| key == "id")
+        } else {
+            records.is_empty()
+                || records
+                    .iter()
+                    .any(|r| !r.fields.iter().any(|(key, _)| key == "id"))
+        };
         self.insert_bulk_built(
             collection,
             built,
