@@ -265,3 +265,17 @@ Matched sampling within each transaction. Columns show median per-process mean m
 | Neoverse-N2 arm64 | thp | 0.160 | 0.160 | 1.341 | 0.924 |
 
 [Raw sampled intervals and host identities](https://github.com/themoretheless/lin/actions/runs/45826400045)
+
+## Output buffer allocation and write on 100k inserts
+
+Diagnostic build 79eeb10c6 sampled 625 rows in each 10k statement. Each cell is microseconds per sampled row, aggregated within a process before taking the median across eight processes. Repeats pool the next two transactions in the same process. Allocation includes Arc header initialization and any first-touch work during that interval. Write includes acquiring unique access and copying the payload. Worker timings overlap across threads.
+
+| CPU / runner | First allocation default / THP | First write default / THP | Repeat allocation default / THP | Repeat write default / THP |
+|---|---:|---:|---:|---:|
+| EPYC 7763 amd-1 | 4.757 / 2.595 | 0.148 / 0.135 | 1.680 / 1.280 | 0.209 / 0.188 |
+| EPYC 9V74 amd-2 | 3.906 / 1.844 | 0.112 / 0.100 | 1.489 / 1.212 | 0.186 / 0.167 |
+| EPYC 7763 amd-3 | 4.875 / 2.538 | 0.146 / 0.131 | 1.687 / 1.780 | 0.193 / 0.182 |
+| EPYC 7763 amd-4 | 4.899 / 2.493 | 0.148 / 0.130 | 1.655 / 1.762 | 0.207 / 0.187 |
+| Neoverse-N2 arm64 | 2.215 / 1.305 | 0.087 / 0.099 | 0.802 / 0.893 | 0.123 / 0.115 |
+
+[Run and raw samples](https://github.com/themoretheless/lin/actions/runs/45827839411)
