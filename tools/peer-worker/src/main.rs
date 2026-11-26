@@ -126,6 +126,8 @@ fn measure_insert(
     let mut usage = Vec::<Value>::new();
     #[cfg(target_os = "linux")]
     let profile_usage = std::env::var_os("LIN_BENCH_INSERT_RUSAGE").is_some();
+    let profile_stages = std::env::var_os("LIN_BENCH_INSERT_STAGES").is_some();
+    let mut stages = Vec::new();
     for _ in 0..samples {
         let open = Instant::now();
         let mut db = match durable {
@@ -148,12 +150,19 @@ fn measure_insert(
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
         } else {
+            let mut boundaries = Vec::with_capacity(if profile_stages { prepared.len() + 2 } else { 0 });
             let mut tx = db.transaction()?;
+            if profile_stages { boundaries.push(start.elapsed().as_nanos() as u64); }
             let mut affected = 0;
             for statement in &prepared {
                 affected += black_box(tx.run_prepared(statement)?).done.n;
+                if profile_stages { boundaries.push(start.elapsed().as_nanos() as u64); }
             }
             tx.commit()?;
+            if profile_stages {
+                boundaries.push(start.elapsed().as_nanos() as u64);
+                stages.push(boundaries);
+            }
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
@@ -224,7 +233,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result, "insert_usage": usage, "reopen_ns":reopen_ns, "wal_bytes":wal_bytes, "open_ns":open_ns, "embedding_hash":embedding_hash,
+    Ok(json!({"samples_ns":timings,"result":result, "insert_usage": usage, "stage_end_ns":stages, "reopen_ns":reopen_ns, "wal_bytes":wal_bytes, "open_ns":open_ns, "embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }

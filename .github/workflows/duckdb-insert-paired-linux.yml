@@ -58,13 +58,9 @@ jobs:
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
           python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
-      - name: Compare WAL type checks on the same host
+      - name: Profile transaction boundaries in fresh processes
         if: steps.cpu.outputs.matched == 'true'
-        run: |
-          cp target/release/lin-peer-worker "$RUNNER_TEMP/candidate-worker"
-          git worktree add --detach "$RUNNER_TEMP/base" cfb65367b
-          (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
-          python3 scripts/profile-build-workers.py "$RUNNER_TEMP/base/target/release/lin-peer-worker" "$RUNNER_TEMP/candidate-worker" > build-workers.json
+        run: python3 scripts/profile-insert-stages.py target/release/lin-peer-worker > stages.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -76,4 +72,4 @@ jobs:
             duckdb-results.json
             duckdb-summary.txt
             duckdb-provenance.txt
-            build-workers.json
+            stages.json
