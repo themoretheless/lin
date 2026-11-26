@@ -279,3 +279,12 @@ Diagnostic build 79eeb10c6 sampled 625 rows in each 10k statement. Each cell is 
 | Neoverse-N2 arm64 | 2.215 / 1.305 | 0.087 / 0.099 | 0.802 / 0.893 | 0.123 / 0.115 |
 
 [Run and raw samples](https://github.com/themoretheless/lin/actions/runs/45827839411)
+
+## Huge pages and repeat latency within Lin
+
+In two independent runs, all eight host/run medians showed slower 10k repeats and faster 100k repeats when glibc requested huge pages for Lin. For each trial, subtract the default Lin median of four repeats from the corresponding THP median. Positive differences mean THP took longer. The ranges span the four host medians in each run.
+
+| Run | Repeat 10k difference (ms) | THP slower, 10k | Repeat 100k difference (ms) | THP slower, 100k |
+|---|---:|---:|---:|---:|
+| [45786610712](https://github.com/themoretheless/lin/actions/runs/45786610712) | +0.272 to +0.541 | 74/100 | −4.906 to −0.860 | 25/100 |
+| [45821850933](https://github.com/themoretheless/lin/actions/runs/45821850933) | +0.242 to +0.473 | 73/100 | −4.356 to −1.693 | 20/100 |
