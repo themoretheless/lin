@@ -463,3 +463,21 @@ Attempt 2 on the identical revision reproduced the repeat 100k improvement again
 | Neoverse-N2 | −13.48 / −15.77 | −18.71 / −18.50 | −121.85 / −145.90 | −160.72 / −161.50 |
 
 Values are paired Lin minus DuckDB milliseconds, default / THP. The default first 100k lost all 25 EPYC pairs. Lin won all 200 THP pairs. [Independent repeat](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/2).
+
+## Cold-start CPU and page faults of the inline FTS candidate
+
+For each fresh Lin process, subtract the mean of its two repeat 100k transactions from its first 100k transaction. The table shows medians of eight within-process differences under default Linux page settings. System and user CPU accumulate across threads and cannot be added to elapsed time. The benchmark recorded zero major faults across all 168 transactions.
+
+| Attempt / runner | CPU | Extra wall ms | Extra system CPU ms | Extra user CPU ms | Extra minor faults |
+|---|---|---:|---:|---:|---:|
+| 1 / amd-1 | EPYC 9V45 | 21.11 | 68.08 | −6.35 | 39,715 |
+| 1 / amd-2 | EPYC 9V45 | 17.49 | 73.63 | −20.01 | 39,985 |
+| 1 / amd-3 | EPYC 7763 | 84.45 | 249.49 | 36.11 | 44,683 |
+| 1 / amd-4 | EPYC 9V74 | 70.78 | 199.63 | 31.47 | 44,819 |
+| 1 / arm64 | Neoverse-N2 | 40.23 | 137.34 | −6.00 | 40,961 |
+| 2 / amd-1 | EPYC 7763 | 85.44 | 234.79 | 54.56 | 44,348 |
+| 2 / arm64 | Neoverse-N2 | 36.94 | 130.43 | −4.97 | 41,297 |
+
+The two 7763 measurements reproduce an 84–85 ms first-transaction penalty within Lin. Relative to the two 9V45 hosts, the 7763 incurred about 11–13% more extra minor faults but over three times as much extra system CPU. These process counters cannot distinguish time servicing faults from other kernel work. A kernel CPU profile during row construction on the 7763 would distinguish first-touch page allocation from allocator synchronization and scheduling costs.
+
+[Attempt 1 samples](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/1) and [attempt 2 samples](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/2), file `build-workers.json` in each matched runner artifact.
