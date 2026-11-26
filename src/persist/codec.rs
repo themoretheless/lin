@@ -707,7 +707,7 @@ pub(crate) fn prepare_insert_columns_ext(
         collection,
         rows,
         uniform_keys,
-        dictionary_writer_enabled(),
+        dictionary_writer_enabled(rows.len()),
         &mut bytes,
     ) {
         let n = rows.len() as u32;
@@ -994,7 +994,7 @@ fn encode_insert_cols_v2_at(
                             .flatten()
                             .fold(0usize, |n, emb| n.saturating_add(emb.len()))
                             >= 2 * 1024 * 1024;
-                        if dictionary_writer_enabled() {
+                        if dictionary_writer_enabled(v.len()) {
                             buf.push(8);
                             let payload_start = buf.len();
                             let (_, exact_sparse_bytes) = append_dictionary_rows_counted(
@@ -1022,7 +1022,7 @@ fn encode_insert_cols_v2_at(
                             }
                         }
                         wrote_sparse = true;
-                    } else if dictionary_writer_enabled() {
+                    } else if dictionary_writer_enabled(v.len()) {
                         let mark = buf.len();
                         buf.push(8);
                         let payload_start = buf.len();
@@ -1133,11 +1133,18 @@ fn encode_insert_cols_v2_at(
     })
 }
 
-/// Whether new WAL frames may use the dictionary vector codec (codec 5, column tag 8).
-/// Off by default: a reader built before the codec refuses such frames, so it may only
-/// be turned on once every consumer of the log (followers, backup tools, the previous
-/// release kept for rollback) can read it.
-static DICTIONARY_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+const DICTIONARY_AUTO: u8 = 2;
+static DICTIONARY_WRITER: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DICTIONARY_AUTO);
+
+#[inline]
+fn dictionary_policy_allows(policy: u8, rows: usize) -> bool {
+    match policy {
+        DICTIONARY_AUTO => cfg!(target_os = "linux")
+            && (cfg!(target_arch = "x86_64") || (cfg!(target_arch = "aarch64") && rows >= 4096)),
+        _ => policy == 1,
+    }
+}
 
 thread_local! {
     /// Per-thread override of [`DICTIONARY_WRITER`], so a test can exercise the writer
@@ -1150,12 +1157,13 @@ thread_local! {
 /// previous setting. Frames already written stay readable either way. Experimental: see
 /// `docs/wal-dictionary.md` for what must hold before turning it on.
 pub fn set_wal_dictionary_writer(enabled: bool) -> bool {
-    DICTIONARY_WRITER.swap(enabled, std::sync::atomic::Ordering::Relaxed)
+    let previous = DICTIONARY_WRITER.swap(u8::from(enabled), std::sync::atomic::Ordering::Relaxed);
+    dictionary_policy_allows(previous, usize::MAX)
 }
 
-/// Whether [`set_wal_dictionary_writer`] is on.
+/// Whether the process policy allows dictionary encoding for eligible WAL batches.
 pub fn wal_dictionary_writer() -> bool {
-    DICTIONARY_WRITER.load(std::sync::atomic::Ordering::Relaxed)
+    dictionary_policy_allows(DICTIONARY_WRITER.load(std::sync::atomic::Ordering::Relaxed), usize::MAX)
 }
 
 #[cfg(test)]
@@ -1182,10 +1190,15 @@ pub(crate) fn with_dictionary_writer_opt<R>(ovr: Option<bool>, f: impl FnOnce() 
 }
 
 #[inline]
-fn dictionary_writer_enabled() -> bool {
+fn dictionary_writer_enabled(rows: usize) -> bool {
     DICTIONARY_WRITER_OVERRIDE
         .with(std::cell::Cell::get)
-        .unwrap_or_else(wal_dictionary_writer)
+        .unwrap_or_else(|| {
+            dictionary_policy_allows(
+                DICTIONARY_WRITER.load(std::sync::atomic::Ordering::Relaxed),
+                rows,
+            )
+        })
 }
 
 /// Most distinct nonzero bit patterns a dictionary row may carry.
@@ -1802,7 +1815,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
     buf: &mut Vec<u8>,
 ) -> Option<([u8; 4], Vec<String>)> {
     encode_insert_rows_direct_at(
-        0, rec_gen, next_id, collection, rows, uniform_keys, dictionary_writer_enabled(), buf,
+        0, rec_gen, next_id, collection, rows, uniform_keys, dictionary_writer_enabled(rows.len()), buf,
     )
 }
 
