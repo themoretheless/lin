@@ -707,6 +707,7 @@ pub(crate) fn prepare_insert_columns_ext(
         collection,
         rows,
         uniform_keys,
+        dictionary_writer_enabled(),
         &mut bytes,
     ) {
         let n = rows.len() as u32;
@@ -1800,13 +1801,15 @@ pub(crate) fn encode_insert_rows_direct_ext(
     uniform_keys: bool,
     buf: &mut Vec<u8>,
 ) -> Option<([u8; 4], Vec<String>)> {
-    encode_insert_rows_direct_at(0, rec_gen, next_id, collection, rows, uniform_keys, buf)
+    encode_insert_rows_direct_at(
+        0, rec_gen, next_id, collection, rows, uniform_keys, dictionary_writer_enabled(), buf,
+    )
 }
 
 /// Encode snapshot rows directly into `buf` with an in-place 8-byte `LCOL` + `magic` header,
 /// avoiding a second buffer allocation and `memcpy` per chunk.
 pub(super) fn encode_insert_rows_lcol(rows: &[Row], buf: &mut Vec<u8>) -> bool {
-    let Some((magic, _)) = encode_insert_rows_direct_at(8, 0, 0, "", rows, false, buf) else {
+    let Some((magic, _)) = encode_insert_rows_direct_at(8, 0, 0, "", rows, false, false, buf) else {
         return false;
     };
     buf[..4].copy_from_slice(b"LCOL");
@@ -1821,6 +1824,7 @@ fn encode_insert_rows_direct_at(
     collection: &str,
     rows: &[Row],
     uniform_keys: bool,
+    dictionary: bool,
     buf: &mut Vec<u8>,
 ) -> Option<([u8; 4], Vec<String>)> {
     if rows.is_empty() {
@@ -2051,8 +2055,7 @@ fn encode_insert_rows_direct_at(
                     let mut accepted_sparse = false;
                     let mut used_dict = false;
                     let mark = buf.len();
-                    // Snapshot LCOL headers do not support the WAL-only dictionary codec.
-                    let mut try_raw_sparse = start_off != 0 || !dictionary_writer_enabled();
+                    let mut try_raw_sparse = !dictionary;
                     if !try_raw_sparse {
                         let dict_give_up = if has_empty {
                             usize::MAX

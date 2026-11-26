@@ -1341,6 +1341,14 @@ mod dictionary_wal_tests {
                 panic!("rows were not eligible for the direct encoder");
             };
             assert_eq!(magic[3], if dictionary { 5 } else { 3 }, "dictionary={dictionary}");
+            let prepared = with_dictionary_writer(dictionary, || {
+                prepare_insert_columns(1, 2, "docs", &rows, Vec::new())
+            });
+            let PreparedEncoding::Ready(encoded) = prepared.encoding else {
+                panic!("expected an in-place prepared frame");
+            };
+            assert!(encoded.framed_ok);
+            assert_eq!(encoded.bytes[8], magic[3]);
             let rec = decode_frame(&magic, &buf).unwrap();
             let Pack::InsertCols { fields, cols, .. } = rec.pack else {
                 panic!("insert cols")
