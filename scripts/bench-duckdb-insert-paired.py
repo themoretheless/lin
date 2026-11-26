@@ -34,39 +34,23 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def physical_core_cpus():
-    allowed = os.sched_getaffinity(0)
-    result = {}
-    topology = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET"], text=True)
-    for line in topology.splitlines():
-        if line.startswith("#"):
-            continue
-        cpu, core, socket = map(int, line.split(","))
-        if cpu in allowed:
-            result.setdefault((socket, core), cpu)
-    if not result:
-        raise RuntimeError("No allowed CPUs in reported topology")
-    return sorted(result.values())
-
-
-def measure_lin(worker, rows, cpus=None):
-    command = [worker]
-    if cpus is not None:
-        command = ["taskset", "-c", ",".join(map(str, cpus)), worker]
+def measure_lin(worker, rows, shared_shape=False):
+    env = dict(os.environ)
+    env.pop("LIN_BENCH_SHARED_INSERT_SHAPE", None)
+    if shared_shape:
+        env["LIN_BENCH_SHARED_INSERT_SHAPE"] = "1"
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     result = json.loads(subprocess.check_output(
-        command, input=json.dumps(request) + "\n", text=True))
+        [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin readback disagrees with fixture")
     return result["samples_ns"][0]
 
 
 def main(worker, output):
-    roles = ("lin", "control", "physical", "duckdb")
-    cpus = physical_core_cpus()
+    roles = ("lin", "control", "shared_shape", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
-        allowed_cpus=sorted(os.sched_getaffinity(0)), physical_core_cpus=cpus,
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(), samples=[],
     )
     rng = random.Random(2929273)
@@ -75,7 +59,7 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         measure_lin(worker, rows)
-        measure_lin(worker, rows, cpus)
+        measure_lin(worker, rows, shared_shape=True)
         for block in range(1):
             orders = list(itertools.permutations(roles))
             rng.shuffle(orders)
@@ -84,7 +68,7 @@ def main(worker, output):
                 for role in order:
                     timings[role] = (
                         measure_duckdb(frame, rows) if role == "duckdb"
-                        else measure_lin(worker, rows, cpus if role == "physical" else None)
+                        else measure_lin(worker, rows, shared_shape=role == "shared_shape")
                     )
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
                 output.write_text(json.dumps(report, indent=2) + "\n")
@@ -93,11 +77,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        physical_gain = median(1 - x["physical"] / x["lin"] for x in pairs)
-        physical_wins = sum(x["physical"] < x["duckdb"] for x in pairs)
+        shared_shape_gain = median(1 - x["shared_shape"] / x["lin"] for x in pairs)
+        shared_shape_wins = sum(x["shared_shape"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, physical gain {physical_gain:.2%}, "
-              f"physical wins {physical_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, shared_shape gain {shared_shape_gain:.2%}, "
+              f"shared_shape wins {shared_shape_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
