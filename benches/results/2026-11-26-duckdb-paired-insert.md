@@ -336,3 +336,18 @@ Median paired Lin minus DuckDB latency in milliseconds, default / transparent hu
 All eight THP losses in 300 comparisons occurred on first inserts on EPYC: one at 10k and seven at 100k.
 
 [Paired timings and process counters](https://github.com/themoretheless/lin/actions/runs/45833579837)
+
+## Observed transparent huge pages around 100k INSERT
+
+Eight fresh processes per host and mode. Each process measured three transactions on fresh databases. Snapshots of /proc/self/smaps_rollup follow preparation and precede the timer, then follow commit and the timer. The repeat column averages the two repeat snapshots within each process before taking the median across processes. Units are MiB. Percentages summarize per-snapshot AnonHugePages / Anonymous.
+
+| Host | THP before first | THP after first | Share after first | THP before repeats | THP after repeats |
+|---|---:|---:|---:|---:|---:|
+| EPYC 7763 amd-2 | 159 | 371 | 68.0% | 421 | 426 |
+| EPYC 9V45 amd-3 | 139 | 306 | 56.2% | 365.5 | 377.5 |
+| EPYC 7763 amd-4 | 179 | 389 | 71.1% | 432 | 432 |
+| ARM64 Neoverse-N2 | 138 | 335 | 61.5% | 390.5 | 395 |
+
+In default mode every host had a zero median for AnonHugePages before and after both first and repeat inserts. With the glibc hint, part of the process was already on huge pages after preparation, and repeat transactions started with markedly greater huge-page residency. The process-wide counter covers allocator arenas, prepared input and other anonymous mappings.
+
+[Snapshots and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45835991931)
