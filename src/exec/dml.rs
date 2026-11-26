@@ -2671,20 +2671,15 @@ fn build_batch_shape_rows_into(
     let title_idx = first.fields.iter().rposition(|(k, _)| k == "title");
     let snippet_idx = first.fields.iter().rposition(|(k, _)| k == "snippet");
 
-    let mut template = first
-        .fields
-        .iter()
-        .map(|(key, _)| (key.clone(), Cell::Null))
-        .collect::<Row>();
+    let mut names: smallvec::SmallVec<[&str; 32]> =
+        first.fields.iter().map(|(key, _)| key.as_str()).collect();
     if needs_hash {
-        template.insert("hash", Cell::Null);
+        names.push("hash");
     }
     if needs_embed {
-        template.insert("embedding", Cell::Null);
+        names.push("embedding");
     }
-    let Some(shape) = template.shape_arc().cloned() else {
-        return (false, !needs_embed, false);
-    };
+    let shape = Row::shape_of(&names);
 
     #[derive(Clone, Copy)]
     enum ShapeSlot {
@@ -2694,8 +2689,9 @@ fn build_batch_shape_rows_into(
         Embed,
     }
 
-    let slots = template
-        .keys()
+    let slots = shape
+        .names()
+        .iter()
         .map(|key| {
             if key == "hash" && needs_hash {
                 ShapeSlot::Hash(body_idx.unwrap())
