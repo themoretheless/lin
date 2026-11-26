@@ -1206,7 +1206,7 @@ impl Db {
             None
         };
         let (built, all_uniform, all_embedded, lossless_cols) =
-            build_insert_rows(records, now, needs_embed, hashing_dim, allow_preencode && self.persist.is_some());
+            build_insert_rows(records, now, needs_embed, hashing_dim);
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
@@ -2444,7 +2444,6 @@ struct BuildTask {
     now: i64,
     needs_embed: bool,
     hashing_dim: Option<usize>,
-    check_wal_types: bool,
     next_chunk: AtomicUsize,
     done_chunks: AtomicUsize,
     neg_flags: AtomicU8,
@@ -2492,7 +2491,6 @@ fn run_build_chunks(task: &BuildTask, is_caller: bool) {
             task.needs_embed,
             task.hashing_dim,
             task.n,
-            task.check_wal_types,
         );
         let mask = u8::from(!u) | (u8::from(!e) << 1) | (u8::from(!l) << 2);
         if mask != 0 {
@@ -2544,7 +2542,6 @@ fn build_insert_rows(
     now: i64,
     needs_embed: bool,
     hashing_dim: Option<usize>,
-    check_wal_types: bool,
 ) -> (Vec<Row>, bool, bool, bool) {
     let n = records.len();
     if n == 0 {
@@ -2566,7 +2563,6 @@ fn build_insert_rows(
                 now,
                 needs_embed,
                 hashing_dim,
-                check_wal_types,
                 next_chunk: AtomicUsize::new(0),
                 done_chunks: AtomicUsize::new(0),
                 neg_flags: AtomicU8::new(0),
@@ -2643,7 +2639,7 @@ fn build_insert_rows(
     let mut rows: Vec<Row> = Vec::with_capacity(n);
     let spare = &mut rows.spare_capacity_mut()[..n];
     let (all_uniform, all_embedded, lossless_cols) =
-        build_batch_shape_rows_into(spare, records, now, needs_embed, hashing_dim, n, check_wal_types);
+        build_batch_shape_rows_into(spare, records, now, needs_embed, hashing_dim, n);
     unsafe {
         rows.set_len(n);
     }
@@ -2657,7 +2653,6 @@ fn build_batch_shape_rows_into(
     needs_embed: bool,
     hashing_dim: Option<usize>,
     total_n: usize,
-    check_wal_types: bool,
 ) -> (bool, bool, bool) {
     let Some(first) = records.first() else {
         return (false, !needs_embed, false);
@@ -2726,9 +2721,9 @@ fn build_batch_shape_rows_into(
 
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
-    let mut lossless_cols = check_wal_types;
+    let mut lossless_cols = true;
     let mut first_kinds = [0u8; 32];
-    let mut have_first_kinds = !check_wal_types;
+    let mut have_first_kinds = false;
 
     let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
         for (slot_out, record) in out.iter_mut().zip(records) {
@@ -2882,7 +2877,7 @@ pub(super) fn append_batch_shape_rows(
     rows.reserve(n);
     let old_len = rows.len();
     let spare = &mut rows.spare_capacity_mut()[..n];
-    let (all_same, _, _) = build_batch_shape_rows_into(spare, records, now, needs_embed, None, n, true);
+    let (all_same, _, _) = build_batch_shape_rows_into(spare, records, now, needs_embed, None, n);
     unsafe {
         rows.set_len(old_len + n);
     }

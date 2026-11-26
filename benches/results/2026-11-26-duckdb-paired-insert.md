@@ -53,3 +53,9 @@ Reject the Linux x64 two-thread cap from `69c4136f1`. At default allocator setti
 Increasing each work item from 64 to 256 rows on large inserts slowed the first 100k insertion by a median paired 1.31 ms on EPYC 9V45 and 3.89 ms on EPYC 7763. The candidate won only two of eight pairs per host. Repeated 100k inserts slowed by 0.85 and 0.72 ms respectively. The engine retains the original 64-row work items.
 
 [Chunk-size comparison and raw samples](https://github.com/themoretheless/lin/actions/runs/45791100037)
+
+## Skipping WAL type checks in memory
+
+Candidate `bfb4e00bc` won 16 of 32 same-host pairs for the first 100k insert against the original engine. Median paired changes were −0.44 and −2.85 ms on EPYC 7763, +0.69 ms on EPYC 9V45 and +0.37 ms on Neoverse N2. One 7763 host also showed a 3.09 ms repeat slowdown. The skip was dropped after this experiment.
+
+[Paired samples and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45793773235)
