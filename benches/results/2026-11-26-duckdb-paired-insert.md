@@ -114,3 +114,20 @@ For each fresh process, subtract the median of its two repeat transactions from 
 | Neoverse-N2 | thp | 9.03 | 7.27 | 1.19 |
 
 [Source profiles](https://github.com/themoretheless/lin/actions/runs/45798842879)
+
+## Paired INSERT on the component-profile hosts
+
+The ordinary release binary ran before profiling instrumentation was applied. Cells show median Lin / DuckDB milliseconds and Lin wins out of 25 pairs. Repeat uses the median of four subsequent insertions per process.
+
+| Processor | Allocator mode | 10k first | 10k repeat | 100k first | 100k repeat |
+|---|---|---|---|---|---|
+| AMD EPYC 9V74 80-Core Processor | Default | 15.52 / 16.04 (22/25) | 7.09 / 15.86 (25/25) | 162.99 / 138.12 (0/25) | 95.06 / 137.68 (25/25) |
+| AMD EPYC 9V74 80-Core Processor | THP | 10.75 / 15.87 (25/25) | 7.17 / 15.83 (25/25) | 110.16 / 138.02 (24/25) | 89.47 / 137.75 (25/25) |
+| AMD EPYC 7763 64-Core Processor | Default | 18.52 / 19.53 (20/25) | 7.92 / 19.20 (25/25) | 197.96 / 168.95 (1/25) | 108.20 / 168.11 (25/25) |
+| AMD EPYC 7763 64-Core Processor | THP | 13.29 / 19.41 (25/25) | 8.60 / 19.10 (25/25) | 137.91 / 168.20 (25/25) | 105.82 / 168.15 (25/25) |
+| AMD EPYC 9V45 96-Core Processor | Default | 6.82 / 13.86 (25/25) | 3.95 / 13.65 (25/25) | 76.12 / 129.50 (25/25) | 60.53 / 131.54 (25/25) |
+| AMD EPYC 9V45 96-Core Processor | THP | 6.11 / 13.95 (25/25) | 4.09 / 13.57 (25/25) | 68.13 / 129.70 (25/25) | 57.36 / 129.59 (25/25) |
+| Neoverse-N2 | Default | 9.91 / 23.25 (25/25) | 4.57 / 23.13 (25/25) | 101.07 / 216.61 (25/25) | 61.18 / 216.35 (25/25) |
+| Neoverse-N2 | THP | 7.82 / 23.17 (25/25) | 4.79 / 23.19 (25/25) | 74.58 / 216.42 (25/25) | 60.06 / 216.60 (25/25) |
+
+[Uninstrumented paired measurements and runner identities](https://github.com/themoretheless/lin/actions/runs/45798842879)
