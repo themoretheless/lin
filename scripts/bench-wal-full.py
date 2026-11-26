@@ -64,7 +64,10 @@ def main():
     parser.add_argument("worker", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--blocks", type=int, default=4)
+    parser.add_argument("--baseline-worker", type=Path)
     args = parser.parse_args()
+    control_role = "lin_base" if args.baseline_worker else "lin_control"
+    workers = {"lin": args.worker.resolve(), control_role: (args.baseline_worker or args.worker).resolve()}
     if args.blocks < 1:
         parser.error("--blocks must be positive")
     rng = random.Random(2929273)
@@ -72,14 +75,14 @@ def main():
     for n in (1000, 10000):
         rows = fixture(n)
         for block in range(args.blocks):
-            orders = list(permutations(("lin", "lin_control", "sqlite")))
+            orders = list(permutations(("lin", control_role, "sqlite")))
             rng.shuffle(orders)
             for order in orders:
                 samples = {}
                 for role in order:
                     with tempfile.TemporaryDirectory() as directory:
                         elapsed = (run_sqlite(directory, rows) if role == "sqlite"
-                                   else run_lin(args.worker.resolve(), directory, rows))
+                                   else run_lin(workers[role], directory, rows))
                     if elapsed <= 0:
                         raise ValueError(f"Nonpositive measurement: {role}, {elapsed}")
                     samples[role] = elapsed
@@ -88,7 +91,9 @@ def main():
         pairs = [row["ns"] for row in report["samples"] if row["rows"] == n]
         print(n, {role: median(row[role] for row in pairs) / 1e6 for role in orders[0]},
               "Lin wins", sum(row["lin"] < row["sqlite"] for row in pairs), "/", len(pairs),
-              "median A/A %", median(abs(100 * (1 - row["lin_control"] / row["lin"])) for row in pairs))
+              "paired candidate minus control ms", median(row["lin"] - row[control_role] for row in pairs) / 1e6)
+        if not args.baseline_worker:
+            print("median A/A %", median(abs(100 * (1 - row[control_role] / row["lin"])) for row in pairs))
 
 
 if __name__ == "__main__":

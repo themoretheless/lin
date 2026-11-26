@@ -41,9 +41,13 @@ jobs:
         run: |
           set -o pipefail
           cargo build --locked --release -p lin-peer-worker
+          git worktree add --detach "$RUNNER_TEMP/base" c226a2334
+          (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json | tee summary.txt
+          git -C "$RUNNER_TEMP/base" rev-parse HEAD >> provenance.txt
+          sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
+          python3 scripts/bench-wal-full.py --baseline-worker "$RUNNER_TEMP/base/target/release/lin-peer-worker" target/release/lin-peer-worker wal-full.json | tee summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
