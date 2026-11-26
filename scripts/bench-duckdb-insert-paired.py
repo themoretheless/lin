@@ -34,12 +34,13 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, large_chunks=False):
+def measure_lin(worker, rows, direct_cells=False):
     env = dict(os.environ)
     env.pop("LIN_BENCH_SHARED_INSERT_SHAPE", None)
     env.pop("LIN_BENCH_BULK_BUILD_CHUNKS", None)
-    if large_chunks:
-        env["LIN_BENCH_BULK_BUILD_CHUNKS"] = "1"
+    env.pop("LIN_BENCH_DIRECT_INSERT_CELLS", None)
+    if direct_cells:
+        env["LIN_BENCH_DIRECT_INSERT_CELLS"] = "1"
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
@@ -49,7 +50,7 @@ def measure_lin(worker, rows, large_chunks=False):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "large_chunks", "duckdb")
+    roles = ("lin", "control", "direct_cells", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(), samples=[],
@@ -60,7 +61,7 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         measure_lin(worker, rows)
-        measure_lin(worker, rows, large_chunks=True)
+        measure_lin(worker, rows, direct_cells=True)
         for block in range(1):
             orders = list(itertools.permutations(roles))
             rng.shuffle(orders)
@@ -69,7 +70,7 @@ def main(worker, output):
                 for role in order:
                     timings[role] = (
                         measure_duckdb(frame, rows) if role == "duckdb"
-                        else measure_lin(worker, rows, large_chunks=role == "large_chunks")
+                        else measure_lin(worker, rows, direct_cells=role == "direct_cells")
                     )
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
                 output.write_text(json.dumps(report, indent=2) + "\n")
@@ -78,11 +79,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        large_chunks_gain = median(1 - x["large_chunks"] / x["lin"] for x in pairs)
-        large_chunks_wins = sum(x["large_chunks"] < x["duckdb"] for x in pairs)
+        direct_cells_gain = median(1 - x["direct_cells"] / x["lin"] for x in pairs)
+        direct_cells_wins = sum(x["direct_cells"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, large_chunks gain {large_chunks_gain:.2%}, "
-              f"large_chunks wins {large_chunks_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, direct_cells gain {direct_cells_gain:.2%}, "
+              f"direct_cells wins {direct_cells_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
