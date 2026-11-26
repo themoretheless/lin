@@ -2830,20 +2830,27 @@ fn build_batch_shape_rows_into(
                 }
                 slot_out.write(Row::from_parts(Arc::clone(&shape), cells));
             } else {
-                let cells = slots.iter().enumerate().map(|(ci, slot)| {
-                    let cell = eval_slot_cell!(slot);
-                    if lossless_cols {
-                        let kind = cell_lossless_kind(&cell);
-                        if have_first_kinds {
-                            lossless_cols = kind == first_kinds[ci];
-                        } else {
-                            first_kinds[ci] = kind;
-                            lossless_cols = kind != 0;
+                let mut cells = Vec::with_capacity(width);
+                if !have_first_kinds {
+                    for (ci, slot) in slots.iter().enumerate() {
+                        let cell = eval_slot_cell!(slot);
+                        let k = cell_lossless_kind(&cell);
+                        first_kinds[ci] = k;
+                        if k == 0 {
+                            lossless_cols = false;
                         }
+                        cells.push(cell);
                     }
-                    cell
-                }).collect();
-                have_first_kinds = true;
+                    have_first_kinds = true;
+                } else {
+                    for (ci, slot) in slots.iter().enumerate() {
+                        let cell = eval_slot_cell!(slot);
+                        if lossless_cols && cell_lossless_kind(&cell) != first_kinds[ci] {
+                            lossless_cols = false;
+                        }
+                        cells.push(cell);
+                    }
+                }
                 slot_out.write(Row::from_vec_parts(Arc::clone(&shape), cells));
             }
         }

@@ -160,3 +160,9 @@ Release timings below are Lin / DuckDB median milliseconds, with Lin wins in par
 ## Coverage of the five-to-eight-cell candidate
 
 The Lin fixture in `tools/peer-worker/src/main.rs` supplies seven fields (id, uri, wing, title, body, layer, ts). Row construction adds hash and embedding, yielding nine slots. Candidate `f2f14bcf2` changes the storage path only for widths five through eight. Both builds already allocate the nine-slot row directly in its final vector. Consequently differences from this paired run cannot qualify that change for this workload. The candidate was withdrawn.
+
+## Exact-size iterator for wide rows
+
+Candidate `7bbab9732` won 20 of 32 first-100k pairs against the previous worker. Median paired changes were −0.55 and −3.38 ms on two EPYC 7763 hosts, −0.52 ms on EPYC 9V74 and −1.06 ms on ARM N2. Repeat 100k slowed by 1.04 ms on the first 7763. With default settings, DuckDB won all 75 first-100k EPYC pairs. Lin won all 400 comparisons with THP enabled for both engines. The candidate was withdrawn and the wide-row WAL regression test retained.
+
+[Raw paired measurements](https://github.com/themoretheless/lin/actions/runs/45806695900)
