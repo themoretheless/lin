@@ -50,6 +50,10 @@ jobs:
           echo "LIN_BENCH_TCMALLOC=$library" >> "$GITHUB_ENV"
           dpkg-query -W libtcmalloc-minimal4 > allocator-provenance.txt
           sha256sum "$library" >> allocator-provenance.txt
+          cat /sys/kernel/mm/transparent_hugepage/enabled >> allocator-provenance.txt
+          loader=$(ldd target/release/lin-peer-worker | awk '/ld-linux/ { print $1 }')
+          "$loader" --list-tunables > glibc-tunables.txt
+          grep -q '^glibc.malloc.hugetlb:' glibc-tunables.txt
       - name: Measure allocation and per-sample resource use
         if: steps.cpu.outputs.matched == 'true'
         run: |
@@ -67,6 +71,7 @@ jobs:
           path: |
             runner-cpu.txt
             allocator-provenance.txt
+            glibc-tunables.txt
             duckdb-results.json
             duckdb-summary.txt
             duckdb-provenance.txt

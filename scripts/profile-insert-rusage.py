@@ -10,16 +10,19 @@ worker, output = map(Path, sys.argv[1:])
 base_env = dict(os.environ, LIN_BENCH_INSERT_RUSAGE="1")
 base_env.pop("LD_PRELOAD", None)
 base_env.pop("MALLOC_CONF", None)
+base_env.pop("GLIBC_TUNABLES", None)
 records = []
 for rows in (10_000, 100_000):
     request = {"insert_rows": rows, "samples": 5, "timestamp_ms": 123456}
     reference = None
-    allocators = ("system", "tcmalloc")
+    allocators = ("system", "tcmalloc", "glibc_thp")
     for trial in range(6):
-        for allocator in allocators[trial % 2:] + allocators[:trial % 2]:
+        for allocator in allocators[trial % len(allocators):] + allocators[:trial % len(allocators)]:
             env = dict(base_env)
             if allocator == "tcmalloc":
                 env["LD_PRELOAD"] = os.environ["LIN_BENCH_TCMALLOC"]
+            if allocator == "glibc_thp":
+                env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
             data = json.loads(subprocess.check_output(
                 [worker.resolve()], input=json.dumps(request) + "\n", text=True, env=env,
             ))
