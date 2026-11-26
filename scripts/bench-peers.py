@@ -421,7 +421,7 @@ class NativeInsert(Lin):
                             raise RuntimeError("Kusto streaming visibility timeout")
                         time.sleep(0.01)
                     timings.append(time.perf_counter_ns() - start)
-                    got = self.kusto_peer.execute(f"{table} | project id,uri,wing,title,ts,body")
+                    got = self.kusto_peer.execute(f"{table} | project id,uri,wing,['title'],ts,body")
                     validate(got, self.want, self.engine, "insert_native")
                 finally:
                     if created:
@@ -633,10 +633,10 @@ class Kusto:
                     time.sleep(0.25)
             d, u, o = self.tables
             self.queries = {
-                "point_get": f'{d} | where id == "d-20" | project id,title',
+                "point_get": f'{d} | where id == "d-20" | project id,["title"]',
                 "filter_eq": f'{d} | where wing == "rag" | count',
-                "text_substr": f'{d} | where title contains_cs "wal" | count',
-                "materialize": f'{d} | where wing == "rag" | project id,title',
+                "text_substr": f'{d} | where ["title"] contains_cs "wal" | count',
+                "materialize": f'{d} | where wing == "rag" | project id,["title"]',
                 "join_inner": f'{o} | join kind=inner ({u}) on $left.user_id == $right.id | project id,email,total',
                 "join_filter": f'{o} | where total>100 | join kind=inner ({u}) on $left.user_id == $right.id | project id,email,total',
             }
