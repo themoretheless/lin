@@ -396,3 +396,19 @@ All 1,920 measured statements entered the parallel maintenance branch. Setup pre
 The full-text index had the longest aggregate lane time on every host, for first and repeat inserts and with both page settings. With THP the first full-text pass still took 34.31–36.65 ms on EPYC and 17.24 ms on ARM64.
 
 [Linux run and per-statement samples](https://github.com/themoretheless/lin/actions/runs/45838227208)
+
+## Full-text partition build and merge
+
+On every measured 10k statement the 5k-row tail produced 5,005 distinct terms. Exactly five already existed in the destination at merge time. The other 5,000 became new keys. This is the vocabulary distribution of this fixture.
+
+Median milliseconds per 100k transaction, default allocator, first / repeat. Left and tail build concurrently. Merge follows their completion.
+
+| Host | Full-text total | Destination half | Temporary half | Merge |
+|---|---:|---:|---:|---:|
+| EPYC 9V45 | 23.57 / 23.78 | 14.31 / 15.33 | 12.00 / 12.88 | 7.66 / 6.50 |
+| EPYC 7763 amd-2 | 36.27 / 31.26 | 21.93 / 20.29 | 17.46 / 16.70 | 12.08 / 8.53 |
+| EPYC 7763 amd-3 | 39.55 / 35.68 | 22.64 / 22.36 | 20.75 / 19.25 | 13.72 / 10.41 |
+| EPYC 7763 amd-4 | 39.25 / 33.94 | 24.08 / 22.13 | 20.98 / 18.26 | 12.46 / 9.08 |
+| ARM64 Neoverse-N2 | 23.04 / 21.24 | 11.12 / 12.52 | 8.67 / 9.59 | 9.10 / 6.24 |
+
+[Per-statement counters and timing samples](https://github.com/themoretheless/lin/actions/runs/45839343845)
