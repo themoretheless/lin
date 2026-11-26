@@ -399,7 +399,11 @@ impl Store {
         }
 
         #[inline]
-        fn scan_nul_chunk(chunk: &[u8], finder: &memchr::memmem::Finder<'_>) -> i64 {
+        fn scan_nul_chunk(
+            chunk: &[u8],
+            finder: &memchr::memmem::Finder<'_>,
+            needle_len: usize,
+        ) -> i64 {
             let mut cursor = 0usize;
             let mut count = 0i64;
             let len = chunk.len();
@@ -409,8 +413,18 @@ impl Store {
                 };
                 let match_pos = cursor + rel;
                 count += 1;
-                if let Some(nul_rel) = memchr::memchr(0, &chunk[match_pos..]) {
-                    cursor = match_pos + nul_rel + 1;
+                let mut p = match_pos + needle_len;
+                let short_end = (p + 24).min(len);
+                while p < short_end {
+                    if chunk[p] == 0 {
+                        break;
+                    }
+                    p += 1;
+                }
+                if p < short_end {
+                    cursor = p + 1;
+                } else if let Some(nul_rel) = memchr::memchr(0, &chunk[p..]) {
+                    cursor = p + nul_rel + 1;
                 } else {
                     break;
                 }
@@ -418,8 +432,10 @@ impl Store {
             count
         }
 
+        let needle_len = needle_bytes.len();
         // Only fan out across worker threads when > 32k rows AND the packed buffer exceeds L2
-        // cache (~512 KiB); below that threshold, single-core SIMD memchr avoids pool locking.
+        // cache (~512 KiB); below that threshold, 3-way persistent steal lanes cover medium
+        // buffers (>= 128 KiB and >= 8k rows) without pool locking.
         let threads = if total_rows > 32_768 && bytes.len() >= 512 * 1024 {
             std::thread::available_parallelism()
                 .map(|p| p.get())
@@ -478,7 +494,7 @@ impl Store {
                                     )
                                 };
                                 let finder = memchr::memmem::Finder::new(ndl);
-                                let c = scan_nul_chunk(chunk, &finder);
+                                let c = scan_nul_chunk(chunk, &finder, job.needle_len);
                                 let _ = res_tx.send(c);
                             }
                         });
@@ -519,7 +535,7 @@ impl Store {
                                 ptr: slice.as_ptr() as usize,
                                 len: slice.len(),
                                 needle_ptr: needle_bytes.as_ptr() as usize,
-                                needle_len: needle_bytes.len(),
+                                needle_len,
                             })
                             .is_ok()
                         {
@@ -534,7 +550,7 @@ impl Store {
                 let my_start = bounds[workers];
                 let my_end = bounds[threads];
                 let mut total = if my_start < my_end {
-                    scan_nul_chunk(&bytes[my_start..my_end], &finder)
+                    scan_nul_chunk(&bytes[my_start..my_end], &finder, needle_len)
                 } else {
                     0
                 };
@@ -547,7 +563,8 @@ impl Store {
                         }
                     }
                     if orphaned[w] {
-                        total += scan_nul_chunk(&bytes[bounds[w]..bounds[w + 1]], &finder);
+                        total +=
+                            scan_nul_chunk(&bytes[bounds[w]..bounds[w + 1]], &finder, needle_len);
                     }
                 }
                 return total;
@@ -564,13 +581,55 @@ impl Store {
                     }
                     let chunk = &bytes[b_start..b_end];
                     let f_ref = &finder;
-                    handles.push(scope.spawn(move || scan_nul_chunk(chunk, f_ref)));
+                    handles.push(scope.spawn(move || scan_nul_chunk(chunk, f_ref, needle_len)));
                 }
                 handles.into_iter().map(|h| h.join().unwrap()).sum()
             })
+        } else if bytes.len() >= 128 * 1024 && total_rows >= 8_192 {
+            let len = bytes.len();
+            let a1 = len / 3;
+            let b1 = match memchr::memchr(0, &bytes[a1..]) {
+                Some(rel) => a1 + rel + 1,
+                None => len,
+            };
+            let a2 = ((len * 2) / 3).max(b1);
+            let b2 = if a2 >= len {
+                len
+            } else {
+                match memchr::memchr(0, &bytes[a2..]) {
+                    Some(rel) => a2 + rel + 1,
+                    None => len,
+                }
+            };
+            let finder = memchr::memmem::Finder::new(needle_bytes);
+            let f_ref = &finder;
+            let c0 = &bytes[..b1];
+            let c1 = &bytes[b1..b2];
+            let c2 = &bytes[b2..];
+            let (n0, n1, n2) = crate::work_steal::steal3(
+                crate::work_steal::StealLane::MaintFts,
+                !c0.is_empty(),
+                move || scan_nul_chunk(c0, f_ref, needle_len),
+                crate::work_steal::StealLane::MaintIdx,
+                move || {
+                    if c1.is_empty() {
+                        0
+                    } else {
+                        scan_nul_chunk(c1, f_ref, needle_len)
+                    }
+                },
+                || {
+                    if c2.is_empty() {
+                        0
+                    } else {
+                        scan_nul_chunk(c2, f_ref, needle_len)
+                    }
+                },
+            );
+            n0 + n1 + n2
         } else {
             let finder = memchr::memmem::Finder::new(needle_bytes);
-            scan_nul_chunk(bytes, &finder)
+            scan_nul_chunk(bytes, &finder, needle_len)
         }
     }
 
@@ -873,6 +932,109 @@ impl Store {
         Some(out)
     }
 
+    /// Project a `PostingList` (`Standard` or `Bitmap`) of `docs` row positions directly
+    /// into `Vec<Row>` using hot SoA columns without allocating an intermediate `Vec<usize>`.
+    #[allow(dead_code)]
+    pub(crate) fn project_docs_hot_posting(
+        &self,
+        list: &crate::index::PostingList,
+        fields: &[String],
+        limit: Option<usize>,
+    ) -> Option<Vec<Row>> {
+        if fields.is_empty() || !fields.iter().all(|f| docs_hot_field(f)) {
+            return None;
+        }
+        if self.is_disk_backed("docs") {
+            return None;
+        }
+        let n = self.docs_id.len();
+        if n != self.collections.get("docs").map_or(0, Vec::len) || self.docs_title.len() != n {
+            return None;
+        }
+        if fields.iter().any(|f| f == "layer") && self.docs_layer.len() != n {
+            return None;
+        }
+        if fields.iter().any(|f| f == "wing") && self.docs_wing.len() != n {
+            return None;
+        }
+        if limit == Some(0) || list.is_empty() {
+            return Some(Vec::new());
+        }
+        let max_take = limit.unwrap_or(usize::MAX);
+        let want = list.len().min(max_take);
+        let id_title = fields.len() == 2
+            && ((fields[0] == "id" && fields[1] == "title")
+                || (fields[0] == "title" && fields[1] == "id"));
+
+        let mut recycled_buf = None;
+        if id_title && limit.is_none() && want >= 1024 {
+            if let Some(mut rows) = take_recycled_id_title_vec() {
+                if rows.len() == want {
+                    let id_title_shape = shape_id_title();
+                    let docs_id = &self.docs_id;
+                    let docs_title = &self.docs_title;
+                    let mut offset = 0usize;
+                    list.for_each_ordered(false, |i| {
+                        if i >= n {
+                            return true;
+                        }
+                        let row = &mut rows[offset];
+                        offset += 1;
+                        if row.shape().is_some_and(|s| Arc::ptr_eq(s, id_title_shape))
+                            && let [v1, v2] = row.cells_mut()
+                        {
+                            if !matches!(v1, Cell::Text(a) if Arc::ptr_eq(a, &docs_id[i])) {
+                                *v1 = Cell::Text(Arc::clone(&docs_id[i]));
+                            }
+                            if !matches!(v2, Cell::Text(a) if Arc::ptr_eq(a, &docs_title[i])) {
+                                *v2 = Cell::Text(Arc::clone(&docs_title[i]));
+                            }
+                        } else {
+                            *row = row_id_title(&docs_id[i], &docs_title[i]);
+                        }
+                        offset < max_take
+                    });
+                    rows.truncate(offset);
+                    return Some(rows);
+                }
+                rows.clear();
+                rows.reserve(want);
+                recycled_buf = Some(rows);
+            }
+        }
+
+        let mut out = recycled_buf.unwrap_or_else(|| Vec::with_capacity(want));
+        if id_title {
+            list.for_each_ordered(false, |i| {
+                if i < n {
+                    out.push(row_id_title(&self.docs_id[i], &self.docs_title[i]));
+                    if out.len() >= max_take {
+                        return false;
+                    }
+                }
+                true
+            });
+        } else {
+            let plan = DocHotPlan::new(fields);
+            list.for_each_ordered(false, |i| {
+                if i < n {
+                    out.push(plan.build_row(
+                        i,
+                        &self.docs_id,
+                        &self.docs_title,
+                        &self.docs_layer,
+                        &self.docs_wing,
+                    ));
+                    if out.len() >= max_take {
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+        Some(out)
+    }
+
     /// Full docs scan projecting only hot columns when filter is title-contains or always-true path.
     pub fn scan_docs_hot_project(
         &self,
@@ -1060,5 +1222,79 @@ impl DocHotPlan {
                     .map(|&c| col_cell(c, i, docs_id, docs_title, docs_layer, docs_wing)),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::PostingList;
+
+    fn seed_docs_store(n: usize) -> Store {
+        let mut store = Store::empty("test/8");
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let title = if i % 17 == 0 {
+                // >= 24 bytes after "wal" to exercise the memchr fallback path too
+                format!("doc {i} wal extended_suffix_0123456789_abcdefghijklmnop")
+            } else if i % 5 == 0 {
+                // needle right at the end before NUL + duplicate needle in same title
+                format!("doc {i} wal and trailing wal")
+            } else {
+                format!("doc {i} ordinary note")
+            };
+            rows.push(Row::from([
+                ("id", Cell::from_text(format!("d{i}"))),
+                ("uri", Cell::from_text(format!("u{i}"))),
+                ("title", Cell::from_text(title)),
+                ("wing", Cell::from_text(if i % 2 == 0 { "rag" } else { "sys" })),
+                ("layer", Cell::from_text(if i % 3 == 0 { "raw" } else { "wiki" })),
+            ]));
+        }
+        store.collections.insert("docs".into(), rows);
+        store.rebuild_row_maps();
+        store
+    }
+
+    #[test]
+    fn title_contains_count_covers_inline_nul_steal3_and_pool() {
+        for n in [128usize, 10_000, 36_000] {
+            let store = seed_docs_store(n);
+            let expected = (0..n).filter(|i| i % 17 == 0 || i % 5 == 0).count() as i64;
+            assert_eq!(store.docs_title_contains_count("wal"), expected, "n={n}");
+            assert_eq!(
+                store.docs_title_contains_count("trailing wal"),
+                (0..n).filter(|i| i % 17 != 0 && i % 5 == 0).count() as i64
+            );
+            assert_eq!(store.docs_title_contains_count(""), n as i64);
+            assert_eq!(store.docs_title_contains_count("never-present-token"), 0);
+        }
+    }
+
+    #[test]
+    fn project_docs_hot_posting_handles_standard_and_bitmap() {
+        let store = seed_docs_store(256);
+        let mut std_pl = PostingList::new(false, 256);
+        let mut bmp_pl = PostingList::new(true, 256);
+        for i in (0..256).step_by(4) {
+            std_pl.insert(i);
+            bmp_pl.insert(i);
+        }
+        let f_id_title = vec!["title".to_string(), "id".to_string()];
+        let f_multi = vec!["id".to_string(), "wing".to_string(), "layer".to_string()];
+
+        let r_std = store.project_docs_hot_posting(&std_pl, &f_id_title, None).unwrap();
+        let r_bmp = store.project_docs_hot_posting(&bmp_pl, &f_id_title, None).unwrap();
+        assert_eq!(r_std, r_bmp);
+        assert_eq!(r_std.len(), 64);
+        assert_eq!(r_std[0].get("id").and_then(Cell::text), Some("d0"));
+        assert_eq!(r_std[1].get("id").and_then(Cell::text), Some("d4"));
+
+        let r_lim = store.project_docs_hot_posting(&bmp_pl, &f_multi, Some(5)).unwrap();
+        assert_eq!(r_lim.len(), 5);
+        assert_eq!(r_lim[4].get("id").and_then(Cell::text), Some("d16"));
+        assert_eq!(r_lim[4].get("wing").and_then(Cell::text), Some("rag"));
+        assert_eq!(store.project_docs_hot_posting(&bmp_pl, &f_multi, Some(0)).unwrap().len(), 0);
+        assert!(store.project_docs_hot_posting(&bmp_pl, &["body".to_string()], None).is_none());
     }
 }

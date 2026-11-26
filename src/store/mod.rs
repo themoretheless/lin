@@ -413,26 +413,55 @@ pub struct AppendMark {
     facts_len: usize,
 }
 
+#[inline]
+fn default_docs_fts() -> &'static crate::fts::FtsIndex {
+    static DEFAULT_DOCS_FTS: OnceLock<crate::fts::FtsIndex> = OnceLock::new();
+    DEFAULT_DOCS_FTS
+        .get_or_init(|| crate::fts::FtsIndex::empty(&["body".to_string(), "title".to_string()]))
+}
+
+#[inline]
+fn is_default_docs_fts_fields(cdef: &crate::catalog::Collection) -> bool {
+    let mut it = cdef
+        .fields
+        .iter()
+        .filter(|(_, f)| f.fts)
+        .map(|(n, _)| n.as_str());
+    matches!(
+        (it.next(), it.next(), it.next()),
+        (Some("body"), Some("title"), None)
+    )
+}
+
 impl Store {
     pub fn empty(embed_id: impl Into<String>) -> Self {
-        // ✅ Preallocate collections with expected count (4 typical tables)
-        let mut collections = BTreeMap::new();
-        for name in ["docs", "users", "orders", "facts"] {
-            collections.insert(name.into(), Vec::new());
-        }
+        static DEFAULT_EMPTY_COLLECTIONS: OnceLock<Arc<BTreeMap<String, Vec<Row>>>> =
+            OnceLock::new();
+        static DEFAULT_EMPTY_COUNTS: OnceLock<FxHashMap<String, usize>> = OnceLock::new();
 
-        // Cache-friendly: track row counts per collection for fast bounds checking
-        let mut col_counts = FxHashMap::default();
-        col_counts.insert("docs".to_string(), 0);
-        col_counts.insert("users".to_string(), 0);
-        col_counts.insert("orders".to_string(), 0);
-        col_counts.insert("facts".to_string(), 0);
+        let empty_cols = Arc::clone(DEFAULT_EMPTY_COLLECTIONS.get_or_init(|| {
+            let mut collections = BTreeMap::new();
+            for name in ["docs", "users", "orders", "facts"] {
+                collections.insert(name.into(), Vec::new());
+            }
+            Arc::new(collections)
+        }));
+        let col_counts = DEFAULT_EMPTY_COUNTS
+            .get_or_init(|| {
+                let mut m = FxHashMap::with_capacity_and_hasher(4, Default::default());
+                m.insert("docs".to_string(), 0);
+                m.insert("users".to_string(), 0);
+                m.insert("orders".to_string(), 0);
+                m.insert("facts".to_string(), 0);
+                m
+            })
+            .clone();
 
         Self {
             r#gen: 0,
             embed_id: embed_id.into(),
             next_id: 1,
-            collections: collections.into(),
+            collections: rowmap::RowMap::from_arc(empty_cols),
             edges: Vec::new(),
             extra_collections: BTreeMap::new(),
             extra_rels: BTreeMap::new(),
@@ -819,6 +848,7 @@ impl Store {
         false
     }
 
+    #[allow(dead_code)]
     pub(crate) fn apply_disk_overlay_ops(&mut self, ops: &[crate::disk::DiskWalOp]) -> Result<(), Error> {
         self.apply_disk_overlay_ops_owned(ops.to_vec())
     }
@@ -1148,7 +1178,124 @@ impl Store {
         }
     }
 
+    fn invalidate_disk_table_caches(&mut self, collection: &str) {
+        if let Some(d) = self.disk.as_mut()
+            && let Some(lazy) = d.tables.get_mut(collection)
+        {
+            lazy.materialized = OnceLock::new();
+        }
+        if let Some(cold) = self.cold_fts_disk.remove(collection) {
+            self.dirty_fts_disk
+                .insert(collection.to_string(), cold.fields.clone());
+            if let Some((_, saved_cold, _)) = self.overlay_savepoint_fts.as_mut() {
+                saved_cold.entry(collection.to_string()).or_insert(cold);
+            }
+        }
+        if let Some(fts_idx) = self.fts.remove(collection) {
+            self.dirty_fts_disk
+                .insert(collection.to_string(), fts_idx.fields.clone());
+            if let Some((saved_fts, _, _)) = self.overlay_savepoint_fts.as_mut() {
+                saved_fts.entry(collection.to_string()).or_insert(fts_idx);
+            }
+        }
+    }
+
+    fn apply_disk_upsert_rows(
+        &mut self,
+        collection: &str,
+        rows: Vec<Row>,
+        write_disk_wal: bool,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        self.invalidate_disk_table_caches(collection);
+        let has_savepoint = self.overlay_savepoint_fts.is_some();
+        let Some(d) = self.disk.as_mut() else {
+            return;
+        };
+        let use_wal = write_disk_wal && d.native_disk && d.writer_lock.is_some() && !has_savepoint;
+        if let Ok(mut eng) = d.engine.write() {
+            if use_wal && !eng.is_read_only() {
+                let _ = eng.upsert_rows_mem_and_wal(collection, rows);
+            } else {
+                let _ = eng.upsert_rows_mem_only(collection, rows);
+            }
+            let nrows = eng.count_table(collection);
+            if let Some(lazy) = d.tables.get_mut(collection) {
+                lazy.row_count = nrows;
+            }
+            self.col_counts.insert(collection.to_string(), nrows);
+        }
+    }
+
+    fn apply_disk_delete_rows(
+        &mut self,
+        collection: &str,
+        rows: &[Row],
+        write_disk_wal: bool,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let has_savepoint = self.overlay_savepoint_fts.is_some();
+        let use_wal = self
+            .disk
+            .as_ref()
+            .is_some_and(|d| write_disk_wal && d.native_disk && d.writer_lock.is_some() && !has_savepoint);
+        if !use_wal
+            && rows.len() == 1
+            && let Some(id) = rows[0].get("id").and_then(Cell::text)
+        {
+            self.invalidate_disk_table_caches(collection);
+            let Some(d) = self.disk.as_mut() else {
+                return;
+            };
+            if let Ok(mut eng) = d.engine.write() {
+                let _ = eng.delete_id_mem_only(collection, id);
+                let nrows = eng.count_table(collection);
+                if let Some(lazy) = d.tables.get_mut(collection) {
+                    lazy.row_count = nrows;
+                }
+                self.col_counts.insert(collection.to_string(), nrows);
+            }
+            return;
+        }
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Cell::text).map(str::to_string))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.invalidate_disk_table_caches(collection);
+        let Some(d) = self.disk.as_mut() else {
+            return;
+        };
+        if let Ok(mut eng) = d.engine.write() {
+            if use_wal && !eng.is_read_only() {
+                let _ = eng.delete_by_ids_mem_and_wal(collection, &ids);
+            } else {
+                let _ = eng.delete_by_ids_mem_only(collection, &ids);
+            }
+            let nrows = eng.count_table(collection);
+            if let Some(lazy) = d.tables.get_mut(collection) {
+                lazy.row_count = nrows;
+            }
+            self.col_counts.insert(collection.to_string(), nrows);
+        }
+    }
+
     pub fn apply_pack(&mut self, pack: &Pack) {
+        self.apply_pack_inner(pack, true);
+    }
+
+    #[allow(dead_code)]
+    pub fn apply_pack_mem_only(&mut self, pack: &Pack) {
+        self.apply_pack_inner(pack, false);
+    }
+
+    fn apply_pack_inner(&mut self, pack: &Pack, write_disk_wal: bool) {
         match pack {
             Pack::Insert {
                 collection,
@@ -1156,9 +1303,7 @@ impl Store {
                 edges,
             } => {
                 if self.can_apply_disk_overlay(collection) {
-                    let mut ops = Vec::new();
-                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
-                    let _ = self.apply_disk_overlay_ops(&ops);
+                    self.apply_disk_upsert_rows(collection, vec![row.clone()], write_disk_wal);
                     for e in edges {
                         let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                     }
@@ -1191,9 +1336,7 @@ impl Store {
                 edges,
             } => {
                 if self.can_apply_disk_overlay(collection) {
-                    let mut ops = Vec::new();
-                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
-                    let _ = self.apply_disk_overlay_ops(&ops);
+                    self.apply_disk_upsert_rows(collection, rows.clone(), write_disk_wal);
                     for e in edges {
                         let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                     }
@@ -1222,9 +1365,10 @@ impl Store {
                 edges,
             } => {
                 if self.can_apply_disk_overlay(collection) {
-                    let mut ops = Vec::new();
-                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
-                    let _ = self.apply_disk_overlay_ops(&ops);
+                    if *n > 0 {
+                        let rows = persist::cols_to_rows(fields, cols, *n as usize);
+                        self.apply_disk_upsert_rows(collection, rows, write_disk_wal);
+                    }
                     for e in edges {
                         let _ = self.append_edge_parts(&e.rel, &e.from, &e.to);
                     }
@@ -1265,9 +1409,7 @@ impl Store {
             }
             Pack::Update { collection, rows } => {
                 if self.can_apply_disk_overlay(collection) {
-                    let mut ops = Vec::new();
-                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
-                    let _ = self.apply_disk_overlay_ops(&ops);
+                    self.apply_disk_upsert_rows(collection, rows.clone(), write_disk_wal);
                     return;
                 }
                 let mut new_rows = 0;
@@ -1326,9 +1468,7 @@ impl Store {
             }
             Pack::Delete { collection, rows } => {
                 if self.can_apply_disk_overlay(collection) {
-                    let mut ops = Vec::new();
-                    checkpoint::pack_to_disk_wal_ops(pack, &mut ops);
-                    let _ = self.apply_disk_overlay_ops(&ops);
+                    self.apply_disk_delete_rows(collection, rows, write_disk_wal);
                     return;
                 }
                 let dead = self.dead_positions(collection, rows);
@@ -1408,20 +1548,20 @@ impl Store {
                 self.extra_owned.insert(name.clone(), fields.clone());
             }
             Pack::Batch { packs } => {
-                self.apply_pack_batch(packs, 0);
+                self.apply_pack_batch(packs, 0, write_disk_wal);
             }
         }
     }
 
-    fn apply_pack_batch(&mut self, packs: &[Pack], depth: usize) {
+    fn apply_pack_batch(&mut self, packs: &[Pack], depth: usize, write_disk_wal: bool) {
         if depth > 64 {
             return;
         }
         for p in packs {
             if let Pack::Batch { packs: sub } = p {
-                self.apply_pack_batch(sub, depth + 1);
+                self.apply_pack_batch(sub, depth + 1, write_disk_wal);
             } else {
-                self.apply_pack(p);
+                self.apply_pack_inner(p, write_disk_wal);
             }
         }
     }
@@ -4259,54 +4399,79 @@ impl Store {
 
     /// Rebuild FTS postings from catalog `fts` fields (memory / missing durable blob).
     pub fn rebuild_fts(&mut self, catalog: &crate::catalog::Catalog) {
-        self.fts.retain(|k, _| catalog.collections.contains_key(k));
-        self.cold_fts_disk
-            .retain(|k, _| catalog.collections.contains_key(k));
-        self.dirty_fts_disk
-            .retain(|k, _| catalog.collections.contains_key(k));
-        let names: smallvec::SmallVec<[String; 4]> = catalog.collections.keys().cloned().collect();
-        for cname in names {
-            let Some(cdef) = catalog.collections.get(&cname) else {
+        if !self.fts.is_empty() {
+            self.fts.retain(|k, _| catalog.collections.contains_key(k));
+        }
+        if !self.cold_fts_disk.is_empty() {
+            self.cold_fts_disk
+                .retain(|k, _| catalog.collections.contains_key(k));
+        }
+        if !self.dirty_fts_disk.is_empty() {
+            self.dirty_fts_disk
+                .retain(|k, _| catalog.collections.contains_key(k));
+        }
+        for (cname, cdef) in &catalog.collections {
+            if !cdef.has_fts() {
+                if !self.fts.is_empty() {
+                    self.fts.remove(cname);
+                }
+                if !self.cold_fts_disk.is_empty() {
+                    self.cold_fts_disk.remove(cname);
+                }
+                if !self.dirty_fts_disk.is_empty() {
+                    self.dirty_fts_disk.remove(cname);
+                }
                 continue;
+            }
+            if !self.cold_fts_disk.is_empty() {
+                self.cold_fts_disk.remove(cname);
+            }
+            if !self.dirty_fts_disk.is_empty() {
+                self.dirty_fts_disk.remove(cname);
+            }
+            let mut existing = if self.fts.is_empty() {
+                None
+            } else {
+                self.fts.remove(cname)
             };
+            if cname == "docs"
+                && existing.is_none()
+                && !self.is_disk_backed("docs")
+                && self.collections.get("docs").is_none_or(Vec::is_empty)
+                && is_default_docs_fts_fields(cdef)
+            {
+                self.fts.insert(cname.clone(), default_docs_fts().clone());
+                continue;
+            }
             let fields: Vec<String> = cdef
                 .fields
                 .iter()
                 .filter(|(_, f)| f.fts)
                 .map(|(n, _)| n.clone())
                 .collect();
-            if fields.is_empty() {
-                self.fts.remove(&cname);
-                self.cold_fts_disk.remove(&cname);
-                self.dirty_fts_disk.remove(&cname);
-                continue;
-            }
-            self.cold_fts_disk.remove(&cname);
-            self.dirty_fts_disk.remove(&cname);
-            let mut existing = self.fts.remove(&cname);
-            let rows = self.collection(&cname);
+            let rows = self.collection(cname);
             let idx = if let Some(mut fts) = existing.take() {
                 fts.rebuild_in_place(rows, &fields);
                 fts
+            } else if rows.is_empty() && cname == "docs" && fields == ["body", "title"] {
+                default_docs_fts().clone()
             } else {
                 crate::fts::FtsIndex::build(rows, &fields)
             };
-            self.fts.insert(cname, idx);
+            self.fts.insert(cname.clone(), idx);
         }
     }
 
     /// Rebuild only collections that have no live posting list.
     pub fn ensure_fts(&mut self, catalog: &crate::catalog::Catalog) {
         for (cname, cdef) in &catalog.collections {
-            let fields: Vec<String> = cdef
-                .fields
-                .iter()
-                .filter(|(_, f)| f.fts)
-                .map(|(n, _)| n.clone())
-                .collect();
-            if fields.is_empty() {
-                self.fts.remove(cname);
-                self.cold_fts_disk.remove(cname);
+            if !cdef.has_fts() {
+                if !self.fts.is_empty() {
+                    self.fts.remove(cname);
+                }
+                if !self.cold_fts_disk.is_empty() {
+                    self.cold_fts_disk.remove(cname);
+                }
                 continue;
             }
             if self.fts.contains_key(cname) || self.cold_fts_disk.contains_key(cname) {
@@ -4314,14 +4479,36 @@ impl Store {
             }
             if self.is_disk_backed(cname) {
                 if self.get_col_count(cname) == 0 {
-                    self.fts
-                        .insert(cname.clone(), crate::fts::FtsIndex::build(&[], &fields));
+                    let idx = if cname == "docs" && is_default_docs_fts_fields(cdef) {
+                        default_docs_fts().clone()
+                    } else {
+                        let fields: Vec<String> = cdef
+                            .fields
+                            .iter()
+                            .filter(|(_, f)| f.fts)
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        crate::fts::FtsIndex::build(&[], &fields)
+                    };
+                    self.fts.insert(cname.clone(), idx);
                     continue;
                 }
                 if self.is_native_disk() || self.dirty_fts_disk.contains_key(cname) {
                     continue;
                 }
+            } else if cname == "docs"
+                && self.collections.get("docs").is_none_or(Vec::is_empty)
+                && is_default_docs_fts_fields(cdef)
+            {
+                self.fts.insert(cname.clone(), default_docs_fts().clone());
+                continue;
             }
+            let fields: Vec<String> = cdef
+                .fields
+                .iter()
+                .filter(|(_, f)| f.fts)
+                .map(|(n, _)| n.clone())
+                .collect();
             let rows = self.collection(cname);
             self.fts
                 .insert(cname.clone(), crate::fts::FtsIndex::build(rows, &fields));
@@ -4335,20 +4522,29 @@ impl Store {
             self.dirty_fts_disk.remove(collection);
             return;
         };
+        if !cdef.has_fts() {
+            self.fts.remove(collection);
+            self.cold_fts_disk.remove(collection);
+            self.dirty_fts_disk.remove(collection);
+            return;
+        };
+        self.cold_fts_disk.remove(collection);
+        self.dirty_fts_disk.remove(collection);
+        if collection == "docs"
+            && !self.is_disk_backed("docs")
+            && self.collections.get("docs").is_none_or(Vec::is_empty)
+            && is_default_docs_fts_fields(cdef)
+        {
+            self.fts
+                .insert(collection.to_string(), default_docs_fts().clone());
+            return;
+        }
         let fields: Vec<String> = cdef
             .fields
             .iter()
             .filter(|(_, f)| f.fts)
             .map(|(n, _)| n.clone())
             .collect();
-        if fields.is_empty() {
-            self.fts.remove(collection);
-            self.cold_fts_disk.remove(collection);
-            self.dirty_fts_disk.remove(collection);
-            return;
-        }
-        self.cold_fts_disk.remove(collection);
-        self.dirty_fts_disk.remove(collection);
         let rows = self.collection(collection);
         self.fts.insert(
             collection.to_string(),
@@ -5110,5 +5306,77 @@ mod empty_index_slab_tests {
             .push(super::Row::from([("id", super::Cell::from_text("d2"))]));
         assert_eq!(snap.collection("docs").len(), 1);
         assert_eq!(store.collection("docs").len(), 2);
+    }
+
+    #[test]
+    fn empty_store_shares_default_collections_and_fts_until_mutated() {
+        let a = crate::Db::empty();
+        let mut b = crate::Db::empty();
+        assert!(std::sync::Arc::ptr_eq(
+            &a.store.collections.share_arc(),
+            &b.store.collections.share_arc()
+        ));
+        assert_eq!(a.store.fts["docs"].fields, vec!["body", "title"]);
+        b.run(r#"insert docs { id: "d1", uri: "u1", title: "hello world", body: "alpha" }"#)
+            .unwrap();
+        assert!(a.store.collection("docs").is_empty());
+        assert_eq!(b.store.collection("docs").len(), 1);
+    }
+
+    #[test]
+    fn apply_pack_mem_only_skips_native_disk_wal_writes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "lin-mem-only-test-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cat = crate::catalog::fixture();
+        {
+            let mut eng = crate::disk::DiskEngine::open(&tmp, false).unwrap();
+            eng.upsert_rows_mem_and_wal(
+                "docs",
+                vec![super::Row::from([
+                    ("id", super::Cell::from_text("d0")),
+                    ("title", super::Cell::from_text("seed")),
+                ])],
+            )
+            .unwrap();
+            eng.checkpoint().unwrap();
+        }
+        let (mut store, _) = super::Store::open_native_disk(&tmp, &cat, false).unwrap();
+        let wal_before = store.disk_engine_read().unwrap().wal_bytes;
+        assert_eq!(wal_before, 0);
+
+        let batch = super::Pack::Batch {
+            packs: vec![
+                super::Pack::Insert {
+                    collection: "docs".into(),
+                    row: super::Row::from([
+                        ("id", super::Cell::from_text("d1")),
+                        ("title", super::Cell::from_text("one")),
+                    ]),
+                    edges: Vec::new(),
+                },
+                super::Pack::Update {
+                    collection: "docs".into(),
+                    rows: vec![super::Row::from([
+                        ("id", super::Cell::from_text("d0")),
+                        ("title", super::Cell::from_text("seed-patched")),
+                    ])],
+                },
+                super::Pack::Delete {
+                    collection: "docs".into(),
+                    rows: vec![super::Row::from([("id", super::Cell::from_text("d1"))])],
+                },
+            ],
+        };
+        store.apply_pack_mem_only(&batch);
+        assert_eq!(store.disk_engine_read().unwrap().wal_bytes, 0);
+        assert_eq!(store.get_col_count("docs"), 1);
+        let d0 = store.disk_point_row("docs", "id", "d0").unwrap();
+        assert_eq!(d0.get("title").and_then(super::Cell::text), Some("seed-patched"));
+        assert!(store.disk_point_row("docs", "id", "d1").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

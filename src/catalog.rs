@@ -488,7 +488,7 @@ fn apply_catalog_filter(q: &mut Query, cat: &Catalog) {
     q.steps.insert(0, Step::Filter(pred));
 }
 
-pub fn fixture() -> Catalog {
+fn build_fixture() -> Catalog {
     let mut collections = BTreeMap::new();
     collections.insert(
         "docs".into(),
@@ -620,6 +620,11 @@ pub fn fixture() -> Catalog {
     };
     cat.refresh_hash();
     cat
+}
+
+pub fn fixture() -> Catalog {
+    static DEFAULT_FIXTURE: std::sync::OnceLock<Catalog> = std::sync::OnceLock::new();
+    DEFAULT_FIXTURE.get_or_init(build_fixture).clone()
 }
 
 struct Fnv1aWriter(u64);
@@ -808,5 +813,22 @@ mod tests {
             matches!(inner.steps.first(), Some(Step::Filter(_))),
             "union branch missed its catalog filter"
         );
+    }
+
+    #[test]
+    fn fixture_singleton_preserves_hash_and_isolated_clones() {
+        let a = fixture();
+        let mut b = fixture();
+        assert_eq!(a.hash_u64(), b.hash_u64());
+        assert_eq!(a.hash_str(), b.hash_str());
+        assert!(Arc::ptr_eq(&a.cached_hash_hex, &b.cached_hash_hex));
+        b.apply_decl(&Decl::Rel {
+            name: "custom_rel".into(),
+            stub: false,
+        })
+        .unwrap();
+        assert!(a.rel("custom_rel").is_none());
+        assert!(b.rel("custom_rel").is_some());
+        assert_ne!(a.hash_u64(), b.hash_u64());
     }
 }
