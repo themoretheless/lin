@@ -14,3 +14,20 @@ Each host ran 24 trials per size. Each trial measured Lin, a second invocation o
 Lin won 136 of 144 paired trials. The smallest median margin was 0.212 ms at 1,000 rows on EPYC 9V74.
 
 [CI artifacts and runner provenance](https://github.com/themoretheless/lin/actions/runs/45794293605)
+
+## Uniform ID candidate
+
+Engine candidate 154c986e4 ran the same balanced FULL-sync commit and recovery protocol. Three runners qualified. The other two x64 runners skipped measurement under the CPU filter. All measured jobs succeeded.
+
+| CPU / runner | Rows | Lin ms | SQLite ms | Lin wins / 24 |
+|---|---:|---:|---:|---:|
+| EPYC 7763 / amd-1 | 1,000 | 3.103 | 3.602 | 24 |
+| EPYC 7763 / amd-1 | 10,000 | 28.326 | 36.248 | 24 |
+| EPYC 7763 / amd-3 | 1,000 | 2.868 | 3.457 | 23 |
+| EPYC 7763 / amd-3 | 10,000 | 27.219 | 35.480 | 24 |
+| Neoverse N2 | 1,000 | 2.079 | 2.440 | 24 |
+| Neoverse N2 | 10,000 | 20.241 | 27.303 | 24 |
+
+Lin won 143 of 144 pairs. This comparison measures the candidate against SQLite. Earlier revision timings came from different runners and cannot establish the candidate's incremental speedup.
+
+[Paired samples and verified recovery run](https://github.com/themoretheless/lin/actions/runs/45817863320)
