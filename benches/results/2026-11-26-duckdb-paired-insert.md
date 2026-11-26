@@ -288,3 +288,18 @@ In two independent runs, all eight host/run medians showed slower 10k repeats an
 |---|---:|---:|---:|---:|
 | [45786610712](https://github.com/themoretheless/lin/actions/runs/45786610712) | +0.272 to +0.541 | 74/100 | −4.906 to −0.860 | 25/100 |
 | [45821850933](https://github.com/themoretheless/lin/actions/runs/45821850933) | +0.242 to +0.473 | 73/100 | −4.356 to −1.693 | 20/100 |
+
+## glibc top_pad at 2 MiB
+
+Both peers received the same top_pad setting in their treatment processes. No explicit huge-page hint was set. Values are median paired differences in milliseconds (Lin treatment minus the comparison). Each host used 25 pairs per size. Repeats use the median of four subsequent inserts in fresh databases.
+
+| CPU / runner | First 10k vs DuckDB | Repeat 10k vs DuckDB | First 100k vs DuckDB | Repeat 100k vs DuckDB | First 100k vs default Lin | Repeat 100k vs default Lin |
+|---|---:|---:|---:|---:|---:|---:|
+| EPYC 7763 amd-1 | −1.866 | −11.650 | +23.716 | −53.453 | −7.038 | +7.812 |
+| EPYC 9V74 amd-3 | −1.770 | −9.402 | +19.689 | −37.150 | −4.857 | +7.892 |
+| EPYC 7763 amd-4 | −1.941 | −11.808 | +28.895 | −45.674 | −8.177 | +11.152 |
+| Neoverse-N2 arm64 | −14.161 | −18.632 | −117.613 | −150.244 | −1.393 | +4.379 |
+
+Reject 2 MiB top_pad as a default. On EPYC it lost all 75 cold 100k comparisons against DuckDB and increased Lin's repeat 100k median on all four hosts.
+
+[Raw samples and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45828769837)
