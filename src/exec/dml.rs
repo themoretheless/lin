@@ -2478,11 +2478,11 @@ fn run_build_chunks(task: &BuildTask, is_caller: bool) {
         let recs = unsafe {
             &std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)[start..end]
         };
+        // Each claimed chunk owns only its output slots. Other workers may
+        // already hold mutable references to the neighboring slots.
         let out = unsafe {
-            &mut std::slice::from_raw_parts_mut(
-                task.out_ptr as *mut std::mem::MaybeUninit<Row>,
-                task.n,
-            )[start..end]
+            let base = task.out_ptr as *mut std::mem::MaybeUninit<Row>;
+            std::slice::from_raw_parts_mut(base.add(start), end - start)
         };
         let (u, e, l) = build_batch_shape_rows_into(
             out,
