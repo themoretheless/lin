@@ -151,6 +151,8 @@ impl FtsIndex {
                     return;
                 }
                 let fused_ascii = std::env::var_os("LIN_BENCH_FTS_FUSED_ASCII").is_some();
+                let buffer_common = std::env::var_os("LIN_BENCH_FTS_BUFFER_COMMON").is_some();
+                let mut buffered: SmallVec<[(Arc<str>, Vec<usize>); 8]> = SmallVec::new();
                 let mut scratch = String::with_capacity(256);
                 for (i, row) in rows.iter().enumerate() {
                     let row_idx = start + i;
@@ -160,17 +162,42 @@ impl FtsIndex {
                         let pos = m.trailing_zeros() as usize;
                         m &= m - 1;
                         if let Some(text) = cells[pos].text() {
+                            let mut visit = |tok: &str| {
+                                if buffer_common {
+                                    if let Some((_, indexes)) =
+                                        buffered.iter_mut().find(|(key, _)| key.as_ref() == tok)
+                                    {
+                                        if indexes.last() != Some(&row_idx) {
+                                            indexes.push(row_idx);
+                                        }
+                                        return;
+                                    }
+                                    if buffered.len() < 8 {
+                                        buffered.push((Arc::from(tok), vec![row_idx]));
+                                        return;
+                                    }
+                                }
+                                add_posting(&mut self.postings, tok, row_idx);
+                            };
                             if fused_ascii && text.is_ascii() {
-                                for_each_lower_ascii_word(text, &mut scratch, |tok| {
-                                    add_posting(&mut self.postings, tok, row_idx);
-                                });
+                                for_each_lower_ascii_word(text, &mut scratch, &mut visit);
                             } else {
-                                let lowered = lowercased(text, &mut scratch);
-                                for_each_word(lowered, |tok| {
-                                    add_posting(&mut self.postings, tok, row_idx);
-                                });
+                                for_each_word(lowercased(text, &mut scratch), &mut visit);
                             }
                         }
+                    }
+                }
+                for (token, indexes) in buffered {
+                    if let Some(postings) = self.postings.get_mut(token.as_ref()) {
+                        if postings.last().is_none_or(|last| *last < indexes[0]) {
+                            postings.extend(indexes);
+                            continue;
+                        }
+                        for index in indexes {
+                            add_posting(&mut self.postings, &token, index);
+                        }
+                    } else {
+                        self.postings.insert(token, SmallVec::from_vec(indexes));
                     }
                 }
                 return;
