@@ -328,6 +328,10 @@ export LIN_BENCH_MYSQL_URL='mysql://lin:lin@127.0.0.1:53306/lin'
 
 Dev-deps: `airbug` (unit) и `airbug-bench` (бенчи) с ветки `release`; плюс `postgres` / `mysql`.
 
+## Сборка CLI для Linux
+
+Для нативной release-сборки CLI и бенч-бинарника выполните `scripts/build-linux-release.sh` из корня проекта. На x86_64 GNU/Linux сборке нужны C++ и статический архив `libtcmalloc_minimal.a` из пакета разработки gperftools. Если архив лежит вне путей поиска компилятора, укажите его полный путь в `LIN_TCMALLOC_ARCHIVE`. Готовые бинарники находятся в `target/release/` при стандартных настройках Cargo. TCMalloc включён в оба x64-бинарника при линковке. На ARM64 скрипт использует системный аллокатор. [Результаты парных замеров](benches/results/2026-11-26-linux-linked-allocator.md)
+
 ## Запуск
 
 ```bash
