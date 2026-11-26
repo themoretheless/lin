@@ -428,3 +428,19 @@ Median paired Lin minus DuckDB milliseconds, default / THP, 25 pairs per size pe
 | ARM64 Neoverse-N2 | −13.20 / −15.55 | −18.55 / −18.39 | −116.11 / −142.87 | −155.82 / −156.91 |
 
 Lin won all 500 THP comparisons. At default settings first 100k lost 75/75 pairs across the 7763 and 9V74 hosts. [Run and raw paired samples](https://github.com/themoretheless/lin/actions/runs/45840431320)
+
+## Inline full-text terms up to 22 bytes
+
+Candidate 0add1938e against baseline 9f518bd41. In the first qualification, repeat 100k improved by a paired median of 5.23–7.99 ms on all five hosts (37/40 wins). First 100k on ARM64 regressed by a median of 0.97 ms (3/8 wins). On EPYC 7763 repeat 10k slowed by 0.49 ms (1/8 wins). Keep the candidate experimental pending independent replication.
+
+Median paired Lin minus DuckDB milliseconds, default / THP. Each cell summarizes 25 pairs per mode.
+
+| Host | First 10k | Repeat 10k | First 100k | Repeat 100k |
+|---|---:|---:|---:|---:|
+| EPYC 9V45 amd-1 | −6.85 / −7.65 | −9.29 / −9.26 | −52.27 / −62.25 | −70.31 / −74.76 |
+| EPYC 9V45 amd-2 | −6.87 / −7.86 | −9.31 / −9.32 | −50.94 / −64.83 | −75.23 / −77.50 |
+| EPYC 7763 | −1.05 / −6.44 | −10.88 / −10.74 | +23.62 / −35.62 | −67.02 / −66.92 |
+| EPYC 9V74 | −0.28 / −4.79 | −8.73 / −8.43 | +26.23 / −29.05 | −46.00 / −50.52 |
+| Neoverse-N2 | −13.31 / −15.50 | −18.66 / −18.40 | −121.78 / −145.28 | −160.61 / −160.38 |
+
+The default first 100k lost all 50 pairs across EPYC 7763 and 9V74. THP won 500/500 pairs. [First qualification and raw samples](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/1)
