@@ -45,9 +45,13 @@ def measure_lin(worker, rows, allocator="lin"):
     env.pop("LIN_BENCH_FTS_SMALLER_HEAD", None)
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
+    env.pop("LIN_BENCH_INSERT_BUILD_GRAIN", None)
+    env.pop("LIN_BENCH_BULK_BUILD_CHUNKS", None)
+    if allocator in ("grain128", "grain256"):
+        env["LIN_BENCH_INSERT_BUILD_GRAIN"] = allocator.removeprefix("grain")
     if allocator == "jemalloc":
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_JEMALLOC"]
-    if allocator in ("tcmalloc", "native_tcmalloc"):
+    if allocator in ("tcmalloc", "grain128", "grain256"):
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_TCMALLOC"]
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
@@ -56,12 +60,11 @@ def measure_lin(worker, rows, allocator="lin"):
     return result["samples_ns"][0], result["embedding_hash"]
 
 
-def main(worker, native_worker, output):
-    roles = ("lin", "control", "jemalloc", "tcmalloc", "native_tcmalloc", "duckdb")
+def main(worker, output):
+    roles = ("lin", "control", "jemalloc", "tcmalloc", "grain128", "grain256", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
-        native_worker_sha256=hashlib.sha256(native_worker.read_bytes()).hexdigest(),
         samples=[],
     )
     rng = random.Random(2929273)
@@ -83,8 +86,7 @@ def main(worker, native_worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        binary = native_worker if role == "native_tcmalloc" else worker
-                        timings[role], digest = measure_lin(binary, rows, role)
+                        timings[role], digest = measure_lin(worker, rows, role)
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -97,14 +99,23 @@ def main(worker, native_worker, output):
         jemalloc_gain = median(1 - x["jemalloc"] / x["lin"] for x in pairs)
         tcmalloc_gain = median(1 - x["tcmalloc"] / x["jemalloc"] for x in pairs)
         tcmalloc_wins = sum(x["tcmalloc"] < x["duckdb"] for x in pairs)
-        native_gain = median(1 - x["native_tcmalloc"] / x["tcmalloc"] for x in pairs)
-        native_wins = sum(x["native_tcmalloc"] < x["duckdb"] for x in pairs)
+        grain_results = {
+            role: (
+                median(1 - x[role] / x["tcmalloc"] for x in pairs),
+                sum(x[role] < x["duckdb"] for x in pairs),
+            )
+            for role in ("grain128", "grain256")
+        }
+        grain_summary = ", ".join(
+            f"{role} gain vs TCMalloc {gain:.2%}, wins {wins}/{len(pairs)}"
+            for role, (gain, wins) in grain_results.items()
+        )
         jemalloc_wins = sum(x["jemalloc"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
               f"A/A {noise:.2%}, jemalloc gain {jemalloc_gain:.2%}, "
               f"jemalloc wins {jemalloc_wins}/{len(pairs)}, tcmalloc gain vs jemalloc "
               f"{tcmalloc_gain:.2%}, tcmalloc wins {tcmalloc_wins}/{len(pairs)}, "
-              f"native gain vs generic TCMalloc {native_gain:.2%}, native wins {native_wins}/{len(pairs)}", flush=True)
+              f"{grain_summary}", flush=True)
 
 
 if __name__ == "__main__":

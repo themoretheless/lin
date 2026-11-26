@@ -2574,10 +2574,13 @@ fn build_insert_rows(
     if n >= 512 {
         let workers = insert_build_workers();
         if !workers.is_empty() {
-            let chunk_size = if n >= 4096
-                && std::env::var_os("LIN_BENCH_BULK_BUILD_CHUNKS").is_some()
-            {
-                512
+            let chunk_size = if n >= 4096 {
+                match std::env::var("LIN_BENCH_INSERT_BUILD_GRAIN").as_deref() {
+                    Ok("128") => 128,
+                    Ok("256") => 256,
+                    _ if std::env::var_os("LIN_BENCH_BULK_BUILD_CHUNKS").is_some() => 512,
+                    _ => 64,
+                }
             } else {
                 64
             };
