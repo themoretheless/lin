@@ -14,13 +14,14 @@ for trial in range(8):
             env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
         run = subprocess.run([sys.argv[1]], text=True, input=request, env=env, capture_output=True, check=True)
         data = json.loads(run.stdout)
-        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": [], "sampled_vector_ns": [], "sampled_cells_ns": [], "sampled_rows": [], "fill_ns": [], "copy_ns": []}
+        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": [], "sampled_vector_ns": [], "sampled_cells_ns": [], "sampled_rows": [], "fill_ns": [], "copy_ns": [], "alloc_ns": [], "write_ns": []}
         for line in run.stderr.splitlines():
             if line.startswith("insert_profile "):
                 _, component, ns = line.split()
                 components[component].append(int(ns))
         assert all(len(values) == 30 for values in components.values())
         assert min(components["fill_ns"]) > 0 and min(components["copy_ns"]) > 0
+        assert all(a + w == c for a, w, c in zip(components["alloc_ns"], components["write_ns"], components["copy_ns"]))
         sampled_rows = components.pop("sampled_rows")
         assert sampled_rows == [625] * 30
         assert len(data["result"]) == 100000

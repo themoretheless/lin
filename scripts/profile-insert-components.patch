@@ -1,8 +1,8 @@
 diff --git a/src/embed.rs b/src/embed.rs
-index 7e03a3704..7590c1a51 100644
+index 7e03a3704..10379115b 100644
 --- a/src/embed.rs
 +++ b/src/embed.rs
-@@ -207,6 +207,12 @@ pub(crate) struct HashingBatch<'a> {
+@@ -207,6 +207,14 @@ pub(crate) struct HashingBatch<'a> {
      text_buf: &'a mut String,
  }
  
@@ -11,11 +11,13 @@ index 7e03a3704..7590c1a51 100644
 +}
 +pub(crate) static FILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 +pub(crate) static COPY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub(crate) static ALLOC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub(crate) static WRITE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 +
  impl HashingBatch<'_> {
      #[inline]
      pub(crate) fn embed_parts(&mut self, texts: [Option<&str>; 3]) -> Arc<[f32]> {
-@@ -233,7 +239,11 @@ impl HashingBatch<'_> {
+@@ -233,7 +241,11 @@ impl HashingBatch<'_> {
                  self.lower.push_str(text);
              }
              self.lower.make_ascii_lowercase();
@@ -27,23 +29,35 @@ index 7e03a3704..7590c1a51 100644
              return self.scratch.finish();
          }
          self.text_buf.clear();
-@@ -642,7 +652,11 @@ impl Scratch {
+@@ -642,7 +654,22 @@ impl Scratch {
          } else {
              l2_normalize(&mut self.v);
          }
-+        let start = PROFILE_ROW.get().then(std::time::Instant::now);
-         let out = Arc::from(&self.v[..]);
-+        if let Some(start) = start {
-+            COPY_NS.fetch_add(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-+        }
+-        let out = Arc::from(&self.v[..]);
++        let out = if PROFILE_ROW.get() {
++            use std::sync::atomic::Ordering::Relaxed;
++            let start = std::time::Instant::now();
++            let mut buffer = Arc::<[f32]>::new_uninit_slice(self.v.len());
++            let allocated = std::time::Instant::now();
++            Arc::get_mut(&mut buffer).unwrap().write_copy_of_slice(&self.v);
++            // Every element was initialized by the full-slice copy.
++            let output = unsafe { buffer.assume_init() };
++            let end = std::time::Instant::now();
++            ALLOC_NS.fetch_add((allocated - start).as_nanos() as u64, Relaxed);
++            WRITE_NS.fetch_add((end - allocated).as_nanos() as u64, Relaxed);
++            COPY_NS.fetch_add((end - start).as_nanos() as u64, Relaxed);
++            output
++        } else {
++            Arc::from(&self.v[..])
++        };
          for &i in &self.touched {
              self.v[i as usize] = 0.0;
          }
 diff --git a/src/exec/dml.rs b/src/exec/dml.rs
-index 063c5b1e2..4fa3be7ca 100644
+index 063c5b1e2..14f3b56f9 100644
 --- a/src/exec/dml.rs
 +++ b/src/exec/dml.rs
-@@ -1205,8 +1205,25 @@ impl Db {
+@@ -1205,8 +1205,27 @@ impl Db {
          } else {
              None
          };
@@ -61,6 +75,8 @@ index 063c5b1e2..4fa3be7ca 100644
 +        eprintln!("insert_profile build {build_ns}");
 +        eprintln!("insert_profile fill_ns {}", crate::embed::FILL_NS.swap(0, Ordering::Relaxed));
 +        eprintln!("insert_profile copy_ns {}", crate::embed::COPY_NS.swap(0, Ordering::Relaxed));
++        eprintln!("insert_profile alloc_ns {}", crate::embed::ALLOC_NS.swap(0, Ordering::Relaxed));
++        eprintln!("insert_profile write_ns {}", crate::embed::WRITE_NS.swap(0, Ordering::Relaxed));
 +        eprintln!("insert_profile sampled_vector_ns {}", SAMPLED_VECTOR_NS.swap(0, Ordering::Relaxed));
 +        eprintln!("insert_profile sampled_cells_ns {}", SAMPLED_CELLS_NS.swap(0, Ordering::Relaxed));
 +        eprintln!("insert_profile sampled_rows {}", SAMPLED_ROWS.swap(0, Ordering::Relaxed));
@@ -69,7 +85,7 @@ index 063c5b1e2..4fa3be7ca 100644
          // Any record without an explicit id gets a generated one, wherever it sits in the
          // batch (deciding from the first record left later id-less rows without an id).
          let needs_id = records.is_empty()
-@@ -2696,6 +2713,11 @@ fn build_insert_rows(
+@@ -2696,6 +2715,11 @@ fn build_insert_rows(
      (rows, all_uniform, all_embedded, lossless_cols)
  }
  
@@ -81,7 +97,7 @@ index 063c5b1e2..4fa3be7ca 100644
  fn build_batch_shape_rows_into(
      out: &mut [std::mem::MaybeUninit<Row>],
      records: &[Record],
-@@ -2713,6 +2735,7 @@ fn build_batch_shape_rows_into(
+@@ -2713,6 +2737,7 @@ fn build_batch_shape_rows_into(
          }
          return (false, !needs_embed, false);
      }
@@ -89,7 +105,7 @@ index 063c5b1e2..4fa3be7ca 100644
      let body_idx = first.fields.iter().rposition(|(k, _)| k == "body");
      let has_hash = first.fields.iter().any(|(k, _)| k == "hash");
      let needs_hash = !has_hash && body_idx.is_some();
-@@ -2775,8 +2798,12 @@ fn build_batch_shape_rows_into(
+@@ -2775,8 +2800,12 @@ fn build_batch_shape_rows_into(
      let mut first_kinds = [0u8; 32];
      let mut have_first_kinds = false;
  
@@ -103,7 +119,7 @@ index 063c5b1e2..4fa3be7ca 100644
              let same_shape = record.fields.len() == first.fields.len()
                  && record
                      .fields
-@@ -2792,6 +2819,7 @@ fn build_batch_shape_rows_into(
+@@ -2792,6 +2821,7 @@ fn build_batch_shape_rows_into(
                  slot_out.write(record_row(record, now));
                  continue;
              }
@@ -111,7 +127,7 @@ index 063c5b1e2..4fa3be7ca 100644
              let mut emb_vec = if let Some(batch) = embed_batch.as_deref_mut() {
                  let t_opt = title_idx.map(|i| &record.fields[i].1);
                  let b_opt = body_idx.map(|i| &record.fields[i].1);
-@@ -2821,7 +2849,10 @@ fn build_batch_shape_rows_into(
+@@ -2821,7 +2851,10 @@ fn build_batch_shape_rows_into(
                      }
                  };
                  if all_embedded && t_str.or(b_str).or(s_str).is_some_and(|s| !s.is_empty()) {
@@ -123,7 +139,7 @@ index 063c5b1e2..4fa3be7ca 100644
                  } else {
                      all_embedded = false;
                      None
-@@ -2830,6 +2861,11 @@ fn build_batch_shape_rows_into(
+@@ -2830,6 +2863,11 @@ fn build_batch_shape_rows_into(
                  None
              };
  
@@ -135,7 +151,7 @@ index 063c5b1e2..4fa3be7ca 100644
              macro_rules! eval_slot_cell {
                  ($slot:expr) => {
                      match $slot {
-@@ -2903,7 +2939,14 @@ fn build_batch_shape_rows_into(
+@@ -2903,7 +2941,14 @@ fn build_batch_shape_rows_into(
                  }
                  slot_out.write(Row::from_vec_parts(Arc::clone(&shape), cells));
              }
