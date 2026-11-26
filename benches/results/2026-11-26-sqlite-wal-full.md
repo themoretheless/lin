@@ -52,3 +52,20 @@ Balanced order, 24 pairs per host and size. Delta is the median paired candidate
 ### Decision on uniform ID presence
 
 On ARM N2 the median paired candidate-minus-base difference at 1k was +0.062 ms when the candidate ran before the base and +0.041 ms in the reverse order (12 pairs per group). At 10k the two order groups had opposite signs (−0.256 and +0.327 ms). The distribution-free median intervals using the seventh and eighteenth ordered differences out of 24 span zero on ARM at both sizes (1k −0.045 to +0.136 ms, 10k −0.429 to +0.562 ms). One 9V45 host showed a positive 10k interval (+0.028 to +0.830 ms), while the other spanned zero. These are individual-host exploratory intervals. Given the ARM qualification condition and the remaining EPYC cold-INSERT deficit, the ID-presence shortcut was withdrawn. The separate field-order correctness fix and regression tests remain.
+
+## Symmetric glibc THP comparison after withdrawing the ID shortcut
+
+Four alternating mode blocks, six permutations of Lin, Lin control and SQLite per block and size. Each mode has 24 pairs. Every sample verifies recovered rows. Times are median milliseconds including commit.
+
+| CPU | Runner | Rows | Default Lin / SQLite | Default wins | THP Lin / SQLite | THP wins |
+|---|---|---:|---:|---:|---:|---:|
+| AMD EPYC 9V45 96-Core Processor | wal-full-amd-1 | 1000 | 1.356 / 2.002 | 23/24 | 1.274 / 1.982 | 24/24 |
+| AMD EPYC 9V45 96-Core Processor | wal-full-amd-1 | 10000 | 13.158 / 20.980 | 23/24 | 10.307 / 20.917 | 23/24 |
+| AMD EPYC 9V74 80-Core Processor | wal-full-amd-3 | 1000 | 2.320 / 2.585 | 23/24 | 2.142 / 2.569 | 22/24 |
+| AMD EPYC 9V74 80-Core Processor | wal-full-amd-3 | 10000 | 24.553 / 27.178 | 17/24 | 16.980 / 26.623 | 20/24 |
+| AMD EPYC 9V74 80-Core Processor | wal-full-amd-4 | 1000 | 2.306 / 2.556 | 22/24 | 2.063 / 2.547 | 24/24 |
+| AMD EPYC 9V74 80-Core Processor | wal-full-amd-4 | 10000 | 28.057 / 29.204 | 14/24 | 19.859 / 28.974 | 22/24 |
+| Neoverse-N2 | wal-full-arm64 | 1000 | 2.080 / 2.404 | 23/24 | 1.841 / 2.412 | 24/24 |
+| Neoverse-N2 | wal-full-arm64 | 10000 | 15.375 / 24.840 | 24/24 | 13.168 / 24.646 | 24/24 |
+
+[Raw samples and runner provenance](https://github.com/themoretheless/lin/actions/runs/45820416806)
