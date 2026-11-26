@@ -4,7 +4,7 @@ The rows link to independently measured workloads. Dates, Lin revisions, hardwar
 
 | Peer | Verified workload and scope | Evidence |
 |---|---|---|
-| DuckDB | On three EPYC hosts the default first 100k INSERT lost all 75 pairs in the wide-row candidate run. With THP enabled for both engines Lin won all 400 pairs across EPYC and ARM64. The candidate was withdrawn. | [Local ARM64 matrix](2026-11-26-embedded-peer-refresh/report.md) and [paired Linux INSERT and profiles](2026-11-26-duckdb-paired-insert.md) |
+| DuckDB | In the paired run of candidate 417c1fc8d, the default first 100k INSERT lost all 75 EPYC pairs, while all 75 repeat pairs won. With THP requested for both engines Lin won 399/400 pairs across EPYC and ARM64. The single loss was a first 10k INSERT on EPYC 7763. This candidate was withdrawn after comparison with the Lin control. | [Local ARM64 matrix](2026-11-26-embedded-peer-refresh/report.md), [paired run 45821850933](https://github.com/themoretheless/lin/actions/runs/45821850933) and [paired Linux INSERT and profiles](2026-11-26-duckdb-paired-insert.md) |
 | SQLite | WAL/FULL at 1k and 10k on EPYC 7763, EPYC 9V74 and ARM64 N2. Lin won all six medians and 136 of 144 pairs with recovery verified. | [Local ARM64 matrix](2026-11-26-embedded-peer-refresh/report.md) and [WAL/FULL](2026-11-26-sqlite-wal-full.md) |
 | PostgreSQL | Six read cases and COPY plus commit, at all three sizes, on the November ARM64 worker. | [Public matrix](2026-11-26-local-peer-refresh/report.md) |
 | MySQL | Six read cases and multi-row insert plus commit at all three sizes on the same frozen build. | [Public matrix](2026-11-26-local-peer-refresh/report.md) |
