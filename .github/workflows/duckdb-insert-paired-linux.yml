@@ -38,14 +38,6 @@ jobs:
         if: steps.cpu.outputs.matched == 'true'
         run: |
           cargo build --locked --release -p lin-peer-worker
-          cp target/release/lin-peer-worker generic-worker
-          native_flags="-C target-cpu=native"
-          if [[ "$(uname -m)" == aarch64 ]]; then
-            native_flags+=" -C target-feature=-dotprod"
-          fi
-          RUSTFLAGS="$native_flags" cargo build --locked --release -p lin-peer-worker
-          cp target/release/lin-peer-worker native-worker
-          printf '%s\n' "$native_flags" > native-rustflags.txt
           python3 -m pip install -r scripts/bench-peers-requirements.lock
       - name: Locate jemalloc for the comparison
         if: steps.cpu.outputs.matched == 'true'
@@ -65,9 +57,9 @@ jobs:
           uname -a >> duckdb-provenance.txt
           lscpu >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
-          sha256sum generic-worker native-worker >> duckdb-provenance.txt
-          python3 scripts/bench-duckdb-insert-paired.py generic-worker native-worker duckdb-results.json | tee duckdb-summary.txt
-          python3 scripts/profile-duckdb-insert-transaction.py generic-worker duckdb-phases.json | tee duckdb-phases.txt
+          sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
+          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+          python3 scripts/profile-duckdb-insert-transaction.py target/release/lin-peer-worker duckdb-phases.json | tee duckdb-phases.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -75,7 +67,6 @@ jobs:
           path: |
             runner-cpu.txt
             jemalloc-provenance.txt
-            native-rustflags.txt
             duckdb-results.json
             duckdb-summary.txt
             duckdb-phases.json
