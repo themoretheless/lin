@@ -48,3 +48,7 @@ Balanced order, 24 pairs per host and size. Delta is the median paired candidate
 | Neoverse-N2 (wal-full-arm64) | 10000 | 20.243 | 20.221 | 27.042 | 0.110 | 12/24 | 24/24 |
 
 [Full-sync paired measurements](https://github.com/themoretheless/lin/actions/runs/45818768030)
+
+### Decision on uniform ID presence
+
+On ARM N2 the median paired candidate-minus-base difference at 1k was +0.062 ms when the candidate ran before the base and +0.041 ms in the reverse order (12 pairs per group). At 10k the two order groups had opposite signs (−0.256 and +0.327 ms). The distribution-free median intervals using the seventh and eighteenth ordered differences out of 24 span zero on ARM at both sizes (1k −0.045 to +0.136 ms, 10k −0.429 to +0.562 ms). One 9V45 host showed a positive 10k interval (+0.028 to +0.830 ms), while the other spanned zero. These are individual-host exploratory intervals. Given the ARM qualification condition and the remaining EPYC cold-INSERT deficit, the ID-presence shortcut was withdrawn. The separate field-order correctness fix and regression tests remain.
