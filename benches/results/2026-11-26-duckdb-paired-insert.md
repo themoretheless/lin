@@ -412,3 +412,19 @@ Median milliseconds per 100k transaction, default allocator, first / repeat. Lef
 | ARM64 Neoverse-N2 | 23.04 / 21.24 | 11.12 / 12.52 | 8.67 / 9.59 | 9.10 / 6.24 |
 
 [Per-statement counters and timing samples](https://github.com/themoretheless/lin/actions/runs/45839343845)
+
+## Preparing hashes before the FTS merge
+
+Withdraw 2d408555d. Against baseline 9f518bd41 the candidate had a slower first 100k median on all five hosts (+0.155 to +1.096 ms), and won only 16/40 paired first inserts. Repeat 100k medians on all four EPYC hosts also regressed (+0.131 to +0.646 ms).
+
+Median paired Lin minus DuckDB milliseconds, default / THP, 25 pairs per size per host:
+
+| Host | First 10k | Repeat 10k | First 100k | Repeat 100k |
+|---|---:|---:|---:|---:|
+| EPYC 7763 amd-1 | −0.64 / −5.72 | −11.45 / −10.88 | +28.17 / −31.16 | −62.40 / −64.57 |
+| EPYC 9V74 | −0.57 / −5.28 | −9.14 / −8.83 | +25.56 / −26.67 | −43.27 / −47.83 |
+| EPYC 9V45 | −6.58 / −7.41 | −9.57 / −9.69 | −46.53 / −56.69 | −63.29 / −68.15 |
+| EPYC 7763 amd-4 | −0.60 / −5.75 | −10.69 / −10.36 | +26.06 / −32.40 | −64.89 / −64.83 |
+| ARM64 Neoverse-N2 | −13.20 / −15.55 | −18.55 / −18.39 | −116.11 / −142.87 | −155.82 / −156.91 |
+
+Lin won all 500 THP comparisons. At default settings first 100k lost 75/75 pairs across the 7763 and 9V74 hosts. [Run and raw paired samples](https://github.com/themoretheless/lin/actions/runs/45840431320)
