@@ -454,3 +454,12 @@ In attempt 1, process peak RSS sampled immediately after the first 100k transact
 | AMD EPYC 7763 64-Core Processor (amd-3) | -1.10 | -66.0 | 91290.0 |
 | AMD EPYC 9V74 80-Core Processor (amd-4) | -0.96 | -69.5 | 91292.0 |
 | Neoverse-N2 (arm64) | -1.57 | -67.0 | 91281.5 |
+
+Attempt 2 on the identical revision reproduced the repeat 100k improvement against baseline in all 16 pairs: 7.267 ms on EPYC 7763 and 5.671 ms on ARM64. The earlier ARM64 first 100k slowdown did not repeat (4.054 ms faster, 8/8 wins). ARM64 first 10k was 0.164 ms slower, 1/8 wins. EPYC first 100k improved by 2.738 ms, 6/8 wins. Three other x64 jobs ran on non-target CPUs and returned no timings.
+
+| Host | First 10k | Repeat 10k | First 100k | Repeat 100k |
+|---|---:|---:|---:|---:|
+| EPYC 7763 | −0.42 / −5.93 | −11.19 / −10.45 | +25.21 / −33.88 | −63.20 / −67.11 |
+| Neoverse-N2 | −13.48 / −15.77 | −18.71 / −18.50 | −121.85 / −145.90 | −160.72 / −161.50 |
+
+Values are paired Lin minus DuckDB milliseconds, default / THP. The default first 100k lost all 25 EPYC pairs. Lin won all 200 THP pairs. [Independent repeat](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/2).
