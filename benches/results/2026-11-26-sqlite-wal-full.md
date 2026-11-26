@@ -80,3 +80,12 @@ Revision 8950abf0a, macOS ARM64, SQLite 3.54.1. Four blocks cover all six proces
 | 10000 | 6.915 | 15.434 | -8.649 | 24/24 |
 
 On the same M4 Max, compare candidate 8950abf0a directly with Lin baseline 28d181d78. Each of 24 pairs per size alternated process order, used a fresh durable database for each binary, and checked every row after reopening. Median paired candidate minus baseline was −0.030 ms at 1k (14/24 wins) and +0.020 ms at 10k (11/24 wins). This comparison provides no consistent durable latency win.
+
+## FTS prehash candidate on Apple M4 Max
+
+Revision 2d408555d against SQLite 3.54.1, four balanced blocks with reopen and exact readback. The 1k batch falls below the 4096-row parallel FTS threshold.
+
+| Rows | Lin median ms | SQLite median ms | Median paired Lin minus SQLite ms | Lin wins |
+|---|---:|---:|---:|---:|
+| 1000 | 1.454 | 1.420 | +0.057 | 7/24 |
+| 10000 | 6.952 | 15.148 | -8.145 | 24/24 |
