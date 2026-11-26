@@ -25,6 +25,9 @@ def fixture(n):
 def run_lin(worker, directory, rows):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, durable_dir=directory)
     result = json.loads(subprocess.check_output([worker], input=json.dumps(request) + "\n", text=True))
+    if not (len(result.get("reopen_ns", [])) == 1 and result["reopen_ns"][0] > 0
+            and any(Path(directory).iterdir())):
+        raise ValueError("Lin worker did not confirm a durable database reopen")
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin durable INSERT readback disagrees with fixture")
     return result["samples_ns"][0]
