@@ -1,0 +1,65 @@
+name: WAL FULL regression check for parallel FTS
+on:
+  push:
+    branches: [codex/fts-wal-full-qualification]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-22.04, replica: amd-1}
+          - {runner: ubuntu-22.04, replica: amd-2}
+          - {runner: ubuntu-22.04, replica: amd-3}
+          - {runner: ubuntu-22.04, replica: amd-4}
+          - {runner: ubuntu-22.04, replica: amd-5}
+          - {runner: ubuntu-22.04, replica: amd-6}
+          - {runner: ubuntu-22.04, replica: amd-7}
+          - {runner: ubuntu-22.04, replica: amd-8}
+          - {runner: ubuntu-24.04-arm, replica: arm64}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Record CPU and select target hosts
+        id: cpu
+        run: |
+          lscpu > runner-cpu.txt
+          if [[ "$(uname -m)" = aarch64 ]] || grep -Eq 'AMD EPYC (9V74|7763)' runner-cpu.txt; then
+            echo 'matched=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.cpu.outputs.matched == 'true'
+        with:
+          toolchain: '1.96.0'
+      - name: Build locked release worker
+        if: steps.cpu.outputs.matched == 'true'
+        run: |
+          cargo build --locked --release -p lin-peer-worker --bin lin-peer-worker
+          cp target/release/lin-peer-worker candidate-worker
+          git worktree add --detach "$RUNNER_TEMP/lin-baseline" b75047d29
+          cp tools/peer-worker/src/main.rs "$RUNNER_TEMP/lin-baseline/tools/peer-worker/src/main.rs"
+          (cd "$RUNNER_TEMP/lin-baseline" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release -p lin-peer-worker --bin lin-peer-worker)
+          cp target/release/lin-peer-worker baseline-worker
+      - name: Measure WAL FULL with paired controls
+        if: steps.cpu.outputs.matched == 'true'
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > wal-provenance.txt
+          uname -a >> wal-provenance.txt
+          lscpu >> wal-provenance.txt
+          rustc -Vv >> wal-provenance.txt
+          sha256sum baseline-worker candidate-worker >> wal-provenance.txt
+          python3 scripts/bench-wal-refresh.py ./candidate-worker ./baseline-worker scripts/bench-wal-full.py wal-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wal-epyc-${{ matrix.replica }}
+          path: |
+            runner-cpu.txt
+            wal-results.json
+            wal-provenance.txt
