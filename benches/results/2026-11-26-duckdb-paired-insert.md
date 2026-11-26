@@ -362,3 +362,22 @@ In the same profile, pair THP and default processes by trial number and subtract
 | ARM64 Neoverse-N2 | 24.01 | 18.72 | 5.24 | 45609 | 0.21 |
 
 All 32 first transactions were faster with THP. Only 7 of 16 repeat pairs improved across the two 7763 hosts. These are diagnostic-build timings. The separate peer runs above measure release performance against DuckDB.
+
+## Post-build time on 100k inserts
+
+Medians in milliseconds from eight processes per host and mode. The validation interval includes checks for duplicate IDs and URIs. Maintenance includes row-map reservation and updates to store structures and indexes. Append moves completed rows into the collection. Sum each stage over ten statements per transaction and average the two repeat transactions within each process. EPYC ranges span three independent 7763 hosts.
+
+| Host | Mode | Transaction | Build | Validation | Maintenance | Append |
+|---|---|---|---:|---:|---:|---:|
+| EPYC 7763 | default | first | 126.13–128.65 | 8.13–8.69 | 46.84–49.21 | 7.31–7.37 |
+| EPYC 7763 | default | repeat | 54.88–60.62 | 7.55–8.24 | 41.18–42.34 | 1.55–1.66 |
+| EPYC 7763 | THP | first | 77.85–78.96 | 7.53–7.58 | 41.32–43.12 | 4.41–4.97 |
+| EPYC 7763 | THP | repeat | 61.59–61.99 | 7.28–7.53 | 39.35–39.71 | 0.73–0.87 |
+| Neoverse-N2 | default | first | 59.56 | 4.62 | 26.97 | 3.58 |
+| Neoverse-N2 | default | repeat | 31.91 | 4.57 | 24.65 | 0.73 |
+| Neoverse-N2 | THP | first | 40.62 | 4.13 | 22.82 | 2.13 |
+| Neoverse-N2 | THP | repeat | 33.51 | 4.04 | 22.30 | 0.39 |
+
+On the first default EPYC transaction, ID-map reservation accounted for 6.06–6.34 ms within maintenance. Identifying the remaining cost requires timings inside the maintenance routine.
+
+[Linux run and per-statement samples](https://github.com/themoretheless/lin/actions/runs/45837167074)
