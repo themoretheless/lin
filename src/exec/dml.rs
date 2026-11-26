@@ -1551,12 +1551,7 @@ impl Db {
                 .extend(built.iter().cloned());
             Ok((built, new_edges, staged))
         } else {
-            let rows = self.store.collection_append_mut(collection);
-            if rows.is_empty() && rows.capacity() <= built.capacity() {
-                *rows = built;
-            } else {
-                rows.extend(built);
-            }
+            self.store.collection_append_mut(collection).extend(built);
             Ok((Vec::new(), new_edges, staged))
         }
     }

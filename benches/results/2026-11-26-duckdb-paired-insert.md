@@ -303,3 +303,20 @@ Both peers received the same top_pad setting in their treatment processes. No ex
 Reject 2 MiB top_pad as a default. On EPYC it lost all 75 cold 100k comparisons against DuckDB and increased Lin's repeat 100k median on all four hosts.
 
 [Raw samples and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45828769837)
+
+## Transferring the first row buffer
+
+Candidate 8892009af reused the first batch's Vec. With default settings it won only 1/100 first 100k pairs against DuckDB on four EPYC 7763 runners. Its first 100k paired median versus the Lin baseline ranged from −3.314 to +5.987 ms across those hosts. With THP, two first 100k pairs on amd-2 still lost (498/500 wins overall).
+
+Candidate 8950abf0a also removed the destination reserve on an empty collection. Values below are median paired Lin minus DuckDB differences in milliseconds at default settings.
+
+| Host | First 10k | Repeat 10k | First 100k | Repeat 100k |
+|---|---:|---:|---:|---:|
+| EPYC 9V74 amd-1 | −1.710 | −9.130 | +20.327 | −46.687 |
+| EPYC 9V74 amd-2 | −1.135 | −9.125 | +25.672 | −42.207 |
+| EPYC 9V45 | −6.666 | −9.445 | −46.448 | −65.453 |
+| ARM64 Neoverse-N2 | −13.928 | −18.714 | −118.592 | −155.544 |
+
+The revised candidate lost all 50 default first 100k pairs on the two 9V74 hosts. It won all 400 THP pairs. Against the Lin baseline the first 10k improved on all four hosts (25/32 wins), but first 100k on ARM64 slowed by a paired median of 1.747 ms (3/8 wins). Both changes were withdrawn.
+
+[First candidate](https://github.com/themoretheless/lin/actions/runs/45830890614) and [revised candidate](https://github.com/themoretheless/lin/actions/runs/45831180568).

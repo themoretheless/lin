@@ -3899,11 +3899,7 @@ impl Store {
         if collection == "docs" {
             self.flush_fts_deferred_docs();
         }
-        let rows = self.collection_append_mut(collection);
-        // The first bulk append can transfer its completed Vec into the collection.
-        if !rows.is_empty() {
-            rows.reserve(built.len());
-        }
+        self.collection_append_mut(collection).reserve(built.len());
         self.row_maps_reserve(collection, built.len());
         let has_unique = self
             .indexes
