@@ -6,9 +6,11 @@
 //! them and only rebuilds missing / mismatched collections. WAL replay then
 //! updates postings incrementally.
 
-use rustc_hash::FxHashMap;
+use hashbrown::hash_map::RawEntryMut;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::{SmallVec, smallvec};
 use std::fs::{self, File};
+use std::hash::BuildHasher;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +19,8 @@ use crate::error::Error;
 use crate::persist::io_err;
 use crate::store::row::OwnedFieldSlot;
 use crate::store::{Cell, Row};
+
+type Postings = hashbrown::HashMap<Arc<str>, SmallVec<[usize; 2]>, FxBuildHasher>;
 
 pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
@@ -54,7 +58,7 @@ fn build_fts_slots(fields: &[String]) -> SmallVec<[OwnedFieldSlot; 4]> {
 pub struct FtsIndex {
     pub fields: Vec<String>,
     slots: SmallVec<[OwnedFieldSlot; 4]>,
-    postings: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: Postings,
     dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
 }
@@ -70,7 +74,7 @@ impl FtsIndex {
         Self {
             fields: fields.to_vec(),
             slots: build_fts_slots(fields),
-            postings: FxHashMap::default(),
+            postings: Postings::default(),
             dels: FxHashMap::default(),
             adds: FxHashMap::default(),
         }
@@ -616,7 +620,7 @@ impl FtsIndex {
         }
         let nterms = read_u32(bytes, &mut i)? as usize;
         let mut postings =
-            FxHashMap::with_capacity_and_hasher(nterms.min((bytes.len() - i) / 8), Default::default());
+            Postings::with_capacity_and_hasher(nterms.min((bytes.len() - i) / 8), Default::default());
         for _ in 0..nterms {
             let tok = read_arc_str(bytes, &mut i)?;
             let n = read_u32(bytes, &mut i)? as usize;
@@ -843,7 +847,7 @@ fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
 /// Insert into a sorted, unique pending list; merges rely on this invariant.
 fn push_pending(
     map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
-    postings: &FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &Postings,
     tok: &str,
     row_idx: usize,
 ) -> usize {
@@ -885,25 +889,34 @@ fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_id
 /// Add `row_idx` to a token's sorted list, allocating a posting list only when
 /// the token is new.
 fn add_posting(
-    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &mut Postings,
     tok: &str,
     row_idx: usize,
 ) {
-    if let Some(list) = postings.get_mut(tok) {
-        if let Some(&last) = list.last() {
-            if last == row_idx {
-                return;
-            }
-            if last < row_idx {
-                list.push(row_idx);
-                return;
-            }
+    // Arc<str> hashes its string contents, so the borrowed hash also indexes
+    // the owned key. Allocate the Arc only when the token is new.
+    let hash = postings.hasher().hash_one(tok);
+    let list = match postings
+        .raw_entry_mut()
+        .from_hash(hash, |key| key.as_ref() == tok)
+    {
+        RawEntryMut::Occupied(entry) => entry.into_mut(),
+        RawEntryMut::Vacant(entry) => {
+            entry.insert_hashed_nocheck(hash, Arc::from(tok), smallvec![row_idx]);
+            return;
         }
-        if let Err(pos) = list.binary_search(&row_idx) {
-            list.insert(pos, row_idx);
+    };
+    if let Some(&last) = list.last() {
+        if last == row_idx {
+            return;
         }
-    } else {
-        postings.insert(Arc::from(tok), smallvec![row_idx]);
+        if last < row_idx {
+            list.push(row_idx);
+            return;
+        }
+    }
+    if let Err(pos) = list.binary_search(&row_idx) {
+        list.insert(pos, row_idx);
     }
 }
 
