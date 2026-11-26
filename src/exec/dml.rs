@@ -2568,6 +2568,9 @@ fn insert_build_workers() -> &'static [std::sync::mpsc::SyncSender<Arc<BuildTask
             .map(|p| p.get())
             .unwrap_or(1)
             .min(8);
+        // Experimental Linux x64 configuration for the four-vCPU benchmark hosts.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let threads = if threads == 4 { 8 } else { threads };
         if threads <= 1 {
             return Vec::new();
         }
