@@ -302,6 +302,9 @@ class NativeInsert(Lin):
                 self.version = peer.execute(".show version", management=True)
                 database = "[" + json.dumps(peer.database) + "]"
                 policy = peer.execute(f".show database {database} policy streamingingestion", management=True)
+                self.kusto_ingest_mode = os.environ.get("LIN_BENCH_KUSTO_INGEST_MODE", "streaming")
+                if self.kusto_ingest_mode not in ("streaming", "inline"):
+                    raise ValueError("unknown Kusto ingestion mode")
                 self.stream_chunks = []
                 chunk = bytearray()
                 row_buffer = io.StringIO(newline="")
@@ -320,6 +323,9 @@ class NativeInsert(Lin):
                 if chunk:
                     self.stream_chunks.append(bytes(chunk))
                 self.contract.update({"api": "Kusto REST streaming ingestion plus full row visibility", "schema": "id/uri/wing/title/ts:long/body; unique fixture values but no SQL uniqueness constraints", "storage": "configured service; default Kusto indexing", "atomicity": "one or more streaming requests; no cross-request transaction", "requests_per_sample": len(self.stream_chunks), "request_byte_limit": KUSTO_STREAM_MAX_BYTES, "timed_visibility_poll_ms": 10, "streaming_policy": policy, "policy_changed_by_adapter": False})
+                if self.kusto_ingest_mode == "inline":
+                    self.contract.update({"api": "Kusto .ingest inline plus full row visibility",
+                                          "atomicity": "one or more management commands; no cross-command transaction"})
             elif engine == "mssql":
                 import pytds
                 from pytds import tds_base, tds_types
@@ -408,7 +414,11 @@ class NativeInsert(Lin):
                     created = True
                     start = time.perf_counter_ns()
                     for payload in self.stream_chunks:
-                        self.kusto_peer.stream_ingest(table, payload)
+                        if self.kusto_ingest_mode == "inline":
+                            csv_text = payload.decode("utf-8")
+                            self.kusto_peer.execute(f".ingest inline into table {table} <|\n{csv_text}", management=True)
+                        else:
+                            self.kusto_peer.stream_ingest(table, payload)
                     deadline = time.monotonic() + 60
                     while True:
                         count = self.kusto_peer.execute(f"{table} | count")
