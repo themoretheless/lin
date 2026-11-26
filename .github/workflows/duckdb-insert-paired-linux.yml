@@ -58,11 +58,11 @@ jobs:
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
           python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
-      - name: Compare row-builder parallelism on the same host
+      - name: Compare row-builder chunk sizes on the same host
         if: steps.cpu.outputs.matched == 'true' && runner.arch == 'X64'
         run: |
           cp target/release/lin-peer-worker "$RUNNER_TEMP/candidate-worker"
-          git worktree add --detach "$RUNNER_TEMP/base" 3b3b7f5bb
+          git worktree add --detach "$RUNNER_TEMP/base" 9eb560dcb
           (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
           python3 scripts/profile-build-workers.py "$RUNNER_TEMP/base/target/release/lin-peer-worker" "$RUNNER_TEMP/candidate-worker" > build-workers.json
       - uses: actions/upload-artifact@v4
