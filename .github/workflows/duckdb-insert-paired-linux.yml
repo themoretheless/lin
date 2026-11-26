@@ -41,7 +41,9 @@ jobs:
         run: |
           if [[ "$(uname -m)" = x86_64 ]]; then
             sudo apt-get update -qq
-            sudo apt-get install -y libgoogle-perftools-dev
+            (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+            dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+            export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
           fi
           scripts/build-linux-release.sh
           if [[ "$(uname -m)" = x86_64 ]]; then
