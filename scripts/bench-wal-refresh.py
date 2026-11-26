@@ -28,7 +28,7 @@ report = {
 for n in (1000, 10000):
     rows = module.fixture(n)
     for block in range(1):
-        roles = ("base", "control", "candidate_default", "candidate", "sqlite")
+        roles = ("base", "control", "candidate_off", "candidate", "sqlite")
         rank = {role: i for i, role in enumerate(roles)}
         orders = [o for o in permutations(roles)
                   if sum(rank[a] > rank[b] for i, a in enumerate(o) for b in o[i+1:]) % 2 == 0]
@@ -42,9 +42,10 @@ for n in (1000, 10000):
                         results[role] = {"insert_ns": module.run_sqlite(path, rows)}
                         continue
                     binary = baseline if role in ("base", "control") else worker
-                    dictionary = role != "candidate_default" and (n >= 4096 or platform.machine() == "x86_64")
                     req = dict(insert_rows=n, samples=1, timestamp_ms=123456,
-                               durable_dir=path, wal_dictionary=dictionary)
+                               durable_dir=path)
+                    if role == "candidate_off":
+                        req["wal_dictionary"] = False
                     data = json.loads(subprocess.check_output(
                         [binary], input=json.dumps(req)+"\n", text=True))
                     assert [tuple(row) for row in data["result"]] == rows

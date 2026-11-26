@@ -1136,7 +1136,7 @@ fn encode_insert_cols_v2_at(
 /// Off by default: a reader built before the codec refuses such frames, so it may only
 /// be turned on once every consumer of the log (followers, backup tools, the previous
 /// release kept for rollback) can read it.
-static DICTIONARY_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DICTIONARY_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 thread_local! {
     /// Per-thread override of [`DICTIONARY_WRITER`], so a test can exercise the writer

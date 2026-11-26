@@ -72,7 +72,7 @@ fn measure_insert(
     samples: usize,
     timestamp: i64,
     durable: Option<&std::path::Path>,
-    wal_dictionary: bool,
+    wal_dictionary: Option<bool>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
@@ -119,9 +119,9 @@ fn measure_insert(
             None => Db::empty(),
         };
         open_ns.push(open.elapsed().as_nanos() as u64);
-        if durable.is_some() && wal_dictionary {
-            db.set_wal_dictionary(Some(true));
-            assert!(db.wal_dictionary_enabled());
+        if durable.is_some() && let Some(enabled) = wal_dictionary {
+            db.set_wal_dictionary(Some(enabled));
+            assert_eq!(db.wal_dictionary_enabled(), enabled);
         }
         db.run("index docs [wing, ts]")?;
         let prepared = sources
@@ -216,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp, durable, request["wal_dictionary"].as_bool().unwrap_or(false))?
+                measure_insert(n as usize, samples as usize, timestamp, durable, request["wal_dictionary"].as_bool())?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
