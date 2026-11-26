@@ -2,6 +2,7 @@
 import hashlib
 import itertools
 import json
+import os
 from pathlib import Path
 import platform
 import random
@@ -33,17 +34,21 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, column_batch=False):
-    request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, column_batch=column_batch)
+def measure_lin(worker, rows, fused_ascii=False):
+    request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
+    env = dict(os.environ)
+    env.pop("LIN_BENCH_FTS_FUSED_ASCII", None)
+    if fused_ascii:
+        env["LIN_BENCH_FTS_FUSED_ASCII"] = "1"
     result = json.loads(subprocess.check_output(
-        [worker], input=json.dumps(request) + "\n", text=True))
+        [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin readback disagrees with fixture")
     return result["samples_ns"][0], result["embedding_hash"]
 
 
 def main(worker, output):
-    roles = ("lin", "control", "column_batch", "duckdb")
+    roles = ("lin", "control", "fused_ascii", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
@@ -66,7 +71,7 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role == "column_batch")
+                        timings[role], digest = measure_lin(worker, rows, role == "fused_ascii")
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -76,11 +81,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        column_batch_gain = median(1 - x["column_batch"] / x["lin"] for x in pairs)
-        column_batch_wins = sum(x["column_batch"] < x["duckdb"] for x in pairs)
+        fused_ascii_gain = median(1 - x["fused_ascii"] / x["lin"] for x in pairs)
+        fused_ascii_wins = sum(x["fused_ascii"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, column_batch gain {column_batch_gain:.2%}, "
-              f"column_batch wins {column_batch_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, fused_ascii gain {fused_ascii_gain:.2%}, "
+              f"fused_ascii wins {fused_ascii_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":

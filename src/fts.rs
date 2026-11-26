@@ -150,6 +150,7 @@ impl FtsIndex {
                 if slot_mask == 0 {
                     return;
                 }
+                let fused_ascii = std::env::var_os("LIN_BENCH_FTS_FUSED_ASCII").is_some();
                 let mut scratch = String::with_capacity(256);
                 for (i, row) in rows.iter().enumerate() {
                     let row_idx = start + i;
@@ -159,10 +160,16 @@ impl FtsIndex {
                         let pos = m.trailing_zeros() as usize;
                         m &= m - 1;
                         if let Some(text) = cells[pos].text() {
-                            let lowered = lowercased(text, &mut scratch);
-                            for_each_word(lowered, |tok| {
-                                add_posting(&mut self.postings, tok, row_idx);
-                            });
+                            if fused_ascii && text.is_ascii() {
+                                for_each_lower_ascii_word(text, &mut scratch, |tok| {
+                                    add_posting(&mut self.postings, tok, row_idx);
+                                });
+                            } else {
+                                let lowered = lowercased(text, &mut scratch);
+                                for_each_word(lowered, |tok| {
+                                    add_posting(&mut self.postings, tok, row_idx);
+                                });
+                            }
                         }
                     }
                 }
@@ -727,6 +734,35 @@ pub(crate) fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str)) {
     } else {
         for tok in s.split_whitespace() {
             f(tok);
+        }
+    }
+}
+
+#[inline]
+fn for_each_lower_ascii_word(text: &str, scratch: &mut String, mut visit: impl FnMut(&str)) {
+    debug_assert!(text.is_ascii());
+    let bytes = text.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() {
+        while end < bytes.len() && is_ascii_unicode_ws(bytes[end]) {
+            end += 1;
+        }
+        let start = end;
+        let mut uppercase = false;
+        while end < bytes.len() && !is_ascii_unicode_ws(bytes[end]) {
+            uppercase |= bytes[end].is_ascii_uppercase();
+            end += 1;
+        }
+        if start != end {
+            let token = &text[start..end];
+            if uppercase {
+                scratch.clear();
+                scratch.push_str(token);
+                scratch.make_ascii_lowercase();
+                visit(scratch);
+            } else {
+                visit(token);
+            }
         }
     }
 }
