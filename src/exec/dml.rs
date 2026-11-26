@@ -2508,7 +2508,7 @@ fn insert_build_workers() -> &'static [std::sync::mpsc::SyncSender<Arc<BuildTask
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
-            .min(8);
+            .min(if cfg!(all(target_os = "linux", target_arch = "x86_64")) { 2 } else { 8 });
         if threads <= 1 {
             return Vec::new();
         }
