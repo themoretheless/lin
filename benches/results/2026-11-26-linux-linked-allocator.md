@@ -38,3 +38,7 @@ Two of eight allocated runners matched the target CPU. Both used the same linked
 On a separate Linux x64 runner, the linked worker won 54/54 read comparisons per peer against SQLite, DuckDB, pandas, PostgreSQL, MySQL and MongoDB. The six read workloads ran at 1k, 10k and 100k in three independent processes. Server-native insertion won 9/9 comparisons per peer against PostgreSQL, MySQL and MongoDB. SQLite and DuckDB INSERT are qualified separately above.
 
 [Read and native INSERT measurements](https://github.com/themoretheless/lin/actions/runs/45870700571)
+
+## Native SQL Server qualification
+
+The linked x64 worker completed six read queries and native INSERT at 1k, 10k and 100k against SQL Server on Linux. All workloads preserved the sentinel and removed their temporary tables. The source and binary hashes remained stable. Comparative timings are in the encrypted artifact. [CI and qualification evidence](https://github.com/themoretheless/lin/actions/runs/45872370569)
