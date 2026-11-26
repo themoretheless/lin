@@ -2617,7 +2617,13 @@ fn build_insert_rows(
                 for c in 1..total_chunks {
                     let bi = c * chunk_size;
                     let same_shape = rows[bi].shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs));
-                    all_uniform &= same_shape;
+                    // The uniqueness fast path indexes source fields by position.
+                    // Equal stored shapes can come from different source orders.
+                    if all_uniform {
+                        all_uniform = same_shape
+                            && records[bi].fields.iter().map(|(name, _)| name)
+                                .eq(records[0].fields.iter().map(|(name, _)| name));
+                    }
                     if lossless_cols {
                         lossless_cols = same_shape
                             && rows[bi].cells_slice().len() == first_cells.len()

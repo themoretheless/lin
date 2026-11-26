@@ -224,3 +224,21 @@ fn wide_batch_preserves_mixed_numeric_cells_after_wal_replay() {
     fs::remove_dir_all(image).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn duplicate_id_across_reordered_worker_chunks_is_rejected_atomically() {
+    let mut db = Db::empty();
+    db.run("col items { id: text, label: text }").unwrap();
+    let records = (0..512)
+        .map(|i| {
+            if (64..128).contains(&i) {
+                let id = if i == 64 { 0 } else { i };
+                format!(r#"{{ label: "value{i}", id: "key{id}" }}"#)
+            } else {
+                format!(r#"{{ id: "key{i}", label: "value{i}" }}"#)
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(db.run(&format!("insert items [{}]", records.join(","))).is_err());
+    assert!(db.store.collection("items").is_empty());
+}
