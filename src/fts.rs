@@ -1161,6 +1161,23 @@ mod tests {
     use crate::store::{Cell, row_text};
 
     #[test]
+    fn fused_ascii_tokens_match_reference() {
+        let mut cases = vec![String::new(), "A b A".to_string(), "  MiXeD!  ".to_string()];
+        cases.extend((0u8..128).map(|byte| format!("A{0}b {0}XYZ{0}", char::from(byte))));
+        let mut scratch = String::new();
+        let mut reference_scratch = String::new();
+        for text in cases {
+            let mut actual = Vec::new();
+            for_each_lower_ascii_word(&text, &mut scratch, |token| actual.push(token.to_owned()));
+            let mut expected = Vec::new();
+            for_each_word(lowercased(&text, &mut reference_scratch), |token| {
+                expected.push(token.to_owned());
+            });
+            assert_eq!(actual, expected, "{text:?}");
+        }
+    }
+
+    #[test]
     fn snippet_mutations_match_rebuilt_index() {
         for fields in [vec!["title".into()], vec!["title".into(), "snippet".into()]] {
             let before = Row::from([
