@@ -27,7 +27,7 @@ jobs:
           cargo build --locked --release -p lin-peer-worker
           sudo apt-get update -qq
           sudo apt-get install -y linux-tools-generic
-          perfbin=$(find /usr/lib/linux-tools -name perf -type f | sort -V | tail -1)
+          perfbin=$(find /usr/lib -path "*/linux-tools*/perf" -type f | sort -V | tail -1)
           sudo sysctl -w kernel.kptr_restrict=0
           for trial in 1 2 3 4; do
             echo '{"insert_rows":100000,"samples":1,"timestamp_ms":123456}' | sudo "$perfbin" record --clockid mono -e cpu-clock:k -F 997 -o perf.data -- target/release/lin-peer-worker > result.json 2> "intervals-$trial.txt"
