@@ -34,7 +34,7 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, smaller_head=False):
+def measure_lin(worker, rows, jemalloc=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     env = dict(os.environ)
     env["LIN_BENCH_FTS_FUSED_ASCII"] = "1"
@@ -43,8 +43,9 @@ def measure_lin(worker, rows, smaller_head=False):
     env.pop("LIN_BENCH_FTS_RESERVE_MERGE", None)
     env.pop("LIN_BENCH_INSERT_UNIFORM_ID", None)
     env.pop("LIN_BENCH_FTS_SMALLER_HEAD", None)
-    if smaller_head:
-        env["LIN_BENCH_FTS_SMALLER_HEAD"] = "1"
+    env.pop("LD_PRELOAD", None)
+    if jemalloc:
+        env["LD_PRELOAD"] = os.environ["LIN_BENCH_JEMALLOC"]
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
@@ -53,7 +54,7 @@ def measure_lin(worker, rows, smaller_head=False):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "smaller_head", "duckdb")
+    roles = ("lin", "control", "jemalloc", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
@@ -76,7 +77,7 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role == "smaller_head")
+                        timings[role], digest = measure_lin(worker, rows, role == "jemalloc")
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -86,11 +87,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        smaller_head_gain = median(1 - x["smaller_head"] / x["lin"] for x in pairs)
-        smaller_head_wins = sum(x["smaller_head"] < x["duckdb"] for x in pairs)
+        jemalloc_gain = median(1 - x["jemalloc"] / x["lin"] for x in pairs)
+        jemalloc_wins = sum(x["jemalloc"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, smaller_head gain {smaller_head_gain:.2%}, "
-              f"smaller_head wins {smaller_head_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, jemalloc gain {jemalloc_gain:.2%}, "
+              f"jemalloc wins {jemalloc_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
