@@ -1,0 +1,67 @@
+name: Validate FTS and WAL release candidate across peers
+on:
+  push:
+    branches: [codex/fts-wal-peer-qualification]
+permissions:
+  contents: read
+jobs:
+  peers:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+        env:
+          POSTGRES_USER: lin
+          POSTGRES_PASSWORD: lin
+          POSTGRES_DB: lin
+        ports: ['55432:5432']
+        options: --tmpfs /var/lib/postgresql/data --health-cmd "pg_isready -U lin -d lin" --health-interval 2s --health-retries 30
+      mysql:
+        image: mysql@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7
+        env:
+          MYSQL_ROOT_PASSWORD: lin-benchmark-only
+          MYSQL_USER: lin
+          MYSQL_PASSWORD: lin
+          MYSQL_DATABASE: lin
+        ports: ['53306:3306']
+        options: --tmpfs /var/lib/mysql --health-cmd "mysqladmin ping -h 127.0.0.1 -ulin -plin --silent" --health-interval 2s --health-retries 45
+      mongo:
+        image: mongo@sha256:b9924c330a8bbc5800fe9c69f04a84e221eca7b28fd049a0354147d9908fa142
+        ports: ['27027:27017']
+        options: --tmpfs /data/db --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok'" --health-interval 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Build candidate and verify benchmark adapters
+        run: |
+          cargo build --release --locked -p lin-peer-worker
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+          python3 scripts/test-bench-peers.py
+      - name: Measure verified reads and native inserts
+        run: |
+          root="$RUNNER_TEMP/lin-peer-results"
+          mkdir -p "$root"
+          git rev-parse HEAD > "$root/provenance.txt"
+          lscpu >> "$root/provenance.txt"
+          sha256sum target/release/lin-peer-worker >> "$root/provenance.txt"
+          status=0
+          for rows in 1000 10000 100000; do
+            python3 scripts/bench-peers.py --lin-binary target/release/lin-peer-worker \
+              --engines lin sqlite duckdb postgres mysql mongo pandas \
+              --rows "$rows" --repeats 3 --samples 12 --output "$root/read-$rows" || status=1
+            python3 scripts/bench-peers.py --lin-binary target/release/lin-peer-worker \
+              --engines lin sqlite duckdb postgres mysql mongo --cases insert_native \
+              --rows "$rows" --repeats 3 --samples 12 --output "$root/insert-$rows" || status=1
+          done
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: peer-results
+          path: ${{ runner.temp }}/lin-peer-results
