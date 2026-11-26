@@ -194,3 +194,17 @@ Candidate `154c986e4` versus baseline `c226a2334`, eight alternating same-host p
 Against DuckDB on standard pages, all three EPYC hosts still lost all 25 first-100k pairs each. The gaps between medians were 25.56, 28.04 and 24.28 ms. With THP enabled symmetrically, Lin won all 400 pairs across sizes and hosts.
 
 [DuckDB samples and same-host candidate comparisons](https://github.com/themoretheless/lin/actions/runs/45815495705)
+
+## Linux kernel CPU during the first 100k INSERT
+
+Six fresh processes per setting and host from the allocator experiment at 16cc0d25a. Each cell shows default / glibc THP medians. CPU time sums all threads, while wall time measures the full transaction. Peak RSS is the process high-water mark.
+
+| Host | Wall ms | Kernel CPU ms | User CPU ms | Minor faults | Peak RSS MiB |
+|---|---:|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor amd-1 | 156.0 / 104.4 | 281.1 / 141.5 | 210.7 / 159.7 | 91268.5 / 33628.5 | 546.9 / 553.9 |
+| AMD EPYC 7763 64-Core Processor amd-2 | 188.8 / 129.9 | 355.6 / 184.7 | 253.9 / 209.7 | 91293.5 / 35780.5 | 546.9 / 554.6 |
+| AMD EPYC 7763 64-Core Processor amd-3 | 192.5 / 140.9 | 336.9 / 191.8 | 274.1 / 217.4 | 91291.5 / 36615.5 | 546.8 / 554.9 |
+| AMD EPYC 7763 64-Core Processor amd-4 | 189.5 / 130.8 | 344.4 / 192.5 | 262.4 / 203.8 | 91295.0 / 36190.5 | 546.8 / 554.2 |
+| Neoverse-N2 arm64 | 102.0 / 73.5 | 194.4 / 111.9 | 120.1 / 106.7 | 91285.5 / 38576.0 | 546.1 / 552.9 |
+
+[Raw resource samples and host details](https://github.com/themoretheless/lin/actions/runs/45767474001)
