@@ -59,3 +59,24 @@ Increasing each work item from 64 to 256 rows on large inserts slowed the first 
 Candidate `bfb4e00bc` won 16 of 32 same-host pairs for the first 100k insert against the original engine. Median paired changes were −0.44 and −2.85 ms on EPYC 7763, +0.69 ms on EPYC 9V45 and +0.37 ms on Neoverse N2. One 7763 host also showed a 3.09 ms repeat slowdown. The skip was dropped after this experiment.
 
 [Paired samples and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45793773235)
+
+## First 100k transaction by statement
+
+Eight fresh processes per host and mode. Each transaction runs ten prepared statements of 10,000 rows. Values are median milliseconds. The total is calculated per transaction before aggregation.
+
+| Host | Mode | Total | Sixth statement | Commit |
+|---|---|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor (amd-1) | default | 167.126 | 23.844 | 0.002 |
+| AMD EPYC 9V74 80-Core Processor (amd-1) | thp | 111.790 | 16.071 | 0.003 |
+| AMD EPYC 7763 64-Core Processor (amd-2) | default | 189.288 | 25.810 | 0.002 |
+| AMD EPYC 7763 64-Core Processor (amd-2) | thp | 131.840 | 17.829 | 0.002 |
+| AMD EPYC 7763 64-Core Processor (amd-3) | default | 192.602 | 26.375 | 0.002 |
+| AMD EPYC 7763 64-Core Processor (amd-3) | thp | 134.549 | 18.501 | 0.002 |
+| AMD EPYC 7763 64-Core Processor (amd-4) | default | 191.125 | 25.752 | 0.002 |
+| AMD EPYC 7763 64-Core Processor (amd-4) | thp | 130.201 | 17.542 | 0.002 |
+| Neoverse-N2 (arm64) | default | 99.977 | 15.816 | 0.002 |
+| Neoverse-N2 (arm64) | thp | 75.764 | 11.885 | 0.002 |
+
+Statement six had the highest median on every host in both modes. The profile measures elapsed time for each whole statement.
+
+[Raw statement profiles](https://github.com/themoretheless/lin/actions/runs/45796253951)
