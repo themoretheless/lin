@@ -156,14 +156,12 @@ impl FtsIndex {
                     self.postings.reserve(rows.len().min(16_384));
                 }
                 let fused_ascii = std::env::var_os("LIN_BENCH_FTS_FUSED_ASCII").is_some();
-                let partitions = std::env::var("LIN_BENCH_FTS_PARALLEL_APPEND")
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .clamp(1, 3);
-                if rows.len() >= 4096 && partitions > 1 {
+                if rows.len() >= 4096
+                    && std::env::var_os("LIN_BENCH_FTS_PARALLEL_APPEND").is_some()
+                {
+                    let pooled = std::env::var_os("LIN_BENCH_FTS_POOLED_TAIL").is_some();
                     append_parallel_postings(
-                        &mut self.postings, start, rows, slot_mask, fused_ascii, partitions,
+                        &mut self.postings, start, rows, slot_mask, fused_ascii, pooled,
                     );
                 } else {
                     append_uniform_postings(&mut self.postings, start, rows, slot_mask, fused_ascii);
@@ -953,24 +951,27 @@ fn append_parallel_postings(
     rows: &[Row],
     slot_mask: u64,
     fused_ascii: bool,
-    partitions: usize,
+    pooled: bool,
 ) {
-    let chunk = rows.len().div_ceil(partitions);
-    let tails = std::thread::scope(|scope| {
-        let mut workers = SmallVec::<[_; 2]>::new();
-        for (part, rows) in rows.chunks(chunk).enumerate().skip(1) {
-            workers.push(scope.spawn(move || {
-                let mut tail = FxHashMap::default();
-                tail.reserve(rows.len());
-                append_uniform_postings(&mut tail, start + part * chunk, rows, slot_mask, fused_ascii);
-                tail
-            }));
-        }
-        append_uniform_postings(postings, start, &rows[..chunk], slot_mask, fused_ascii);
-        workers.into_iter().map(|worker| worker.join().expect("FTS append worker panicked"))
-            .collect::<SmallVec<[_; 2]>>()
-    });
-    for (term, indexes) in tails.into_iter().flatten() {
+    let mid = rows.len().div_ceil(2);
+    let (left, right) = rows.split_at(mid);
+    let build_tail = || {
+        let mut tail = FxHashMap::default();
+        tail.reserve(right.len());
+        append_uniform_postings(&mut tail, start + mid, right, slot_mask, fused_ascii);
+        tail
+    };
+    let mut append_left = || append_uniform_postings(postings, start, left, slot_mask, fused_ascii);
+    let tail = if pooled {
+        crate::work_steal::steal2(crate::work_steal::StealLane::FtsTail, build_tail, append_left).0
+    } else {
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(build_tail);
+            append_left();
+            worker.join().expect("FTS append worker panicked")
+        })
+    };
+    for (term, indexes) in tail {
         match postings.entry(term) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(indexes);
@@ -1240,7 +1241,7 @@ mod tests {
         let mut parallel = FxHashMap::default();
         for (start, rows) in [(30, &rows[..64]), (0, rows.as_slice())] {
             append_uniform_postings(&mut serial, start, rows, 1, true);
-            append_parallel_postings(&mut parallel, start, rows, 1, true, 3);
+            append_parallel_postings(&mut parallel, start, rows, 1, true, true);
         }
         assert_eq!(parallel, serial);
     }

@@ -19,6 +19,7 @@ use std::time::Duration;
 pub(crate) enum StealLane {
     DirectEnc,
     MaintFts,
+    FtsTail,
     MaintIdx,
 }
 
@@ -74,10 +75,12 @@ impl StealLane {
     fn sender(self) -> Option<&'static SyncSender<Arc<StealSlot>>> {
         static ENC: OnceLock<Option<SyncSender<Arc<StealSlot>>>> = OnceLock::new();
         static FTS: OnceLock<Option<SyncSender<Arc<StealSlot>>>> = OnceLock::new();
+        static FTS_TAIL: OnceLock<Option<SyncSender<Arc<StealSlot>>>> = OnceLock::new();
         static IDX: OnceLock<Option<SyncSender<Arc<StealSlot>>>> = OnceLock::new();
         match self {
             Self::DirectEnc => ENC.get_or_init(|| spawn_lane("lin-steal-enc")).as_ref(),
             Self::MaintFts => FTS.get_or_init(|| spawn_lane("lin-steal-fts")).as_ref(),
+            Self::FtsTail => FTS_TAIL.get_or_init(|| spawn_lane("lin-steal-fts-tail")).as_ref(),
             Self::MaintIdx => IDX.get_or_init(|| spawn_lane("lin-steal-idx")).as_ref(),
         }
     }

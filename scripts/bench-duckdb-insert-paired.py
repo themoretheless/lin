@@ -34,11 +34,14 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, three_fts=False):
+def measure_lin(worker, rows, pooled_fts=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     env = dict(os.environ)
     env["LIN_BENCH_FTS_FUSED_ASCII"] = "1"
-    env["LIN_BENCH_FTS_PARALLEL_APPEND"] = "3" if three_fts else "2"
+    env["LIN_BENCH_FTS_PARALLEL_APPEND"] = "1"
+    env.pop("LIN_BENCH_FTS_POOLED_TAIL", None)
+    if pooled_fts:
+        env["LIN_BENCH_FTS_POOLED_TAIL"] = "1"
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
@@ -47,7 +50,7 @@ def measure_lin(worker, rows, three_fts=False):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "three_fts", "duckdb")
+    roles = ("lin", "control", "pooled_fts", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
@@ -70,7 +73,7 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role == "three_fts")
+                        timings[role], digest = measure_lin(worker, rows, role == "pooled_fts")
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -80,11 +83,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        three_fts_gain = median(1 - x["three_fts"] / x["lin"] for x in pairs)
-        three_fts_wins = sum(x["three_fts"] < x["duckdb"] for x in pairs)
+        pooled_fts_gain = median(1 - x["pooled_fts"] / x["lin"] for x in pairs)
+        pooled_fts_wins = sum(x["pooled_fts"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, three_fts gain {three_fts_gain:.2%}, "
-              f"three_fts wins {three_fts_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, pooled_fts gain {pooled_fts_gain:.2%}, "
+              f"pooled_fts wins {pooled_fts_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
