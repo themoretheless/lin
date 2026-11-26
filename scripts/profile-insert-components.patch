@@ -203,7 +203,7 @@ index 063c5b1e2..c2c0c764f 100644
      if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
          crate::embed::with_hashing_scratch(dim, |batch| process_rows(Some(batch)));
 diff --git a/src/store/mod.rs b/src/store/mod.rs
-index 6ce068290..78bb24b95 100644
+index 6ce068290..26eb40ef9 100644
 --- a/src/store/mod.rs
 +++ b/src/store/mod.rs
 @@ -3739,10 +3739,10 @@ impl Store {
@@ -221,3 +221,83 @@ index 6ce068290..78bb24b95 100644
          if collection == "docs" {
              if !self.docs_by_uri.is_empty() || additional < 512 {
                  self.docs_by_uri.reserve(additional);
+@@ -3896,6 +3896,13 @@ impl Store {
+         start: usize,
+         built: &[Row],
+     ) -> Result<(), Error> {
++        fn timed<T>(key: &str, f: impl FnOnce() -> T) -> T {
++            let start = std::time::Instant::now();
++            let result = f();
++            eprintln!("insert_profile {key} {}", start.elapsed().as_nanos());
++            result
++        }
++        let setup = std::time::Instant::now();
+         if collection == "docs" {
+             self.flush_fts_deferred_docs();
+         }
+@@ -3905,12 +3912,14 @@ impl Store {
+             .indexes
+             .values()
+             .any(|idx| idx.def.collection == collection && idx.def.unique);
++        eprintln!("insert_profile maint_setup {}", setup.elapsed().as_nanos());
+         if collection == "docs"
+             && built.len() >= 256
+             && !has_unique
+             && self.docs_id.len() == start
+             && self.fts.contains_key(collection)
+         {
++            eprintln!("insert_profile maint_parallel 1");
+             self.invalidate_docs_cache();
+             let indexes = &mut self.indexes;
+             let fts_opt = self.fts.get_mut(collection);
+@@ -3926,13 +3935,13 @@ impl Store {
+             let ((), idx_res, ()) = crate::work_steal::steal3(
+                 crate::work_steal::StealLane::MaintFts,
+                 has_fts,
+-                move || {
++                move || timed("maint_fts", || {
+                     if let Some(fts) = fts_opt {
+                         fts.append_slab(start, built);
+                     }
+-                },
++                }),
+                 crate::work_steal::StealLane::MaintIdx,
+-                move || -> Result<(), Error> {
++                move || timed("maint_index", || -> Result<(), Error> {
+                     for idx in indexes.values_mut() {
+                         if idx.def.collection == collection
+                             && let Err(e) = idx.insert_slab_batch_no_reverse(start, built)
+@@ -3941,8 +3950,8 @@ impl Store {
+                         }
+                     }
+                     Ok(())
+-                },
+-                move || {
++                }),
++                move || timed("maint_maps_hnsw", || {
+                     if let Some(hnsw) = hnsw_opt {
+                         for (i, row) in built.iter().enumerate() {
+                             if let Some(Cell::Vec(v)) = row.get_str("embedding") {
+@@ -4012,14 +4021,17 @@ impl Store {
+                             docs_wing.push_cell(found[4]);
+                         }
+                     }
+-                },
++                }),
+             );
+             return idx_res;
+         }
+-        self.index_insert_slab(collection, start, built)?;
+-        self.fts_insert_slab(collection, start, built);
+-        self.hnsw_insert_slab(collection, start, built);
+-        self.row_maps_register_slab(collection, start, built);
++        eprintln!("insert_profile maint_parallel 0");
++        timed("maint_index", || self.index_insert_slab(collection, start, built))?;
++        timed("maint_fts", || self.fts_insert_slab(collection, start, built));
++        timed("maint_maps_hnsw", || {
++            self.hnsw_insert_slab(collection, start, built);
++            self.row_maps_register_slab(collection, start, built);
++        });
+         Ok(())
+     }
+ 
