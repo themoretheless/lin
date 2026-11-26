@@ -38,8 +38,8 @@ def role_env(role):
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
     env.pop("GLIBC_TUNABLES", None)
-    if role in ("pad", "duckdb_pad"):
-        env["GLIBC_TUNABLES"] = "glibc.malloc.top_pad=2097152"
+    if role in ("thp", "duckdb_thp"):
+        env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
     return env
 
 
@@ -56,13 +56,13 @@ def measure_lin(worker, rows, samples, role):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "pad", "duckdb", "duckdb_pad")
+    roles = ("lin", "control", "thp", "duckdb", "duckdb_thp")
     samples = 5
     rng = random.Random(2929273)
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
-        treatment="glibc.malloc.top_pad=2097152", samples=[],
+        samples=[],
     )
     for n in (10_000, 100_000):
         rows = bench["fixture"](n)
@@ -86,9 +86,9 @@ def main(worker, output):
         for label, aggregate in (("first", lambda ts: ts[0]), ("warm", lambda ts: median(ts[1:]))):
             ms = {role: median(aggregate(pair[role]) for pair in pairs) / 1e6 for role in roles}
             wins = sum(aggregate(pair["lin"]) < aggregate(pair["duckdb"]) for pair in pairs)
-            pad_wins = sum(aggregate(pair["pad"]) < aggregate(pair["duckdb_pad"]) for pair in pairs)
+            thp_wins = sum(aggregate(pair["thp"]) < aggregate(pair["duckdb_thp"]) for pair in pairs)
             print(f"{n} rows {label}: {ms}, Lin wins {wins}/{len(pairs)}, "
-                  f"Lin top_pad wins {pad_wins}/{len(pairs)}", flush=True)
+                  f"Lin THP wins {thp_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":

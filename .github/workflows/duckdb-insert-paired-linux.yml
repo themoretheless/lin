@@ -47,7 +47,7 @@ jobs:
           cat /sys/kernel/mm/transparent_hugepage/enabled >> allocator-provenance.txt
           loader=$(ldd target/release/lin-peer-worker | awk '/ld-linux/ { print $1 }')
           "$loader" --list-tunables > glibc-tunables.txt
-          grep -q '^glibc.malloc.top_pad:' glibc-tunables.txt
+          grep -q '^glibc.malloc.hugetlb:' glibc-tunables.txt
       - name: Measure paired first and subsequent insertions
         if: steps.cpu.outputs.matched == 'true'
         run: |
@@ -58,6 +58,12 @@ jobs:
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
           python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+      - name: Compare row construction with the previous worker
+        if: steps.cpu.outputs.matched == 'true'
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" 28d181d78
+          (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
+          python3 scripts/profile-build-workers.py "$RUNNER_TEMP/base/target/release/lin-peer-worker" target/release/lin-peer-worker > build-workers.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,3 +75,4 @@ jobs:
             duckdb-results.json
             duckdb-summary.txt
             duckdb-provenance.txt
+            build-workers.json
