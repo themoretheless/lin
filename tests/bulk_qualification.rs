@@ -186,3 +186,35 @@ fn bulk_insert_survives_log_replay_unchanged() {
     assert_eq!(distinct.len(), ids.len());
     assert_eq!(ids.len(), 3260);
 }
+
+#[test]
+fn wide_batch_preserves_mixed_numeric_cells_after_wal_replay() {
+    let dir = tmp();
+    let mut db = Db::open(&dir).unwrap();
+    db.run("col wide { id: text, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, amount: f64 }").unwrap();
+    let records = (0..513)
+        .map(|i| {
+            let amount = if i == 64 || i == 511 { "1.5" } else { "1" };
+            format!(r#"{{ id: "r{i}", a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, amount: {amount} }}"#)
+        })
+        .collect::<Vec<_>>();
+    db.run(&format!("insert wide [{}]", records.join(","))).unwrap();
+    let image = crash_image(&dir);
+    let recovered = Db::open(&image).unwrap();
+    for store in [&db.store, &recovered.store] {
+        let records = store.collection("wide");
+        assert_eq!(records.len(), 513);
+        for (i, record) in records.iter().enumerate() {
+            let expected = if i == 64 || i == 511 {
+                lin::Cell::Float(1.5)
+            } else {
+                lin::Cell::Int(1)
+            };
+            assert_eq!(record.get("amount"), Some(&expected), "row {i}");
+        }
+    }
+    drop(recovered);
+    drop(db);
+    fs::remove_dir_all(image).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
