@@ -39,16 +39,21 @@ jobs:
         run: |
           cargo build --locked --release -p lin-peer-worker
           python3 -m pip install -r scripts/bench-peers-requirements.lock
-      - name: Locate jemalloc for the comparison
+      - name: Locate jemalloc and mimalloc for the comparison
         if: steps.cpu.outputs.matched == 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libjemalloc2
+          sudo apt-get install -y libjemalloc2 libmimalloc2.0
           library=$(ldconfig -p | awk '/libjemalloc\.so\.2 / { print $NF }' | head -1)
           test -f "$library"
           echo "LIN_BENCH_JEMALLOC=$library" >> "$GITHUB_ENV"
           dpkg-query -W libjemalloc2 > jemalloc-provenance.txt
           sha256sum "$library" >> jemalloc-provenance.txt
+          library=$(ldconfig -p | awk '/libmimalloc\.so\.2 / { print $NF }' | head -1)
+          test -f "$library"
+          echo "LIN_BENCH_MIMALLOC=$library" >> "$GITHUB_ENV"
+          dpkg-query -W libmimalloc2.0 > mimalloc-provenance.txt
+          sha256sum "$library" >> mimalloc-provenance.txt
       - name: Measure prepared INSERT and validate readback
         if: steps.cpu.outputs.matched == 'true'
         run: |
@@ -67,6 +72,7 @@ jobs:
           path: |
             runner-cpu.txt
             jemalloc-provenance.txt
+            mimalloc-provenance.txt
             duckdb-results.json
             duckdb-summary.txt
             duckdb-phases.json
