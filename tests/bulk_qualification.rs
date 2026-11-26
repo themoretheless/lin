@@ -205,6 +205,12 @@ fn wide_batch_preserves_mixed_numeric_cells_after_wal_replay() {
         let records = store.collection("wide");
         assert_eq!(records.len(), 513);
         for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.len(), 9, "row {i}");
+            let id = format!("r{i}");
+            assert_eq!(record.get("id").and_then(lin::Cell::text), Some(id.as_str()));
+            for (field, value) in [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6), ("g", 7)] {
+                assert_eq!(record.get(field), Some(&lin::Cell::Int(value)), "row {i} field {field}");
+            }
             let expected = if i == 64 || i == 511 {
                 lin::Cell::Float(1.5)
             } else {
