@@ -14,7 +14,7 @@ for trial in range(8):
             env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
         run = subprocess.run([sys.argv[1]], text=True, input=request, env=env, capture_output=True, check=True)
         data = json.loads(run.stdout)
-        components = {"build": [], "reserve": [], "minor_faults": []}
+        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": []}
         for line in run.stderr.splitlines():
             if line.startswith("insert_profile "):
                 _, component, ns = line.split()
