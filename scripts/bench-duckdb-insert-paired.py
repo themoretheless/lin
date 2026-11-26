@@ -34,11 +34,14 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, samples):
+def measure_lin(worker, rows, samples, role):
     request = dict(insert_rows=len(rows), samples=samples, timestamp_ms=123456)
     env = dict(os.environ)
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
+    env.pop("GLIBC_TUNABLES", None)
+    if role == "thp":
+        env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
@@ -50,9 +53,9 @@ def measure_lin(worker, rows, samples):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "duckdb")
+    roles = ("lin", "control", "thp", "duckdb")
     samples = 5
-    orders = list(itertools.permutations(roles)) * 2
+    orders = list(itertools.permutations(roles))
     rng = random.Random(2929273)
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
@@ -69,14 +72,16 @@ def main(worker, output):
                 if role == "duckdb":
                     timings[role] = [measure_duckdb(frame, rows) for _ in range(samples)]
                 else:
-                    timings[role] = measure_lin(worker, rows, samples)
+                    timings[role] = measure_lin(worker, rows, samples, role)
             report["samples"].append(dict(rows=n, order=order, ns=timings))
             output.write_text(json.dumps(report, indent=2) + "\n")
         pairs = [sample["ns"] for sample in report["samples"] if sample["rows"] == n]
         for label, aggregate in (("first", lambda ts: ts[0]), ("warm", lambda ts: median(ts[1:]))):
             ms = {role: median(aggregate(pair[role]) for pair in pairs) / 1e6 for role in roles}
             wins = sum(aggregate(pair["lin"]) < aggregate(pair["duckdb"]) for pair in pairs)
-            print(f"{n} rows {label}: {ms}, Lin wins {wins}/{len(pairs)}", flush=True)
+            thp_wins = sum(aggregate(pair["thp"]) < aggregate(pair["duckdb"]) for pair in pairs)
+            print(f"{n} rows {label}: {ms}, Lin wins {wins}/{len(pairs)}, "
+                  f"Lin THP wins {thp_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":

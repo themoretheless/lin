@@ -1,4 +1,4 @@
-name: Profile first and warm INSERT on Linux
+name: Pair glibc huge-page hint against DuckDB
 on:
   push:
     branches: [codex/duckdb-process-warmup]
@@ -40,21 +40,15 @@ jobs:
         if: steps.cpu.outputs.matched == 'true'
         run: |
           cargo build --locked --release -p lin-peer-worker
-      - name: Locate TCMalloc for the allocation control
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Record huge-page and glibc settings
         if: steps.cpu.outputs.matched == 'true'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y libtcmalloc-minimal4
-          library=$(ldconfig -p | awk '/libtcmalloc_minimal\.so\.4 / { print $NF }' | head -1)
-          test -f "$library"
-          echo "LIN_BENCH_TCMALLOC=$library" >> "$GITHUB_ENV"
-          dpkg-query -W libtcmalloc-minimal4 > allocator-provenance.txt
-          sha256sum "$library" >> allocator-provenance.txt
           cat /sys/kernel/mm/transparent_hugepage/enabled >> allocator-provenance.txt
           loader=$(ldd target/release/lin-peer-worker | awk '/ld-linux/ { print $1 }')
           "$loader" --list-tunables > glibc-tunables.txt
           grep -q '^glibc.malloc.hugetlb:' glibc-tunables.txt
-      - name: Measure allocation and per-sample resource use
+      - name: Measure paired first and subsequent insertions
         if: steps.cpu.outputs.matched == 'true'
         run: |
           set -o pipefail
@@ -63,7 +57,7 @@ jobs:
           lscpu >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
-          python3 scripts/profile-insert-rusage.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
