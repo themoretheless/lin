@@ -14,7 +14,7 @@ for trial in range(8):
             env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
         run = subprocess.run([sys.argv[1]], text=True, input=request, env=env, capture_output=True, check=True)
         data = json.loads(run.stdout)
-        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": [], "sampled_vector_ns": [], "sampled_cells_ns": [], "sampled_rows": [], "fill_ns": [], "copy_ns": [], "alloc_ns": [], "write_ns": [], "validate": [], "maintain": [], "append": [], "maint_setup": [], "maint_parallel": [], "maint_fts": [], "maint_index": [], "maint_maps_hnsw": []}
+        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": [], "sampled_vector_ns": [], "sampled_cells_ns": [], "sampled_rows": [], "fill_ns": [], "copy_ns": [], "alloc_ns": [], "write_ns": [], "validate": [], "maintain": [], "append": [], "maint_setup": [], "maint_parallel": [], "maint_fts": [], "maint_index": [], "maint_maps_hnsw": [], "fts_left": [], "fts_tail": [], "fts_merge": [], "fts_terms": [], "fts_existing": []}
         pages = {phase: {field: [] for field in ("Anonymous", "AnonHugePages")} for phase in ("before", "after")}
         for line in run.stderr.splitlines():
             if line.startswith("insert_pages "):
