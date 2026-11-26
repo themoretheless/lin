@@ -41,13 +41,20 @@ jobs:
         run: |
           set -o pipefail
           cargo build --locked --release -p lin-peer-worker
-          git worktree add --detach "$RUNNER_TEMP/base" c226a2334
-          (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git -C "$RUNNER_TEMP/base" rev-parse HEAD >> provenance.txt
-          sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
-          python3 scripts/bench-wal-full.py --baseline-worker "$RUNNER_TEMP/base/target/release/lin-peer-worker" target/release/lin-peer-worker wal-full.json | tee summary.txt
+          cat /sys/kernel/mm/transparent_hugepage/enabled >> provenance.txt
+          loader=$(ldd target/release/lin-peer-worker | awk '/ld-linux/ { print $1 }')
+          "$loader" --list-tunables | grep '^glibc.malloc.hugetlb:' >> provenance.txt
+          for trial in 0 1 2 3; do
+            modes=(default thp)
+            if (( trial % 2 )); then modes=(thp default); fi
+            for mode in "${modes[@]}"; do
+              unset GLIBC_TUNABLES
+              if [[ "$mode" == thp ]]; then export GLIBC_TUNABLES=glibc.malloc.hugetlb=1; fi
+              python3 scripts/bench-wal-full.py --blocks 1 target/release/lin-peer-worker "wal-full-$trial-$mode.json" >> summary.txt
+            done
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -55,5 +62,5 @@ jobs:
           path: |
             runner-cpu.txt
             provenance.txt
-            wal-full.json
+            wal-full-*.json
             summary.txt
