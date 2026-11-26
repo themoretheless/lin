@@ -496,3 +496,18 @@ The diagnostic worker compared glibc defaults with `glibc.malloc.top_pad=2097152
 Reject the 2 MiB padding setting. First 100k improved in 30/32 pairs, but repeat 100k regressed in 31/32. First-transaction minor faults rose on every host (median paired increases of 920–1,467). This workload compared two Lin processes with the same diagnostic binary.
 
 [Run, host details and raw process measurements](https://github.com/themoretheless/lin/actions/runs/45863266830)
+
+## Symmetric TCMalloc on Linux
+
+Release engine 0add1938e. With TCMalloc preloaded into both engines, Lin won each host median. The table shows median paired Lin minus DuckDB milliseconds, with Lin wins out of 25 in parentheses. Repeated INSERT uses the median of four later transactions within each process. Each engine verified the six projected fields after insertion.
+
+| Host | First 10k | Repeat 10k | First 100k | Repeat 100k |
+|---|---:|---:|---:|---:|
+| EPYC 7763 amd-1 | −3.353 (25) | −11.643 (25) | −1.892 (18) | −93.702 (25) |
+| EPYC 9V74 amd-2 | −3.210 (24) | −10.050 (25) | −3.163 (23) | −74.908 (25) |
+| EPYC 7763 amd-3 | −3.442 (25) | −11.732 (25) | −3.816 (20) | −94.993 (25) |
+| Neoverse-N2 | −12.355 (25) | −18.997 (25) | −104.201 (25) | −167.092 (25) |
+
+With default allocation the same three EPYC hosts lost the first 100k by 27.269, 18.886 and 26.771 ms respectively, winning 1/75 pairs in total. TCMalloc improved Lin's own first 100k by 23.462–30.289 ms on EPYC. On N2 it slowed Lin's first 100k by 9.722 ms (all 25 pairs) and first 10k by 0.942 ms (22/25 losses), although Lin still beat DuckDB. The experiment changes the allocator through the process environment. Default Linux behavior remains an open performance gap on EPYC.
+
+[Paired samples, CPU and allocator provenance](https://github.com/themoretheless/lin/actions/runs/45864248068)
