@@ -1205,8 +1205,13 @@ impl Db {
         } else {
             None
         };
+        let profile = std::env::var_os("LIN_BENCH_INSERT_PHASES").is_some();
+        let build_start = profile.then(std::time::Instant::now);
         let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        if let Some(start) = build_start {
+            eprintln!("INSERT_BUILD {}", start.elapsed().as_nanos());
+        }
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
@@ -1268,6 +1273,8 @@ impl Db {
             None
         };
 
+        let profile = std::env::var_os("LIN_BENCH_INSERT_PHASES").is_some();
+        let check_start = profile.then(std::time::Instant::now);
         let fast_checked = if let Some(records) = records
             && all_uniform
             && !needs_id
@@ -1378,6 +1385,9 @@ impl Db {
                     self.check_row_fks_dedup(collection, row, &mut fk_watchers)?;
                 }
             }
+        }
+        if let Some(start) = check_start {
+            eprintln!("INSERT_CHECK {}", start.elapsed().as_nanos());
         }
         if !all_embedded {
             self.maybe_embed_rows(collection, &mut built)?;
@@ -1539,7 +1549,11 @@ impl Db {
                     },
                 })
         } else {
+            let maintain_start = profile.then(std::time::Instant::now);
             self.maintain_insert_slab(collection, start, &built)?;
+            if let Some(start) = maintain_start {
+                eprintln!("INSERT_MAINTAIN {}", start.elapsed().as_nanos());
+            }
             None
         };
         self.store

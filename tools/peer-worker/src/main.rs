@@ -103,6 +103,7 @@ fn measure_insert(
         .map(|chunk| format!("insert docs [{}]", chunk.join(",")))
         .collect::<Vec<_>>();
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
+    let profile = std::env::var_os("LIN_BENCH_INSERT_PHASES").is_some();
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
     for _ in 0..samples {
@@ -117,11 +118,22 @@ fn measure_insert(
             black_box(prepared[0].run(&mut db)?).done.n
         } else {
             let mut tx = db.transaction()?;
+            if profile {
+                eprintln!("INSERT_BEGIN {}", start.elapsed().as_nanos());
+            }
             let mut affected = 0;
             for statement in &prepared {
+                let chunk_start = profile.then(Instant::now);
                 affected += black_box(tx.run_prepared(statement)?).done.n;
+                if let Some(start) = chunk_start {
+                    eprintln!("INSERT_CHUNK {}", start.elapsed().as_nanos());
+                }
             }
+            let commit_start = profile.then(Instant::now);
             tx.commit()?;
+            if let Some(start) = commit_start {
+                eprintln!("INSERT_COMMIT {}", start.elapsed().as_nanos());
+            }
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
