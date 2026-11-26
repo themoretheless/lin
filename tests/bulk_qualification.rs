@@ -242,3 +242,28 @@ fn duplicate_id_across_reordered_worker_chunks_is_rejected_atomically() {
     assert!(db.run(&format!("insert items [{}]", records.join(","))).is_err());
     assert!(db.store.collection("items").is_empty());
 }
+
+#[test]
+fn final_idless_chunk_gets_unique_ids_in_a_parallel_insert() {
+    let mut db = Db::empty();
+    db.run(SCHEMA).unwrap();
+    let records = (0..513)
+        .map(|i| {
+            if i == 512 {
+                format!(r#"{{ name: "row{i}" }}"#)
+            } else {
+                format!(r#"{{ id: "explicit{i}", name: "row{i}" }}"#)
+            }
+        })
+        .collect::<Vec<_>>();
+    db.run(&format!("insert t [{}]", records.join(","))).unwrap();
+    let stored = db.store.collection("t");
+    assert_eq!(stored.len(), 513);
+    let generated = stored[512].get("id").and_then(lin::Cell::text).unwrap();
+    assert!(!generated.is_empty());
+    for (i, row) in stored[..512].iter().enumerate() {
+        let explicit = format!("explicit{i}");
+        assert_eq!(row.get("id").and_then(lin::Cell::text), Some(explicit.as_str()));
+        assert_ne!(explicit, generated);
+    }
+}
