@@ -156,27 +156,12 @@ impl FtsIndex {
                     self.postings.reserve(rows.len().min(16_384));
                 }
                 let fused_ascii = std::env::var_os("LIN_BENCH_FTS_FUSED_ASCII").is_some();
-                let mut scratch = String::with_capacity(256);
-                for (i, row) in rows.iter().enumerate() {
-                    let row_idx = start + i;
-                    let cells = row.cells_slice();
-                    let mut m = slot_mask;
-                    while m != 0 {
-                        let pos = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        if let Some(text) = cells[pos].text() {
-                            if fused_ascii && text.is_ascii() {
-                                for_each_lower_ascii_word(text, &mut scratch, |tok| {
-                                    add_posting(&mut self.postings, tok, row_idx);
-                                });
-                            } else {
-                                let lowered = lowercased(text, &mut scratch);
-                                for_each_word(lowered, |tok| {
-                                    add_posting(&mut self.postings, tok, row_idx);
-                                });
-                            }
-                        }
-                    }
+                if rows.len() >= 4096
+                    && std::env::var_os("LIN_BENCH_FTS_PARALLEL_APPEND").is_some()
+                {
+                    append_parallel_postings(&mut self.postings, start, rows, slot_mask, fused_ascii);
+                } else {
+                    append_uniform_postings(&mut self.postings, start, rows, slot_mask, fused_ascii);
                 }
                 return;
             }
@@ -925,6 +910,78 @@ fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_id
 
 /// Add `row_idx` to a token's sorted list, allocating a posting list only when
 /// the token is new.
+
+fn append_uniform_postings(
+    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    start: usize,
+    rows: &[Row],
+    slot_mask: u64,
+    fused_ascii: bool,
+) {
+    let mut scratch = String::with_capacity(256);
+    for (i, row) in rows.iter().enumerate() {
+        let row_idx = start + i;
+        let cells = row.cells_slice();
+        let mut m = slot_mask;
+        while m != 0 {
+            let pos = m.trailing_zeros() as usize;
+            m &= m - 1;
+            if let Some(text) = cells[pos].text() {
+                if fused_ascii && text.is_ascii() {
+                    for_each_lower_ascii_word(text, &mut scratch, |tok| {
+                        add_posting(postings, tok, row_idx);
+                    });
+                } else {
+                    let lowered = lowercased(text, &mut scratch);
+                    for_each_word(lowered, |tok| {
+                        add_posting(postings, tok, row_idx);
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn append_parallel_postings(
+    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    start: usize,
+    rows: &[Row],
+    slot_mask: u64,
+    fused_ascii: bool,
+) {
+    let mid = rows.len() / 2;
+    let (left, right) = rows.split_at(mid);
+    let tail = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let mut tail = FxHashMap::default();
+            tail.reserve(right.len());
+            append_uniform_postings(&mut tail, start + mid, right, slot_mask, fused_ascii);
+            tail
+        });
+        append_uniform_postings(postings, start, left, slot_mask, fused_ascii);
+        worker.join().expect("FTS append worker panicked")
+    });
+    for (term, indexes) in tail {
+        match postings.entry(term) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(indexes);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.last().is_none_or(|last| *last < indexes[0]) {
+                    existing.extend(indexes);
+                } else {
+                    for index in indexes {
+                        if let Err(position) = existing.binary_search(&index) {
+                            existing.insert(position, index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn add_posting(
     postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     tok: &str,
@@ -1164,6 +1221,20 @@ pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::store::{Cell, row_text};
+
+    #[test]
+    fn parallel_postings_match_serial_with_overlapping_rows() {
+        let rows: Vec<_> = (0..4097)
+            .map(|i| Row::from([("title", Cell::text_arc(format!("Common {i} ΟΔΟΣ common")))]))
+            .collect();
+        let mut serial = FxHashMap::default();
+        let mut parallel = FxHashMap::default();
+        for (start, rows) in [(30, &rows[..64]), (0, rows.as_slice())] {
+            append_uniform_postings(&mut serial, start, rows, 1, true);
+            append_parallel_postings(&mut parallel, start, rows, 1, true);
+        }
+        assert_eq!(parallel, serial);
+    }
 
     #[test]
     fn fused_ascii_tokens_match_reference() {
