@@ -70,11 +70,18 @@ fn measure_insert(
     n: usize,
     samples: usize,
     timestamp: i64,
+    column_batch: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
     }
-    let mut records = Vec::with_capacity(n);
+    let mut records = Vec::with_capacity(if column_batch { 0 } else { n });
+    let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
+    let mut batch = column_batch.then(|| {
+        let mut names = fields.to_vec();
+        names.push("layer".to_string());
+        lin::RecordBatch::with_capacity(names, n)
+    });
     let mut expected = Vec::with_capacity(n);
     for i in 0..n {
         let id = format!("d-{i}");
@@ -86,14 +93,26 @@ fn measure_insert(
             format!("doc {i} plain")
         };
         let body = format!("body {i}");
-        records.push(format!(
-            r#"{{id:{},uri:{},wing:{},title:{},body:{},layer:"wiki",ts:timestamp({timestamp})}}"#,
-            json!(id),
-            json!(uri),
-            json!(wing),
-            json!(title),
-            json!(body)
-        ));
+        if let Some(batch) = &mut batch {
+            batch.push_cells([
+                Cell::Text(id.as_str().into()),
+                Cell::Text(uri.as_str().into()),
+                Cell::Text(wing.into()),
+                Cell::Text(title.as_str().into()),
+                Cell::Time(timestamp),
+                Cell::Text(body.as_str().into()),
+                Cell::Text("wiki".into()),
+            ]);
+        } else {
+            records.push(format!(
+                r#"{{id:{},uri:{},wing:{},title:{},body:{},layer:"wiki",ts:timestamp({timestamp})}}"#,
+                json!(id),
+                json!(uri),
+                json!(wing),
+                json!(title),
+                json!(body)
+            ));
+        }
         expected.push(json!([id, uri, wing, title, timestamp, body]));
     }
     // Respect the per-statement AST quota without relaxing production limits.
@@ -102,10 +121,10 @@ fn measure_insert(
         .chunks(10_000)
         .map(|chunk| format!("insert docs [{}]", chunk.join(",")))
         .collect::<Vec<_>>();
-    let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let profile = std::env::var_os("LIN_BENCH_INSERT_PHASES").is_some();
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    let mut embedding_hash = None;
     for _ in 0..samples {
         let mut db = Db::empty();
         db.run("index docs [wing, ts]")?;
@@ -114,7 +133,9 @@ fn measure_insert(
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
         let start = Instant::now();
-        let affected = if prepared.len() == 1 {
+        let affected = if let Some(batch) = &batch {
+            black_box(db.insert_batch("docs", batch)?).n
+        } else if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
         } else {
             let mut tx = db.transaction()?;
@@ -148,14 +169,26 @@ fn measure_insert(
         {
             return Err("insert rows or default embeddings missing".into());
         }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for row in rows {
+            row.get("layer").and_then(Cell::text).hash(&mut hasher);
+            row.get("hash").and_then(Cell::text).hash(&mut hasher);
+            let vector = row.get("embedding").and_then(Cell::as_vec).unwrap();
+            vector.len().hash(&mut hasher);
+            for value in vector {
+                value.to_bits().hash(&mut hasher);
+            }
+        }
+        embedding_hash = Some(hasher.finish());
         result = canonical(rows, &fields);
         if result != Value::Array(expected.clone()) {
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result,"embedding_hash":embedding_hash,
         "statement_rows_limit":10_000,"statements":sources.len(),
-        "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
+        "api":if column_batch {"column batch"} else if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -172,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp)?
+                measure_insert(n as usize, samples as usize, timestamp, request["column_batch"].as_bool().unwrap_or(false))?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -219,7 +252,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, false).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);

@@ -33,21 +33,21 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows):
-    request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
+def measure_lin(worker, rows, column_batch=False):
+    request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, column_batch=column_batch)
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True))
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin readback disagrees with fixture")
-    return result["samples_ns"][0]
+    return result["samples_ns"][0], result["embedding_hash"]
 
 
-def main(worker, native_worker, output):
-    roles = ("lin", "control", "native_cpu", "duckdb")
+def main(worker, output):
+    roles = ("lin", "control", "column_batch", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
-        native_sha256=hashlib.sha256(native_worker.read_bytes()).hexdigest(), samples=[],
+        samples=[],
     )
     rng = random.Random(2929273)
     for n in (10_000, 100_000):
@@ -55,17 +55,20 @@ def main(worker, native_worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         measure_lin(worker, rows)
-        measure_lin(native_worker, rows)
+        measure_lin(worker, rows, True)
         for block in range(1):
             orders = list(itertools.permutations(roles))
             rng.shuffle(orders)
             for order in orders:
                 timings = {}
+                hashes = set()
                 for role in order:
-                    timings[role] = (
-                        measure_duckdb(frame, rows) if role == "duckdb"
-                        else measure_lin(native_worker if role == "native_cpu" else worker, rows)
-                    )
+                    if role == "duckdb":
+                        timings[role] = measure_duckdb(frame, rows)
+                    else:
+                        timings[role], digest = measure_lin(worker, rows, role == "column_batch")
+                        hashes.add(digest)
+                assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
                 output.write_text(json.dumps(report, indent=2) + "\n")
         pairs = [x["ns"] for x in report["samples"] if x["rows"] == n]
@@ -73,11 +76,11 @@ def main(worker, native_worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        native_cpu_gain = median(1 - x["native_cpu"] / x["lin"] for x in pairs)
-        native_cpu_wins = sum(x["native_cpu"] < x["duckdb"] for x in pairs)
+        column_batch_gain = median(1 - x["column_batch"] / x["lin"] for x in pairs)
+        column_batch_wins = sum(x["column_batch"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, native_cpu gain {native_cpu_gain:.2%}, "
-              f"native_cpu wins {native_cpu_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, column_batch gain {column_batch_gain:.2%}, "
+              f"column_batch wins {column_batch_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
