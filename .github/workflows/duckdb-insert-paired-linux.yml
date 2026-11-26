@@ -16,7 +16,7 @@ jobs:
           - {runner: ubuntu-22.04, replica: amd-3}
           - {runner: ubuntu-22.04, replica: amd-4}
           - {runner: ubuntu-24.04-arm, replica: arm64}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,7 +25,7 @@ jobs:
         id: cpu
         run: |
           lscpu > runner-cpu.txt
-          if [[ "$(uname -m)" = aarch64 ]] || grep -Eq 'AMD EPYC (7763|9V74)' runner-cpu.txt; then
+          if [[ "$(uname -m)" = aarch64 ]] || grep -Eq 'AMD EPYC (7763|9V74|9V45)' runner-cpu.txt; then
             echo 'matched=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@master

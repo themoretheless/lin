@@ -1,6 +1,5 @@
 """Compare prepared in-memory batch INSERT with exact readback."""
 import hashlib
-import itertools
 import json
 import os
 from pathlib import Path
@@ -34,16 +33,20 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, samples, role):
-    request = dict(insert_rows=len(rows), samples=samples, timestamp_ms=123456)
+def role_env(role):
     env = dict(os.environ)
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
     env.pop("GLIBC_TUNABLES", None)
-    if role == "thp":
+    if role in ("thp", "duckdb_thp"):
         env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
+    return env
+
+
+def measure_lin(worker, rows, samples, role):
+    request = dict(insert_rows=len(rows), samples=samples, timestamp_ms=123456)
     result = json.loads(subprocess.check_output(
-        [worker], input=json.dumps(request) + "\n", text=True, env=env))
+        [worker], input=json.dumps(request) + "\n", text=True, env=role_env(role)))
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin readback disagrees with fixture")
     timings = result["samples_ns"]
@@ -53,9 +56,8 @@ def measure_lin(worker, rows, samples, role):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "thp", "duckdb")
+    roles = ("lin", "control", "thp", "duckdb", "duckdb_thp")
     samples = 5
-    orders = list(itertools.permutations(roles))
     rng = random.Random(2929273)
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
@@ -64,13 +66,18 @@ def main(worker, output):
     )
     for n in (10_000, 100_000):
         rows = bench["fixture"](n)
-        frame = pd.DataFrame(rows, columns=FIELDS)
+        orders = []
+        for _ in range(5):
+            cycle = rng.sample(roles, len(roles))
+            orders.extend(cycle[i:] + cycle[:i] for i in range(len(roles)))
         rng.shuffle(orders)
         for order in orders:
             timings = {}
             for role in order:
-                if role == "duckdb":
-                    timings[role] = [measure_duckdb(frame, rows) for _ in range(samples)]
+                if role.startswith("duckdb"):
+                    timings[role] = json.loads(subprocess.check_output(
+                        [sys.executable, __file__, "--duckdb", str(n), str(samples)],
+                        text=True, env=role_env(role)))
                 else:
                     timings[role] = measure_lin(worker, rows, samples, role)
             report["samples"].append(dict(rows=n, order=order, ns=timings))
@@ -79,10 +86,15 @@ def main(worker, output):
         for label, aggregate in (("first", lambda ts: ts[0]), ("warm", lambda ts: median(ts[1:]))):
             ms = {role: median(aggregate(pair[role]) for pair in pairs) / 1e6 for role in roles}
             wins = sum(aggregate(pair["lin"]) < aggregate(pair["duckdb"]) for pair in pairs)
-            thp_wins = sum(aggregate(pair["thp"]) < aggregate(pair["duckdb"]) for pair in pairs)
+            thp_wins = sum(aggregate(pair["thp"]) < aggregate(pair["duckdb_thp"]) for pair in pairs)
             print(f"{n} rows {label}: {ms}, Lin wins {wins}/{len(pairs)}, "
                   f"Lin THP wins {thp_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "--duckdb":
+        rows = bench["fixture"](int(sys.argv[2]))
+        frame = pd.DataFrame(rows, columns=FIELDS)
+        print(json.dumps([measure_duckdb(frame, rows) for _ in range(int(sys.argv[3]))]))
+        sys.exit(0)
     main(*(Path(arg).resolve() for arg in sys.argv[1:]))
