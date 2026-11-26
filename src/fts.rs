@@ -6,7 +6,7 @@
 //! them and only rebuilds missing / mismatched collections. WAL replay then
 //! updates postings incrementally.
 
-use hashbrown::hash_map::{Entry, RawEntryMut};
+use hashbrown::hash_map::RawEntryMut;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::{SmallVec, smallvec};
 use std::fs::{self, File};
@@ -948,7 +948,10 @@ fn append_parallel_postings(
         let mut tail = Postings::default();
         tail.reserve(right.len());
         append_uniform_postings(&mut tail, start + mid, right, slot_mask);
-        tail
+        let hasher = *tail.hasher();
+        tail.into_iter()
+            .map(|(term, indexes)| (hasher.hash_one(term.as_ref()), term, indexes))
+            .collect::<Vec<_>>()
     };
     let mut append_left = || append_uniform_postings(postings, start, left, slot_mask);
     let tail = std::thread::scope(|scope| {
@@ -960,12 +963,13 @@ fn append_parallel_postings(
         append_uniform_postings(postings, start + mid, right, slot_mask);
         return;
     };
-    for (term, indexes) in tail {
-        match postings.entry(term) {
-            Entry::Vacant(entry) => {
-                entry.insert(indexes);
+    for (hash, term, indexes) in tail {
+        // Both maps use the same stateless FxBuildHasher.
+        match postings.raw_entry_mut().from_hash(hash, |key| key == &term) {
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_hashed_nocheck(hash, term, indexes);
             }
-            Entry::Occupied(mut entry) => {
+            RawEntryMut::Occupied(mut entry) => {
                 let existing = entry.get_mut();
                 if existing.last().is_none_or(|last| *last < indexes[0]) {
                     existing.extend(indexes);
