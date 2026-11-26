@@ -1351,12 +1351,27 @@ pub(super) fn write_segment_from(
 
     let file_crcs = compute_segment_file_crcs(&seg_dir)?;
 
+    let integer_bounds = seg_columns
+        .iter()
+        .filter_map(|column| {
+            if !matches!(column.kind, DiskColKind::Int64 | DiskColKind::Time64) {
+                return None;
+            }
+            let source = rows.col(&column.name);
+            let mut values = (0..source.len()).filter_map(|i| source.int_or_time(i));
+            let first = values.next()?;
+            let bounds = values.fold((first, first), |(lo, hi), n| (lo.min(n), hi.max(n)));
+            Some((column.name.clone(), bounds))
+        })
+        .collect();
+
     Ok(SegmentMeta {
         seg_id,
         table: schema.name.clone(),
         row_count,
         columns: seg_columns,
         indexed_fields: schema.indexed_fields.clone(),
+        integer_bounds,
         file_crcs,
     })
 }

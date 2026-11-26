@@ -1394,3 +1394,112 @@ fn drop_fully_dead_segments_o1_and_savepoint_guard() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn mem_only_overlay_skips_wal_updates_in_place_and_tracks_has_overlay() {
+    let tmp = std::env::temp_dir().join(format!("lin_disk_mem_only_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let mut eng = DiskEngine::open(&tmp, true).unwrap();
+    eng.commit_ops(vec![DiskWalOp::EnsureTable {
+        schema: DiskTableSchema {
+            name: "docs".into(),
+            columns: vec![
+                DiskColSchema {
+                    name: "id".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+                DiskColSchema {
+                    name: "wing".into(),
+                    kind: DiskColKind::TextDict,
+                },
+                DiskColSchema {
+                    name: "title".into(),
+                    kind: DiskColKind::TextZstd,
+                },
+            ],
+            indexed_fields: vec!["wing".into()],
+            cluster_by: None,
+        },
+    }])
+    .unwrap();
+
+    let rows: Vec<Row> = (0..200usize)
+        .map(|i| {
+            let mut r = Row::new();
+            r.insert("id", Cell::from_text(format!("d-{i:04}")));
+            r.insert("wing", Cell::from_text(if i % 2 == 0 { "rag" } else { "sys" }));
+            r.insert("title", Cell::from_text(format!("title {i}")));
+            r
+        })
+        .collect();
+    eng.upsert_rows_mem_and_wal("docs", rows).unwrap();
+    eng.checkpoint().unwrap();
+    assert!(!eng.has_any_overlay);
+    assert_eq!(fs::metadata(tmp.join(WAL_FILE)).unwrap().len(), 0);
+
+    // Warm d-0010 into hot_cache, then mutate via mem_only.
+    let before = eng.get_by_id("docs", "d-0010").unwrap().unwrap();
+    assert_eq!(before.get("title").and_then(Cell::text), Some("title 10"));
+    assert_eq!(eng.hot_cache_stats().cached_rows, 1);
+
+    // Repeated in-place mem_only updates must NOT write DiskEngine's cold/wal or grow mt.rows.
+    for round in 0..50usize {
+        let mut patched = before.clone();
+        patched.insert("title", Cell::from_text(format!("updated {round}")));
+        if round >= 25 {
+            patched.insert("wing", Cell::from_text("sys"));
+        }
+        assert_eq!(eng.upsert_rows_mem_only("docs", vec![patched]).unwrap(), 1);
+    }
+    assert_eq!(fs::metadata(tmp.join(WAL_FILE)).unwrap().len(), 0);
+    assert!(eng.has_any_overlay);
+    assert!(eng.table_has_dirty_overlay("docs"));
+    assert_eq!(eng.memtables["docs"].rows.len(), 1);
+    assert_eq!(eng.count_table("docs"), 200);
+    assert_eq!(eng.hot_cache_stats().cached_rows, 0);
+
+    let pred_id = crate::parse::parse_pred_src(r#"id == "d-0010""#).unwrap();
+    let hit = eng
+        .query_filter("docs", Some(&pred_id), None, Some(&["id", "title"]), 0)
+        .unwrap();
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].get("title").and_then(Cell::text), Some("updated 49"));
+    assert_eq!(
+        eng.count_by_eq("docs", "wing", &Cell::from_text("sys"))
+            .unwrap(),
+        101
+    );
+    assert_eq!(
+        eng.count_by_eq("docs", "wing", &Cell::from_text("rag"))
+            .unwrap(),
+        99
+    );
+
+    // Delete via mem_only: returns exact live deleted count and leaves cold/wal untouched.
+    assert_eq!(
+        eng.delete_by_ids_mem_only("docs", &["d-0010".into(), "d-0020".into(), "missing".into()])
+            .unwrap(),
+        2
+    );
+    assert_eq!(fs::metadata(tmp.join(WAL_FILE)).unwrap().len(), 0);
+    assert_eq!(eng.count_table("docs"), 198);
+    assert!(eng.get_by_id("docs", "d-0010").unwrap().is_none());
+    assert!(eng.get_by_id("docs", "d-0020").unwrap().is_none());
+
+    // Savepoint rollback restores overlay state cleanly.
+    eng.begin_mem_savepoint();
+    assert_eq!(eng.delete_id_mem_only("docs", "d-0030").unwrap(), 1);
+    assert_eq!(eng.count_table("docs"), 197);
+    eng.rollback_savepoint();
+    assert_eq!(eng.count_table("docs"), 198);
+    assert!(eng.exists_by_id("docs", "d-0030"));
+
+    // Checkpoint flushes overlay to segment and clears has_any_overlay.
+    eng.checkpoint().unwrap();
+    assert!(!eng.has_any_overlay);
+    assert!(!eng.has_dirty_overlay());
+    assert_eq!(eng.count_table("docs"), 198);
+
+    let _ = fs::remove_dir_all(&tmp);
+}

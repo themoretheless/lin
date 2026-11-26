@@ -2659,3 +2659,129 @@ mod neon_sparse_writer_tests {
         assert_eq!(decoded_chunked.collections["docs"].len(), 1000);
     }
 }
+
+#[cfg(test)]
+mod wal_coalesce_and_intern_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn preencoded_facts_coalesced_and_large_match_append_facts_v2_and_intern_arcs() {
+        let dir = std::env::temp_dir().join(format!(
+            "lin-wal-coalesce-intern-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for count in [5usize, 1_000, 9_000] {
+            let mut s_vec = Vec::with_capacity(count);
+            let mut p_vec = Vec::with_capacity(count);
+            let mut o_vec = Vec::with_capacity(count);
+            let mut encoded_spo = Vec::new();
+            for i in 0..count {
+                let sv = format!("entity-{}", i % 32);
+                let pv = if i % 4 == 0 { "likes" } else { "tagged" };
+                let ov = if count == 9_000 {
+                    // > 256 KiB total payload to exercise >256KiB fallback path too.
+                    format!("payload-{i:05}-{}", "x".repeat(32))
+                } else if i % 2 == 0 {
+                    format!("entity-{}", (i + 1) % 32)
+                } else {
+                    format!(" unicode-msg-{i}-Сигнал")
+                };
+                put_str(&mut encoded_spo, &sv);
+                put_str(&mut encoded_spo, pv);
+                put_str(&mut encoded_spo, &ov);
+                s_vec.push(Arc::<str>::from(sv));
+                p_vec.push(Arc::<str>::from(pv));
+                o_vec.push(Arc::<str>::from(ov));
+            }
+
+            let p_a = dir.join(format!("a_{count}"));
+            let p_b = dir.join(format!("b_{count}"));
+            std::fs::create_dir_all(&p_a).unwrap();
+            std::fs::create_dir_all(&p_b).unwrap();
+            let mut f_a = open_log(&p_a).unwrap();
+            let mut f_b = open_log(&p_b).unwrap();
+            let mut buf_a = Vec::new();
+            let mut buf_b = Vec::new();
+            let mut bytes_a = 0u64;
+            let mut bytes_b = 0u64;
+
+            append_facts_v2_preencoded(
+                &mut f_a,
+                7,
+                100,
+                count as u32,
+                &encoded_spo,
+                &mut buf_a,
+                SyncMode::Normal,
+                &mut bytes_a,
+            )
+            .unwrap();
+            append_facts_v2(
+                &mut f_b,
+                7,
+                100,
+                &s_vec,
+                &p_vec,
+                &o_vec,
+                &mut buf_b,
+                SyncMode::Normal,
+                &mut bytes_b,
+            )
+            .unwrap();
+
+            assert_eq!(bytes_a, bytes_b);
+            let raw_a = std::fs::read(log_path(&p_a)).unwrap();
+            let raw_b = std::fs::read(log_path(&p_b)).unwrap();
+            assert_eq!(raw_a, raw_b, "frame bytes mismatch for count={count}");
+
+            let mut decoded_recs = Vec::new();
+            let frames_seen = for_each_wal_frame_raw(&raw_a, |raw, rec| {
+                assert_eq!(raw.len(), raw_a.len());
+                decoded_recs.push(rec);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(frames_seen, 1);
+            let Pack::AppendFactsBulk { s, p, o } = &decoded_recs[0].pack else {
+                panic!("expected AppendFactsBulk");
+            };
+            assert_eq!(s, &s_vec);
+            assert_eq!(p, &p_vec);
+            assert_eq!(o, &o_vec);
+            if count == 1_000 {
+                // Verify repeated predicates and repeated subjects share Arc allocations
+                // even when `o` contains hundreds of unique strings!
+                assert!(Arc::ptr_eq(&p[1], &p[2]));
+                assert!(Arc::ptr_eq(&p[0], &p[4]));
+                let shared_s = (0..32).filter(|&k| Arc::ptr_eq(&s[k], &s[k + 32])).count();
+                assert!(
+                    shared_s >= 24,
+                    "expected most of the 32 repeated subjects to share Arcs, got {shared_s}/32"
+                );
+            }
+        }
+
+        // Verify reserved_bytes tracking across open, >64KiB append, and compact_log.
+        let p_res = dir.join("res");
+        std::fs::create_dir_all(&p_res).unwrap();
+        let mut f_res = open_log(&p_res).unwrap();
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        assert!(crate::persist::wal::wal_reserved_bytes(&f_res) >= 1024 * 1024);
+        let mut tracked = 0u64;
+        crate::persist::wal::reserve_wal_space_tracked(&f_res, 0, 128 * 1024, &mut tracked);
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        assert!(tracked >= 1024 * 1024);
+        f_res.write_all(&vec![0xAB; 80 * 1024]).unwrap();
+        compact_log(&mut f_res).unwrap();
+        assert_eq!(f_res.metadata().unwrap().len(), 0);
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        assert!(crate::persist::wal::wal_reserved_bytes(&f_res) >= 1024 * 1024);
+        drop(f_res);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

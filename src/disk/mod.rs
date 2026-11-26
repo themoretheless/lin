@@ -110,6 +110,9 @@ pub struct SegmentMeta {
     pub row_count: u32,
     pub columns: Vec<DiskColSchema>,
     pub indexed_fields: Vec<String>,
+    /// Inclusive min/max for non-null integer and timestamp columns.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub integer_bounds: BTreeMap<String, (i64, i64)>,
     /// `(byte_len, crc32c)` per relative file name inside `segments/seg_XXXXXXXX/`.
     /// Empty for segments written before per-file checksums were added.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1193,6 +1196,8 @@ struct MemTable {
     sec: FxHashMap<String, FxHashMap<Vec<u8>, Vec<usize>>>,
     /// IDs explicitly deleted since last segment flush (masks any older segments).
     deleted_ids: FxHashSet<String>,
+    /// Cached flag: `true` iff `!rows.is_empty() || !deleted_ids.is_empty()`.
+    has_overlay: bool,
 }
 
 impl MemTable {
@@ -1263,11 +1268,58 @@ impl MemTable {
         row: Row,
         indexed_fields: &[String],
         mut undo: Option<&mut MemTableUndo>,
-    ) {
+    ) -> bool {
         let Some(id_str) = row.get("id").and_then(Cell::text) else {
-            return;
+            return false;
         };
         let old_idx_opt = self.by_id.get(id_str).copied();
+        // Fast path outside savepoint when updating an existing MemTable row: overwrite
+        // `self.rows[old_idx]` in-place without growing `rows`, `dead_bits`, or rehashing `by_id`.
+        if undo.is_none()
+            && let Some(old_idx) = old_idx_opt
+            && self.sec.keys().all(|k| indexed_fields.iter().any(|f| f == k))
+        {
+            for field in indexed_fields {
+                if field == "id" {
+                    continue;
+                }
+                let old_cell = self.rows[old_idx].get(field);
+                let new_cell = row.get(field);
+                if old_cell == new_cell && self.sec.contains_key(field.as_str()) {
+                    continue;
+                }
+                if let Some(oc) = old_cell
+                    && let Some(fmap) = self.sec.get_mut(field.as_str())
+                {
+                    with_index_cell_key(oc, |kslice| {
+                        if let Some(vec) = fmap.get_mut(kslice)
+                            && let Some(pos) = vec.iter().position(|&x| x == old_idx)
+                        {
+                            vec.swap_remove(pos);
+                        }
+                    });
+                }
+                if let Some(nc) = new_cell {
+                    with_index_cell_key(nc, |kslice| {
+                        if let Some(fmap) = self.sec.get_mut(field.as_str()) {
+                            if let Some(vec) = fmap.get_mut(kslice) {
+                                vec.push(old_idx);
+                            } else {
+                                fmap.insert(kslice.to_vec(), vec![old_idx]);
+                            }
+                        } else {
+                            let mut fmap = FxHashMap::default();
+                            fmap.insert(kslice.to_vec(), vec![old_idx]);
+                            self.sec.insert(field.clone(), fmap);
+                        }
+                    });
+                }
+            }
+            self.rows[old_idx] = row;
+            self.has_overlay = true;
+            return true;
+        }
+
         let was_deleted = !self.deleted_ids.is_empty() && self.deleted_ids.remove(id_str);
         if let Some(u) = undo.as_deref_mut() {
             u.record_id(id_str, old_idx_opt, was_deleted);
@@ -1300,20 +1352,23 @@ impl MemTable {
                 });
             }
         }
-        if let Some((_, slot)) = self.by_id.get_key_value(id_str) {
-            let _ = slot;
-            if let Some(v) = self.by_id.get_mut(id_str) {
-                *v = new_idx;
-            }
+        if let Some(v) = self.by_id.get_mut(id_str) {
+            *v = new_idx;
         } else {
             self.by_id.insert(id_str.to_string(), new_idx);
         }
         self.rows.push(row);
+        self.has_overlay = true;
+        true
     }
 
-    fn delete_id(&mut self, id: &str, mut undo: Option<&mut MemTableUndo>) {
-        let old_idx_opt = self.by_id.remove(id);
-        let was_deleted = self.deleted_ids.contains(id);
+    fn delete_id(&mut self, id: &str, mut undo: Option<&mut MemTableUndo>) -> bool {
+        let old_idx_opt = if self.by_id.is_empty() {
+            None
+        } else {
+            self.by_id.remove(id)
+        };
+        let was_deleted = !self.deleted_ids.is_empty() && self.deleted_ids.contains(id);
         if let Some(u) = undo.as_deref_mut() {
             u.record_id(id, old_idx_opt, was_deleted);
         }
@@ -1327,8 +1382,11 @@ impl MemTable {
         if !was_deleted {
             self.deleted_ids.insert(id.to_string());
         }
+        self.has_overlay = !self.rows.is_empty() || !self.deleted_ids.is_empty();
+        old_idx_opt.is_some()
     }
 
+    #[inline]
     fn live_count(&self) -> usize {
         self.by_id.len()
     }
@@ -1345,6 +1403,7 @@ impl MemTable {
         self.dead_bits.clear();
         self.sec.clear();
         self.deleted_ids.clear();
+        self.has_overlay = false;
         out
     }
 }
@@ -1359,14 +1418,31 @@ pub(crate) struct SegmentTombstones {
 }
 
 impl SegmentTombstones {
-    #[inline]
-    fn is_dead(&self, seg_id: u64, row_id: u32) -> bool {
-        let Some(words) = self.words_by_seg.get(&seg_id) else {
-            return false;
-        };
+    #[inline(always)]
+    fn word_is_dead(words: &[u64], row_id: u32) -> bool {
         let w = (row_id as usize) >> 6;
         let b = row_id & 63;
         w < words.len() && (words[w] & (1u64 << b)) != 0
+    }
+
+    /// Returns the tombstone words slice for `seg_id` only when at least one row is dead.
+    #[inline]
+    fn live_words(&self, seg_id: u64) -> Option<&[u64]> {
+        if self.words_by_seg.is_empty() || self.dead_count(seg_id) == 0 {
+            return None;
+        }
+        self.words_by_seg.get(&seg_id).map(Vec::as_slice)
+    }
+
+    #[inline]
+    fn is_dead(&self, seg_id: u64, row_id: u32) -> bool {
+        if self.words_by_seg.is_empty() {
+            return false;
+        }
+        let Some(words) = self.words_by_seg.get(&seg_id) else {
+            return false;
+        };
+        Self::word_is_dead(words, row_id)
     }
 
     #[inline]
@@ -1497,6 +1573,8 @@ pub struct DiskEngine {
     /// `table_name -> ordered Vec<Arc<DiskSegment>>` (oldest first, newest last).
     segments: BTreeMap<String, Vec<Arc<DiskSegment>>>,
     memtables: BTreeMap<String, MemTable>,
+    /// Cached flag: `true` iff at least one table in `memtables` has `has_overlay == true`.
+    has_any_overlay: bool,
     tombstones: SegmentTombstones,
     hot_cache: Arc<HotTierCache>,
     active_savepoint: Option<DiskSavepoint>,
@@ -1609,6 +1687,7 @@ impl DiskEngine {
             manifest,
             segments,
             memtables: BTreeMap::new(),
+            has_any_overlay: false,
             tombstones,
             hot_cache: Arc::new(HotTierCache::new(hot_cfg)),
             active_savepoint: None,
@@ -1663,6 +1742,7 @@ impl DiskEngine {
             manifest,
             segments,
             memtables: BTreeMap::new(),
+            has_any_overlay: false,
             tombstones,
             hot_cache: Arc::new(HotTierCache::new(hot_cfg)),
             active_savepoint: None,
@@ -1699,6 +1779,7 @@ impl DiskEngine {
             manifest: self.manifest.clone(),
             segments: self.segments.clone(),
             memtables: self.memtables.clone(),
+            has_any_overlay: self.has_any_overlay,
             tombstones: self.tombstones.clone(),
             hot_cache: Arc::new(HotTierCache::new(HotCacheConfig {
                 enabled: false,
@@ -1847,9 +1928,9 @@ impl DiskEngine {
         Ok(())
     }
 
-    fn mark_segment_key_dead(&mut self, table: &str, id: &str) {
+    fn mark_segment_key_dead(&mut self, table: &str, id: &str) -> bool {
         let Some(segs) = self.segments.get(table) else {
-            return;
+            return false;
         };
         let mut newly_dead = SmallVec::<[(u64, u32); 2]>::new();
         with_text_index_key(id, |kbuf| {
@@ -1864,9 +1945,46 @@ impl DiskEngine {
                 });
             }
         });
+        let any_dead = !newly_dead.is_empty();
         if let Some(sp) = self.active_savepoint.as_mut() {
             sp.added_tombstones.extend(newly_dead);
         }
+        any_dead
+    }
+
+    #[inline(always)]
+    fn active_memtable(&self, table: &str) -> Option<&MemTable> {
+        if !self.has_any_overlay {
+            return None;
+        }
+        self.memtables.get(table).filter(|mt| mt.has_overlay)
+    }
+
+    #[inline(always)]
+    fn active_memtable_rows(&self, table: &str) -> Option<&MemTable> {
+        if !self.has_any_overlay {
+            return None;
+        }
+        self.memtables
+            .get(table)
+            .filter(|mt| !mt.by_id.is_empty())
+    }
+
+    #[inline]
+    fn refresh_has_any_overlay(&mut self) {
+        self.has_any_overlay = self.memtables.values().any(|mt| mt.has_overlay);
+    }
+
+    #[inline]
+    fn mark_table_dirty_overlay(&mut self, table: &str) {
+        if !self.dirty_overlay.contains(table) {
+            let owned = table.to_owned();
+            if let Some(sp) = self.active_savepoint.as_mut() {
+                sp.added_dirty_overlay.push(owned.clone());
+            }
+            self.dirty_overlay.insert(owned);
+        }
+        self.overlay_epoch = self.overlay_epoch.wrapping_add(1);
     }
 
     #[inline]
@@ -2008,55 +2126,146 @@ impl DiskEngine {
                 }
             }
             DiskWalOp::UpsertBatch { table, rows } => {
-                self.ensure_memtable_undo(&table);
-                self.ensure_schema_columns_for_rows(&table, &rows);
-                for row in &rows {
-                    if let Some(id) = row.get("id").and_then(Cell::text) {
-                        self.mark_segment_key_dead(&table, id);
-                        self.hot_cache.invalidate_row(&table, id);
-                    }
-                }
-                if !self.memtables.contains_key(table.as_str()) {
-                    self.memtables.insert(table.clone(), MemTable::default());
-                }
-                let indexed_fields: &[String] = self
-                    .manifest
-                    .tables
-                    .get(table.as_str())
-                    .map(|t| t.indexed_fields.as_slice())
-                    .unwrap_or(&[]);
-                let mt = self.memtables.get_mut(table.as_str()).unwrap();
-                let mut undo = self.active_savepoint.as_mut().and_then(|sp| {
-                    sp.memtable_undos
-                        .iter_mut()
-                        .find(|(t, _)| t == &table)
-                        .map(|(_, u)| u)
-                });
-                for row in rows {
-                    mt.upsert_row(row, indexed_fields, undo.as_deref_mut());
-                }
+                let _ = self.apply_upsert_rows_in_memory(&table, rows);
             }
             DiskWalOp::DeleteIds { table, ids } => {
-                self.ensure_memtable_undo(&table);
-                for id in &ids {
-                    self.mark_segment_key_dead(&table, id);
-                    self.hot_cache.invalidate_row(&table, id);
-                }
-                if !self.memtables.contains_key(table.as_str()) {
-                    self.memtables.insert(table.clone(), MemTable::default());
-                }
-                let mt = self.memtables.get_mut(table.as_str()).unwrap();
-                let mut undo = self.active_savepoint.as_mut().and_then(|sp| {
-                    sp.memtable_undos
-                        .iter_mut()
-                        .find(|(t, _)| t == &table)
-                        .map(|(_, u)| u)
-                });
-                for id in ids {
-                    mt.delete_id(&id, undo.as_deref_mut());
-                }
+                let _ = self.apply_delete_ids_in_memory(&table, &ids);
             }
         }
+    }
+
+    fn apply_upsert_rows_in_memory(&mut self, table: &str, rows: Vec<Row>) -> usize {
+        if rows.is_empty() {
+            return 0;
+        }
+        self.ensure_memtable_undo(table);
+        self.ensure_schema_columns_for_rows(table, &rows);
+        for row in &rows {
+            if let Some(id) = row.get("id").and_then(Cell::text) {
+                self.mark_segment_key_dead(table, id);
+                self.hot_cache.invalidate_row(table, id);
+            }
+        }
+        if !self.memtables.contains_key(table) {
+            self.memtables.insert(table.to_owned(), MemTable::default());
+        }
+        let indexed_fields: &[String] = self
+            .manifest
+            .tables
+            .get(table)
+            .map(|t| t.indexed_fields.as_slice())
+            .unwrap_or(&[]);
+        let mt = self.memtables.get_mut(table).unwrap();
+        let mut undo = self.active_savepoint.as_mut().and_then(|sp| {
+            sp.memtable_undos
+                .iter_mut()
+                .find(|(t, _)| t == table)
+                .map(|(_, u)| u)
+        });
+        let mut upserted = 0usize;
+        for row in rows {
+            if mt.upsert_row(row, indexed_fields, undo.as_deref_mut()) {
+                upserted += 1;
+            }
+        }
+        if mt.has_overlay {
+            self.has_any_overlay = true;
+        }
+        upserted
+    }
+
+    fn apply_delete_ids_in_memory<S: AsRef<str>>(&mut self, table: &str, ids: &[S]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        self.ensure_memtable_undo(table);
+        let mut deleted = 0usize;
+        if !self.memtables.contains_key(table) {
+            self.memtables.insert(table.to_owned(), MemTable::default());
+        }
+        for id_ref in ids {
+            let id = id_ref.as_ref();
+            let seg_dead = self.mark_segment_key_dead(table, id);
+            self.hot_cache.invalidate_row(table, id);
+            let mt = self.memtables.get_mut(table).unwrap();
+            let mut undo = self.active_savepoint.as_mut().and_then(|sp| {
+                sp.memtable_undos
+                    .iter_mut()
+                    .find(|(t, _)| t == table)
+                    .map(|(_, u)| u)
+            });
+            let mt_dead = mt.delete_id(id, undo.as_deref_mut());
+            if seg_dead || mt_dead {
+                deleted += 1;
+            }
+        }
+        if self.memtables.get(table).is_some_and(|mt| mt.has_overlay) {
+            self.has_any_overlay = true;
+        }
+        deleted
+    }
+
+    /// Upsert `rows` into `table`'s in-memory overlay (`MemTable` + tombstones + `hot_cache`
+    /// invalidation + `dirty_overlay`) without writing or fsyncing `DiskEngine`'s `cold/wal`.
+    /// Used when `Persist::log` already durably logged the mutation.
+    pub fn upsert_rows_mem_only(&mut self, table: &str, rows: Vec<Row>) -> Result<usize, Error> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.mark_table_dirty_overlay(table);
+        Ok(self.apply_upsert_rows_in_memory(table, rows))
+    }
+
+    /// Single-row convenience wrapper around [`Self::upsert_rows_mem_only`].
+    pub fn upsert_row_mem_only(&mut self, table: &str, row: Row) -> Result<usize, Error> {
+        self.upsert_rows_mem_only(table, vec![row])
+    }
+
+    /// Delete `ids` in `table`'s in-memory overlay (`MemTable` + tombstones + `hot_cache`
+    /// invalidation + `dirty_overlay`) without writing or fsyncing `DiskEngine`'s `cold/wal`.
+    /// Used when `Persist::log` already durably logged the mutation.
+    pub fn delete_by_ids_mem_only(&mut self, table: &str, ids: &[String]) -> Result<usize, Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.mark_table_dirty_overlay(table);
+        Ok(self.apply_delete_ids_in_memory(table, ids))
+    }
+
+    /// Single-ID borrowed slice convenience for [`Self::delete_by_ids_mem_only`] avoiding `String` allocation.
+    pub fn delete_id_mem_only(&mut self, table: &str, id: &str) -> Result<usize, Error> {
+        self.mark_table_dirty_overlay(table);
+        Ok(self.apply_delete_ids_in_memory(table, &[id]))
+    }
+
+    /// Upsert `rows` durably into `DiskEngine`'s WAL and in-memory `MemTable` (standalone `DiskEngine` mode).
+    pub fn upsert_rows_mem_and_wal(&mut self, table: &str, rows: Vec<Row>) -> Result<usize, Error> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let n = rows.len();
+        self.commit_ops(vec![DiskWalOp::UpsertBatch {
+            table: table.to_owned(),
+            rows,
+        }])?;
+        Ok(n)
+    }
+
+    /// Delete `ids` durably in `DiskEngine`'s WAL and in-memory `MemTable` (standalone `DiskEngine` mode).
+    pub fn delete_by_ids_mem_and_wal(
+        &mut self,
+        table: &str,
+        ids: &[String],
+    ) -> Result<usize, Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let n = ids.len();
+        self.commit_ops(vec![DiskWalOp::DeleteIds {
+            table: table.to_owned(),
+            ids: ids.to_vec(),
+        }])?;
+        Ok(n)
     }
 
     /// Begin an interactive ACID transaction savepoint.
@@ -2152,6 +2361,7 @@ impl DiskEngine {
                 }
             }
         }
+        self.refresh_has_any_overlay();
         (out, self.tombstones.clone())
     }
 
@@ -2241,7 +2451,8 @@ impl DiskEngine {
                         }
                     }
                 }
-                mt.rows.is_empty() && mt.deleted_ids.is_empty()
+                mt.has_overlay = !mt.rows.is_empty() || !mt.deleted_ids.is_empty();
+                !mt.has_overlay
             } else {
                 false
             };
@@ -2249,6 +2460,7 @@ impl DiskEngine {
                 self.memtables.remove(&tbl);
             }
         }
+        self.refresh_has_any_overlay();
         for (sid, rid) in sp.added_tombstones {
             self.tombstones.unmark_dead(sid, rid);
         }
@@ -2341,6 +2553,7 @@ impl DiskEngine {
 
         self.manifest.segments.extend(new_metas);
         self.dirty_overlay.clear();
+        self.has_any_overlay = false;
         self.save_tombstones_and_manifest()?;
 
         if let Some(f) = self.wal_file.as_mut() {
@@ -3141,7 +3354,7 @@ impl DiskEngine {
                 }
             }
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -3180,7 +3393,7 @@ impl DiskEngine {
 
     /// Exact live row count in O(#segments).
     pub fn count_table(&self, table: &str) -> usize {
-        let mem_live = self.memtables.get(table).map_or(0, MemTable::live_count);
+        let mem_live = self.active_memtable_rows(table).map_or(0, MemTable::live_count);
         let seg_live: usize = if let Some(segs) = self.segments.get(table) {
             segs.iter()
                 .map(|s| {
@@ -3208,11 +3421,11 @@ impl DiskEngine {
     }
 
     pub fn exists_by_id(&self, table: &str, id: &str) -> bool {
-        if let Some(mt) = self.memtables.get(table) {
-            if mt.deleted_ids.contains(id) {
+        if let Some(mt) = self.active_memtable(table) {
+            if !mt.deleted_ids.is_empty() && mt.deleted_ids.contains(id) {
                 return false;
             }
-            if mt.by_id.contains_key(id) {
+            if !mt.by_id.is_empty() && mt.by_id.contains_key(id) {
                 return true;
             }
         }
@@ -3222,9 +3435,10 @@ impl DiskEngine {
         with_text_index_key(id, |kbuf| {
             for seg in segs.iter().rev() {
                 let sid = seg.meta.seg_id;
+                let tomb_words = self.tombstones.live_words(sid);
                 let mut found = false;
                 seg.pk_index.for_each_key(kbuf, |rid| {
-                    if !self.tombstones.is_dead(sid, rid) {
+                    if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                         found = true;
                         return false;
                     }
@@ -3313,7 +3527,7 @@ impl DiskEngine {
             };
             total += n;
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if !mt.is_dead_mem(idx) && crate::eval::eval_pred(full_pred, row, now_ms) {
                     total += 1;
@@ -3389,7 +3603,7 @@ impl DiskEngine {
             };
             total.merge(seg_sum);
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if !mt.is_dead_mem(idx) {
                     total.add_cell(row.get(field));
@@ -3510,10 +3724,7 @@ impl DiskEngine {
         val_field: &str,
         by_field: &str,
     ) -> Result<Option<Vec<(Cell, f64)>>, Error> {
-        let mt_empty = self
-            .memtables
-            .get(table)
-            .is_none_or(|mt| mt.live_count() == 0);
+        let mt_empty = self.active_memtable_rows(table).is_none();
         if mt_empty
             && let Some(segs) = self.segments.get(table)
             && segs.len() == 1
@@ -3680,7 +3891,7 @@ impl DiskEngine {
                 }
             }
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -3718,11 +3929,13 @@ impl DiskEngine {
         skip: &[&str],
         cache_hot: bool,
     ) -> Result<Option<Row>, Error> {
-        if let Some(mt) = self.memtables.get(table) {
-            if mt.deleted_ids.contains(id) {
+        if let Some(mt) = self.active_memtable(table) {
+            if !mt.deleted_ids.is_empty() && mt.deleted_ids.contains(id) {
                 return Ok(None);
             }
-            if let Some(&idx) = mt.by_id.get(id) {
+            if !mt.by_id.is_empty()
+                && let Some(&idx) = mt.by_id.get(id)
+            {
                 return Ok(Some(mt.rows[idx].clone()));
             }
         }
@@ -3735,9 +3948,10 @@ impl DiskEngine {
         with_text_index_key(id, |kbuf| {
             for seg in segs.iter().rev() {
                 let sid = seg.meta.seg_id;
+                let tomb_words = self.tombstones.live_words(sid);
                 let mut live_rid = None;
                 seg.pk_index.for_each_key(kbuf, |rid| {
-                    if !self.tombstones.is_dead(sid, rid) {
+                    if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                         live_rid = Some(rid);
                         return false;
                     }
@@ -3767,16 +3981,18 @@ impl DiskEngine {
     ) -> Result<FxHashMap<&'k str, Row>, Error> {
         let mut out: FxHashMap<&'k str, Row> = FxHashMap::default();
         let mut pending: Vec<&'k str> = Vec::new();
-        let mt = self.memtables.get(table);
+        let mt = self.active_memtable(table);
         for id in ids {
             if out.contains_key(id) {
                 continue;
             }
             if let Some(mt) = mt {
-                if mt.deleted_ids.contains(id) {
+                if !mt.deleted_ids.is_empty() && mt.deleted_ids.contains(id) {
                     continue;
                 }
-                if let Some(&idx) = mt.by_id.get(id) {
+                if !mt.by_id.is_empty()
+                    && let Some(&idx) = mt.by_id.get(id)
+                {
                     out.insert(id, mt.rows[idx].clone());
                     continue;
                 }
@@ -3797,9 +4013,10 @@ impl DiskEngine {
             with_text_index_key(id, |kbuf| {
                 for (pos, seg) in segs.iter().enumerate().rev() {
                     let sid = seg.meta.seg_id;
+                    let tomb_words = self.tombstones.live_words(sid);
                     let mut live_rid = None;
                     seg.pk_index.for_each_key(kbuf, |rid| {
-                        if !self.tombstones.is_dead(sid, rid) {
+                        if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                             live_rid = Some(rid);
                             return false;
                         }
@@ -3822,11 +4039,13 @@ impl DiskEngine {
     }
 
     pub fn get_arc_by_id(&self, table: &str, id: &str) -> Result<Option<Arc<Row>>, Error> {
-        if let Some(mt) = self.memtables.get(table) {
-            if mt.deleted_ids.contains(id) {
+        if let Some(mt) = self.active_memtable(table) {
+            if !mt.deleted_ids.is_empty() && mt.deleted_ids.contains(id) {
                 return Ok(None);
             }
-            if let Some(&idx) = mt.by_id.get(id) {
+            if !mt.by_id.is_empty()
+                && let Some(&idx) = mt.by_id.get(id)
+            {
                 return Ok(Some(Arc::new(mt.rows[idx].clone())));
             }
         }
@@ -3839,9 +4058,10 @@ impl DiskEngine {
         with_text_index_key(id, |kbuf| {
             for seg in segs.iter().rev() {
                 let sid = seg.meta.seg_id;
+                let tomb_words = self.tombstones.live_words(sid);
                 let mut live_rid = None;
                 seg.pk_index.for_each_key(kbuf, |rid| {
-                    if !self.tombstones.is_dead(sid, rid) {
+                    if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                         live_rid = Some(rid);
                         return false;
                     }
@@ -3910,11 +4130,13 @@ impl DiskEngine {
         id: &str,
         fields: &[&str],
     ) -> Result<Option<Row>, Error> {
-        if let Some(mt) = self.memtables.get(table) {
-            if mt.deleted_ids.contains(id) {
+        if let Some(mt) = self.active_memtable(table) {
+            if !mt.deleted_ids.is_empty() && mt.deleted_ids.contains(id) {
                 return Ok(None);
             }
-            if let Some(&idx) = mt.by_id.get(id) {
+            if !mt.by_id.is_empty()
+                && let Some(&idx) = mt.by_id.get(id)
+            {
                 return Ok(Some(Self::project_cached_row(&mt.rows[idx], fields)));
             }
         }
@@ -3927,9 +4149,10 @@ impl DiskEngine {
         with_text_index_key(id, |kbuf| {
             for seg in segs.iter().rev() {
                 let sid = seg.meta.seg_id;
+                let tomb_words = self.tombstones.live_words(sid);
                 let mut live_rid = None;
                 seg.pk_index.for_each_key(kbuf, |rid| {
-                    if !self.tombstones.is_dead(sid, rid) {
+                    if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                         live_rid = Some(rid);
                         return false;
                     }
@@ -3959,16 +4182,18 @@ impl DiskEngine {
     ) -> Result<FxHashMap<&'k str, Row>, Error> {
         let mut out: FxHashMap<&'k str, Row> = FxHashMap::default();
         let mut pending: Vec<&'k str> = Vec::new();
-        let mt = self.memtables.get(table);
+        let mt = self.active_memtable(table);
         for id in ids {
             if out.contains_key(id) {
                 continue;
             }
             if let Some(mt) = mt {
-                if mt.deleted_ids.contains(id) {
+                if !mt.deleted_ids.is_empty() && mt.deleted_ids.contains(id) {
                     continue;
                 }
-                if let Some(&idx) = mt.by_id.get(id) {
+                if !mt.by_id.is_empty()
+                    && let Some(&idx) = mt.by_id.get(id)
+                {
                     out.insert(id, Self::project_cached_row(&mt.rows[idx], fields));
                     continue;
                 }
@@ -4027,7 +4252,7 @@ impl DiskEngine {
         }
         let Some(total) = with_index_cell_key(key, |kbuf| -> Result<usize, Error> {
             let mut total = 0usize;
-            if let Some(mt) = self.memtables.get(table) {
+            if let Some(mt) = self.active_memtable_rows(table) {
                 if let Some(fmap) = mt.sec.get(field) {
                     if let Some(idxs) = fmap.get(kbuf) {
                         for &idx in idxs {
@@ -4047,16 +4272,19 @@ impl DiskEngine {
             if let Some(segs) = self.segments.get(table) {
                 for seg in segs {
                     let sid = seg.meta.seg_id;
+                    let tomb_words = self.tombstones.live_words(sid);
                     if let Some(sec_idx) = seg.sec_indexes.get(field) {
                         sec_idx.for_each_key(kbuf, |rid| {
-                            if !self.tombstones.is_dead(sid, rid) {
+                            if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                                 total += 1;
                             }
                             true
                         });
                     } else {
                         for rid in 0..seg.meta.row_count {
-                            if !self.tombstones.is_dead(sid, rid) && seg.get_cell(rid, field)? == *key {
+                            if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid))
+                                && seg.get_cell(rid, field)? == *key
+                            {
                                 total += 1;
                             }
                         }
@@ -4152,7 +4380,7 @@ impl DiskEngine {
         };
         let mut collected: Option<Vec<Row>> = cacheable.then(Vec::new);
 
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             if let Some(fmap) = mt.sec.get(field) {
                 if let Some(idxs) = fmap.get(&kbuf) {
                     for &idx in idxs {
@@ -4205,10 +4433,11 @@ impl DiskEngine {
         if let Some(segs) = self.segments.get(table) {
             for seg in segs {
                 let sid = seg.meta.seg_id;
+                let tomb_words = self.tombstones.live_words(sid);
                 if let Some(sec_idx) = seg.sec_indexes.get(field) {
                     let mut matches = Vec::new();
                     sec_idx.for_each_key(&kbuf, |rid| {
-                        if !self.tombstones.is_dead(sid, rid) {
+                        if tomb_words.is_none_or(|w| !SegmentTombstones::word_is_dead(w, rid)) {
                             matches.push(rid);
                         }
                         true
@@ -4355,7 +4584,7 @@ impl DiskEngine {
         let max_cached_rows = 4096usize;
         let mut collected: Option<Vec<Row>> = cacheable.then(Vec::new);
 
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             let mut on_mem = |idx: usize, row: &Row| -> bool {
                 if !seen_mem.insert(idx) || !crate::eval::eval_pred(pred, row, now_ms) {
                     return true;
@@ -4561,10 +4790,7 @@ impl DiskEngine {
             Dynamic,
         }
 
-        let mt_empty = self
-            .memtables
-            .get(left_name)
-            .is_none_or(|mt| mt.live_count() == 0);
+        let mt_empty = self.active_memtable_rows(left_name).is_none();
         let segs_opt = self.segments.get(left_name);
         let segs: &[Arc<DiskSegment>] = segs_opt.map(Vec::as_slice).unwrap_or(&[]);
 
@@ -5077,7 +5303,7 @@ impl DiskEngine {
             }
         }
 
-        if let Some(mt) = self.memtables.get(left_name) {
+        if let Some(mt) = self.active_memtable_rows(left_name) {
             for (idx, src) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -5292,7 +5518,7 @@ impl DiskEngine {
                 }
             }
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, src) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -5437,7 +5663,7 @@ impl DiskEngine {
             pos.seg += 1;
             pos.rid = 0;
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             while pos.mem < mt.rows.len() {
                 let idx = pos.mem;
                 pos.mem += 1;
@@ -5521,7 +5747,7 @@ impl DiskEngine {
                 }
             }
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -5543,13 +5769,15 @@ impl DiskEngine {
         if let Some(segs) = self.segments.get(table) {
             for seg in segs {
                 let sid = seg.meta.seg_id;
-                let has_dead = self.tombstones.dead_count(sid) > 0;
+                let tomb_words = self.tombstones.live_words(sid);
                 match project_fields {
                     Some(fs) => {
                         let mut proj = seg.prepare_projection(fs);
                         let mut scratch = Row::new();
                         for rid in 0..seg.meta.row_count {
-                            if has_dead && self.tombstones.is_dead(sid, rid) {
+                            if let Some(words) = tomb_words
+                                && SegmentTombstones::word_is_dead(words, rid)
+                            {
                                 continue;
                             }
                             proj.materialize_into(rid, &mut scratch)?;
@@ -5560,7 +5788,9 @@ impl DiskEngine {
                     }
                     None => {
                         for rid in 0..seg.meta.row_count {
-                            if has_dead && self.tombstones.is_dead(sid, rid) {
+                            if let Some(words) = tomb_words
+                                && SegmentTombstones::word_is_dead(words, rid)
+                            {
                                 continue;
                             }
                             let row = seg.materialize_row(rid)?;
@@ -5572,7 +5802,7 @@ impl DiskEngine {
                 }
             }
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -5613,7 +5843,7 @@ impl DiskEngine {
                 }
             }
         }
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -5819,7 +6049,7 @@ impl DiskEngine {
             }
         }
 
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -5970,7 +6200,7 @@ impl DiskEngine {
             }
         }
 
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, r) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -6071,7 +6301,7 @@ impl DiskEngine {
             }
         }
 
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, r) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -6099,7 +6329,7 @@ impl DiskEngine {
         mut visit: impl FnMut(Option<&str>, Option<&str>, Option<&str>) -> Result<bool, Error>,
     ) -> Result<(), Error> {
         with_text_index_key(key_str, |kbuf| {
-            if let Some(mt) = self.memtables.get(table) {
+            if let Some(mt) = self.active_memtable_rows(table) {
                 if let Some(fmap) = mt.sec.get(index_field) {
                     if let Some(idxs) = fmap.get(kbuf) {
                         for &idx in idxs {
@@ -6199,7 +6429,7 @@ impl DiskEngine {
         allow_fk: impl Fn(&str) -> bool,
     ) -> Result<Option<Vec<u64>>, Error> {
         let segs = self.table_segments(table);
-        let mt_live = self.memtables.get(table).map_or(0, MemTable::live_count);
+        let mt_live = self.active_memtable_rows(table).map_or(0, MemTable::live_count);
         let seg_live: usize = segs
             .iter()
             .map(|s| {
@@ -6333,7 +6563,7 @@ impl DiskEngine {
         table: &str,
         mut visit: impl FnMut(usize, &Row) -> Result<bool, Error>,
     ) -> Result<(), Error> {
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if !mt.is_dead_mem(idx) && !visit(idx, row)? {
                     return Ok(());
@@ -6507,7 +6737,7 @@ impl DiskEngine {
                             true
                         });
                     }
-                    if let Some(mt) = self.memtables.get(table)
+                    if let Some(mt) = self.active_memtable_rows(table)
                         && let Some(fmap) = mt.sec.get(doc_id_field)
                         && let Some(idxs) = fmap.get(&kbuf)
                     {
@@ -6830,7 +7060,7 @@ impl DiskEngine {
             }
         }
 
-        if let Some(mt) = self.memtables.get(table) {
+        if let Some(mt) = self.active_memtable_rows(table) {
             for (idx, row) in mt.rows.iter().enumerate() {
                 if mt.is_dead_mem(idx) {
                     continue;
@@ -6915,6 +7145,7 @@ impl DiskEngine {
         }
         self.manifest.tables.remove(table);
         self.memtables.remove(table);
+        self.refresh_has_any_overlay();
         self.dirty_overlay.remove(table);
         if let Some(segs) = self.segments.remove(table) {
             for seg in segs {
@@ -6962,6 +7193,25 @@ impl DiskEngine {
             return Ok(out);
         };
 
+        // Direct primary-key equality fast path (`id == "<lit>"`): skips `needed_cols` Vec
+        // allocations, `extract_index_pushdown`, `seen_ids` HashSet, and extra `Row::clone()`.
+        if let crate::ast::Pred::Cmp {
+            field,
+            op: crate::ast::CmpOp::Eq,
+            value: crate::ast::Value::String(id_str),
+        } = p
+            && field.leaf() == Some("id")
+        {
+            let maybe_row = match project_fields {
+                Some(fs) => self.get_projected_by_id(table, id_str, fs)?,
+                None => self.get_by_id(table, id_str)?,
+            };
+            if let Some(r) = maybe_row {
+                out.push(r);
+            }
+            return Ok(out);
+        }
+
         let needed_cols: Option<Vec<&str>> = project_fields.and_then(|fs| {
             let mut pfields = Vec::new();
             p.walk_fields(&mut pfields);
@@ -6996,10 +7246,7 @@ impl DiskEngine {
                         ..
                     } if field.leaf() == Some(idx_field.as_str())
                 )
-                && self
-                    .memtables
-                    .get(table)
-                    .is_none_or(|mt| mt.rows.is_empty() && mt.deleted_ids.is_empty())
+                && self.active_memtable(table).is_none()
                 && self.segments.get(table).is_none_or(|s| s.len() <= 1)
             {
                 if project_fields == Some(&["id", "title"]) {
@@ -7224,7 +7471,7 @@ impl DiskEngine {
                 'segments_proj: for seg in segs {
                     let sid = seg.meta.seg_id;
                     let n = seg.meta.row_count as usize;
-                    let has_dead = self.tombstones.dead_count(sid) > 0;
+                    let tomb_words = self.tombstones.live_words(sid);
                     for &(f, want) in &terms.text_eqs {
                         match seg.col(f) {
                             None => continue 'segments_proj,
@@ -7259,7 +7506,9 @@ impl DiskEngine {
                                     || zone_prune.all(bi));
                             for idx in start..end {
                                 let rid = idx as u32;
-                                if has_dead && self.tombstones.is_dead(sid, rid) {
+                                if let Some(words) = tomb_words
+                                    && SegmentTombstones::word_is_dead(words, rid)
+                                {
                                     continue;
                                 }
                                 if !all_match {

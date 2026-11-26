@@ -82,3 +82,8 @@ pub(crate) use wal::{
     reserve_wal_space, sync_dir_checked, truncate_log_with_sync, write_frame,
     write_frame_precomputed, write_head_no_dir_sync,
 };
+#[allow(unused_imports)]
+pub(crate) use wal::{
+    clear_wal_reserved, note_wal_reserved, reserve_wal_space_at, reserve_wal_space_tracked,
+    wal_reserved_bytes,
+};

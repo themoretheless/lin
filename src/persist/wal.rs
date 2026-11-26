@@ -291,97 +291,222 @@ pub(super) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+const WAL_FD_SLOTS: usize = 128;
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+static WAL_RESERVED_FD: [std::sync::atomic::AtomicU64; WAL_FD_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; WAL_FD_SLOTS];
+
+#[inline]
+pub(crate) fn clear_wal_reserved(log: &File) {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let fd = log.as_raw_fd();
+        if fd >= 0 && (fd as usize) < WAL_FD_SLOTS {
+            WAL_RESERVED_FD[fd as usize].store(0, Ordering::Release);
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    let _ = log;
+}
+
+#[inline]
+pub(crate) fn wal_reserved_bytes(log: &File) -> u64 {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let fd = log.as_raw_fd();
+        if fd >= 0 && (fd as usize) < WAL_FD_SLOTS {
+            return WAL_RESERVED_FD[fd as usize].load(Ordering::Acquire);
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    let _ = log;
+    0
+}
+
+#[inline]
+pub(crate) fn note_wal_reserved(log: &File, reserved: u64) {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let fd = log.as_raw_fd();
+        if fd >= 0 && (fd as usize) < WAL_FD_SLOTS {
+            WAL_RESERVED_FD[fd as usize].store(reserved, Ordering::Release);
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    let _ = (log, reserved);
+}
+
+/// Fast-path WAL preallocation check using cached physical reservation ceiling:
+/// skips both `fstat` (`log.metadata()`) and `F_PREALLOCATE` / `fallocate` whenever
+/// `log_bytes + additional <= reserved_bytes`.
+#[inline]
+pub(crate) fn reserve_wal_space_at(log: &File, log_bytes: u64, additional: usize) {
+    let Ok(add_u64) = u64::try_from(additional) else {
+        return;
+    };
+    let Some(required) = log_bytes.checked_add(add_u64) else {
+        return;
+    };
+    if wal_reserved_bytes(log) >= required {
+        return;
+    }
+    let res = reserve_wal_space_inner(log, additional, false);
+    if res > 0 {
+        note_wal_reserved(log, res);
+    }
+}
+
+/// Explicit tracked variant updating caller-owned `reserved_bytes` alongside per-FD tracking.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn reserve_wal_space_tracked(
+    log: &File,
+    log_bytes: u64,
+    additional: usize,
+    reserved_bytes: &mut u64,
+) {
+    let Ok(add_u64) = u64::try_from(additional) else {
+        return;
+    };
+    let Some(required) = log_bytes.checked_add(add_u64) else {
+        return;
+    };
+    if *reserved_bytes >= required {
+        return;
+    }
+    let fd_cached = wal_reserved_bytes(log);
+    if fd_cached >= required {
+        *reserved_bytes = fd_cached;
+        return;
+    }
+    let res = reserve_wal_space_inner(log, additional, false);
+    if res > 0 {
+        *reserved_bytes = res;
+        note_wal_reserved(log, res);
+    }
+}
+
 // Best-effort physical allocation only; logical WAL bytes/length and sync stay unchanged.
 pub(crate) fn reserve_wal_space(log: &File, additional: usize, empty_only: bool) {
+    let _ = reserve_wal_space_inner(log, additional, empty_only);
+}
+
+fn reserve_wal_space_inner(log: &File, additional: usize, empty_only: bool) -> u64 {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::unix::{fs::MetadataExt, io::AsRawFd};
         const CHUNK: u64 = 1024 * 1024;
         let Ok(metadata) = log.metadata() else {
-            return;
-        };
-        if empty_only && metadata.len() != 0 {
-            return;
-        }
-        let Ok(additional) = u64::try_from(additional) else {
-            return;
-        };
-        let Some(required) = metadata.len().checked_add(additional) else {
-            return;
+            return 0;
         };
         let allocated = metadata.blocks().saturating_mul(512);
+        if empty_only && metadata.len() != 0 {
+            return allocated.max(metadata.len());
+        }
+        let Ok(additional) = u64::try_from(additional) else {
+            return allocated;
+        };
+        let Some(required) = metadata.len().checked_add(additional) else {
+            return allocated;
+        };
         if allocated >= required {
-            return;
+            return allocated;
         }
         let Some(rounded) = required.checked_add(CHUNK - 1).map(|n| n / CHUNK * CHUNK) else {
-            return;
+            return allocated;
         };
         // Do not reserve an arbitrarily large sparse-file backlog.
         let length = rounded
             .saturating_sub(allocated)
             .min(additional.saturating_add(CHUNK));
-        let Ok(length) = i64::try_from(length) else {
-            return;
+        let Ok(length_i64) = i64::try_from(length) else {
+            return allocated;
         };
-        if length == 0 {
-            return;
+        if length_i64 == 0 {
+            return allocated;
         }
         let mut request = libc::fstore_t {
             fst_flags: libc::F_ALLOCATEALL,
             fst_posmode: libc::F_PEOFPOSMODE,
             fst_offset: 0,
-            fst_length: length,
+            fst_length: length_i64,
             fst_bytesalloc: 0,
         };
         // Unsupported filesystem / allocation failure retains the ordinary write path.
-        let _ = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
+        let rc = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
+        if rc == 0 {
+            let added = u64::try_from(request.fst_bytesalloc.max(0))
+                .unwrap_or(0)
+                .max(length);
+            allocated.saturating_add(added)
+        } else {
+            allocated
+        }
     }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::{fs::MetadataExt, io::AsRawFd};
         const CHUNK: u64 = 1024 * 1024;
         let Ok(metadata) = log.metadata() else {
-            return;
-        };
-        if empty_only && metadata.len() != 0 {
-            return;
-        }
-        let Ok(additional) = u64::try_from(additional) else {
-            return;
-        };
-        let Some(required) = metadata.len().checked_add(additional) else {
-            return;
+            return 0;
         };
         let allocated = metadata.blocks().saturating_mul(512);
+        if empty_only && metadata.len() != 0 {
+            return allocated.max(metadata.len());
+        }
+        let Ok(additional) = u64::try_from(additional) else {
+            return allocated;
+        };
+        let Some(required) = metadata.len().checked_add(additional) else {
+            return allocated;
+        };
         if allocated >= required {
-            return;
+            return allocated;
         }
         let Some(rounded) = required.checked_add(CHUNK - 1).map(|n| n / CHUNK * CHUNK) else {
-            return;
+            return allocated;
         };
         let target_end = rounded.min(required.saturating_add(CHUNK));
         let Ok(len) = libc::off_t::try_from(target_end) else {
-            return;
+            return allocated;
         };
         if len <= 0 {
-            return;
+            return allocated;
         }
         // Preallocate physical extents on ext4/xfs without advancing st_size, so fdatasync
         // avoids block-allocation metadata updates while preserving exact WAL EOF framing.
-        let _ = unsafe { libc::fallocate(log.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+        let rc = unsafe { libc::fallocate(log.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+        if rc == 0 {
+            allocated.max(target_end)
+        } else {
+            allocated
+        }
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-    let _ = (log, additional, empty_only);
+    {
+        let _ = (log, additional, empty_only);
+        0
+    }
 }
 
 fn open_log_file(dir: &Path) -> Result<File, Error> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(log_path(dir))
-        .map_err(io_err)
+        .map_err(io_err)?;
+    clear_wal_reserved(&file);
+    Ok(file)
 }
 
 pub(crate) fn open_log_unreserved(dir: &Path) -> Result<File, Error> {
@@ -390,7 +515,10 @@ pub(crate) fn open_log_unreserved(dir: &Path) -> Result<File, Error> {
 
 pub fn open_log(dir: &Path) -> Result<File, Error> {
     let file = open_log_file(dir)?;
-    reserve_wal_space(&file, 1024 * 1024, true);
+    let res = reserve_wal_space_inner(&file, 1024 * 1024, true);
+    if res > 0 {
+        note_wal_reserved(&file, res);
+    }
     Ok(file)
 }
 
@@ -570,9 +698,10 @@ pub(super) fn write_frame_bytes(
     payload: &[u8],
     checksum: [u8; 4],
     len: u32,
+    log_bytes: u64,
 ) -> io::Result<()> {
     if payload.len() >= 64 * 1024 {
-        reserve_wal_space(log, payload.len().saturating_add(13), false);
+        reserve_wal_space_at(log, log_bytes, payload.len().saturating_add(13));
     }
     let mut hdr = [0u8; 9];
     hdr[..4].copy_from_slice(&LOG_MAGIC_CHECKSUM);
@@ -618,7 +747,7 @@ pub(super) fn write_in_place_frame_buf(
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
     if framed.len() >= 64 * 1024 + 13 {
-        reserve_wal_space(log, framed.len(), false);
+        reserve_wal_space_at(log, *log_bytes, framed.len());
     }
     log.write_all(framed).map_err(io_err)?;
     if sync == SyncMode::Full {
@@ -664,7 +793,7 @@ pub(crate) fn write_frame_precomputed(
         return Err(io_err("log record exceeds 16MiB"));
     };
     let codec = magic[3];
-    write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
+    write_frame_bytes(log, codec, payload, checksum, len as u32, *log_bytes).map_err(io_err)?;
 
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
@@ -939,9 +1068,15 @@ pub(crate) fn truncate_log_with_sync(
     let metadata = log.metadata().map_err(io_err)?;
     let current_len = metadata.len();
     if current_len != end {
+        clear_wal_reserved(log);
         log.set_len(end).map_err(io_err)?;
         if end == 0 {
-            reserve_wal_space(log, 1024 * 1024, true);
+            let res = reserve_wal_space_inner(log, 1024 * 1024, true);
+            if res > 0 {
+                note_wal_reserved(log, res);
+            }
+        } else {
+            note_wal_reserved(log, end);
         }
         log.seek(SeekFrom::End(0)).map_err(io_err)?;
         durable_sync(log).or_else(|_| log.sync_all()).map_err(io_err)?;
@@ -950,15 +1085,41 @@ pub(crate) fn truncate_log_with_sync(
             #[cfg(target_vendor = "apple")]
             {
                 use std::os::unix::fs::MetadataExt;
-                if metadata.blocks().saturating_mul(512) < 1024 * 1024 {
-                    reserve_wal_space(log, 1024 * 1024, true);
+                let allocated = metadata.blocks().saturating_mul(512);
+                if allocated < 1024 * 1024 {
+                    let res = reserve_wal_space_inner(log, 1024 * 1024, true);
+                    if res > 0 {
+                        note_wal_reserved(log, res);
+                    }
                     if sync == SyncMode::Full {
                         durable_sync(log).or_else(|_| log.sync_all()).map_err(io_err)?;
                     }
+                } else {
+                    note_wal_reserved(log, allocated);
                 }
             }
-            #[cfg(not(target_vendor = "apple"))]
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let _ = sync;
+                let allocated = metadata.blocks().saturating_mul(512);
+                if allocated < 1024 * 1024 {
+                    let res = reserve_wal_space_inner(log, 1024 * 1024, true);
+                    if res > 0 {
+                        note_wal_reserved(log, res);
+                    }
+                } else {
+                    note_wal_reserved(log, allocated);
+                }
+            }
+            #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
             let _ = sync;
+        } else {
+            #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+            {
+                use std::os::unix::fs::MetadataExt;
+                note_wal_reserved(log, metadata.blocks().saturating_mul(512).max(end));
+            }
         }
         log.seek(SeekFrom::End(0)).map_err(io_err)?;
     }
@@ -1342,7 +1503,7 @@ pub(crate) fn append_validated_frames(
         return Ok(());
     }
     if frames.len() >= 64 * 1024 {
-        reserve_wal_space(log, frames.len(), false);
+        reserve_wal_space_at(log, *log_bytes, frames.len());
     }
     log.write_all(frames).map_err(io_err)?;
     if sync == SyncMode::Full {
@@ -1364,7 +1525,7 @@ pub(crate) fn append_validated_frame_slices(
         return Ok(());
     }
     if total_len >= 64 * 1024 {
-        reserve_wal_space(log, total_len, false);
+        reserve_wal_space_at(log, *log_bytes, total_len);
     }
     write_all_vectored(log, slices).map_err(io_err)?;
     if sync == SyncMode::Full {

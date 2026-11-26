@@ -1305,6 +1305,67 @@ pub(crate) struct RemoteColdManifest {
     pub(crate) db_snapshot: Option<Vec<u8>>,
 }
 
+fn download_remote_segment(tier: &RemoteTier, seg_id: u64, dir: &Path) -> Result<(), Error> {
+    let key = object_key(
+        &tier.inner.prefix,
+        &format!("segments/seg_{seg_id:08}.lseg"),
+    )?;
+    let bundle = tier
+        .inner
+        .store
+        .get(&key)?
+        .ok_or_else(|| Error::runtime(format!("remote cold segment {key:?} missing")))?;
+    let checksum = tier
+        .inner
+        .seg_entries
+        .get(&seg_id)
+        .map(|entry| (seg_id, entry.bundle_crc32c));
+    unpack_segment_dir_checked(&bundle, dir, checksum)
+}
+
+fn segment_may_match(meta: &SegmentMeta, pred: &crate::ast::Pred) -> bool {
+    use crate::ast::{CmpOp, Pred, Value};
+    match pred {
+        Pred::And(a, b) => segment_may_match(meta, a) && segment_may_match(meta, b),
+        Pred::Or(a, b) => segment_may_match(meta, a) || segment_may_match(meta, b),
+        Pred::Cmp { field, op, value } => {
+            let Some(name) = field.leaf() else {
+                return true;
+            };
+            let Some(&(lo, hi)) = meta.integer_bounds.get(name) else {
+                return true;
+            };
+            let n = match value {
+                Value::Int(n)
+                    if meta
+                        .columns
+                        .iter()
+                        .any(|c| c.name == name && matches!(c.kind, super::DiskColKind::Int64)) =>
+                {
+                    *n
+                }
+                Value::Timestamp(n)
+                    if meta.columns.iter().any(|c| {
+                        c.name == name && matches!(c.kind, super::DiskColKind::Time64)
+                    }) =>
+                {
+                    *n
+                }
+                _ => return true,
+            };
+            match op {
+                CmpOp::Eq => lo <= n && n <= hi,
+                CmpOp::Gt => hi > n,
+                CmpOp::Ge => hi >= n,
+                CmpOp::Lt => lo < n,
+                CmpOp::Le => lo <= n,
+                CmpOp::Ne => true,
+            }
+        }
+        _ => true,
+    }
+}
+
 impl RemoteColdManifest {
     pub(crate) fn encode_wire(&self) -> Result<Vec<u8>, Error> {
         let manifest_json = serde_json::to_vec(&self.disk_manifest).map_err(io_err)?;
@@ -1702,6 +1763,7 @@ impl DiskEngine {
             manifest: remote_manifest.disk_manifest,
             segments: BTreeMap::new(),
             memtables: BTreeMap::new(),
+            has_any_overlay: false,
             tombstones,
             hot_cache: Arc::new(HotTierCache::new(HotCacheConfig::default())),
             active_savepoint: None,
@@ -1770,6 +1832,59 @@ impl DiskEngine {
             .sum()
     }
 
+    pub(crate) fn remote_pruned_segments(
+        &self,
+        table: &str,
+        pred: &crate::ast::Pred,
+    ) -> Option<Vec<SegmentMeta>> {
+        if self.remote_tier.is_none() || self.is_table_hydrated(table) {
+            return None;
+        }
+        let mut pruned = false;
+        let selected = self
+            .manifest
+            .segments
+            .iter()
+            .filter(|meta| meta.table == table)
+            .filter(|meta| {
+                let matches = segment_may_match(meta, pred);
+                pruned |= !matches;
+                matches
+            })
+            .cloned()
+            .collect();
+        pruned.then_some(selected)
+    }
+
+    /// Load an isolated view for a single filtered scan. The caller owns the
+    /// staging directory and removes it after the view has been dropped.
+    pub(crate) fn remote_filtered_view(
+        &self,
+        table: &str,
+        selected: Vec<SegmentMeta>,
+        staging: &Path,
+    ) -> Result<Self, Error> {
+        let tier = self
+            .remote_tier
+            .as_ref()
+            .ok_or_else(|| Error::runtime("filtered scan requires remote storage"))?;
+        let mut view = self.snapshot_view();
+        view.dir = staging.to_path_buf();
+        view.remote_tier = None;
+        view.manifest.segments.retain(|meta| meta.table != table);
+        for meta in selected {
+            let dir = staging.join(format!("seg_{:08}", meta.seg_id));
+            download_remote_segment(tier, meta.seg_id, &dir)?;
+            let segment = DiskSegment::open(&dir, meta.clone())?;
+            view.manifest.segments.push(meta);
+            view.segments
+                .entry(table.to_owned())
+                .or_default()
+                .push(Arc::new(segment));
+        }
+        Ok(view)
+    }
+
     pub fn hydrate_table(&mut self, table: &str) -> Result<usize, Error> {
         if self.segments.contains_key(table) {
             if let Some(rt) = &self.remote_tier {
@@ -1802,19 +1917,7 @@ impl DiskEngine {
                     .join(SEGMENTS_DIR)
                     .join(format!("seg_{:08}", meta.seg_id));
                 if !seg_dir.exists() {
-                    let seg_key = object_key(
-                        &rt.inner.prefix,
-                        &format!("segments/seg_{:08}.lseg", meta.seg_id),
-                    )?;
-                    let bundle = rt.inner.store.get(&seg_key)?.ok_or_else(|| {
-                        Error::runtime(format!("remote cold segment {seg_key:?} missing"))
-                    })?;
-                    let exp_bundle_crc = rt
-                        .inner
-                        .seg_entries
-                        .get(&meta.seg_id)
-                        .map(|entry| (meta.seg_id, entry.bundle_crc32c));
-                    unpack_segment_dir_checked(&bundle, &seg_dir, exp_bundle_crc)?;
+                    download_remote_segment(&rt, meta.seg_id, &seg_dir)?;
                     downloaded_dirs.push(seg_dir.clone());
                 }
                 total_bytes = total_bytes.saturating_add(dir_size_bytes(&seg_dir)?);

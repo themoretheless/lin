@@ -428,6 +428,14 @@ pub struct Persist {
 }
 
 impl Persist {
+    /// Cached physical preallocation ceiling for `self.log` (skips `fstat`/`F_PREALLOCATE`
+    /// while `log_bytes + additional <= reserved_bytes`).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        super::wal::wal_reserved_bytes(&self.log)
+    }
+
     pub(super) fn release_writer_lock(&self) {
         // flock belongs to the open file description, which fork inherits.
         // Closing our File alone leaves the lock held by a child until exec/exit.
@@ -445,6 +453,7 @@ impl Persist {
 
 impl Drop for Persist {
     fn drop(&mut self) {
+        super::wal::clear_wal_reserved(&self.log);
         self.release_writer_lock();
     }
 }

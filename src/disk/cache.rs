@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use rustc_hash::{FxHashMap, FxHasher};
@@ -175,6 +175,7 @@ impl HotRowShard {
         Some(out)
     }
 
+    /// Returns `(evicted_or_added_delta_is_new_insert, net_removed_count)`.
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
@@ -185,10 +186,11 @@ impl HotRowShard {
         approx_bytes: usize,
         max_bytes: usize,
         max_rows: usize,
-    ) {
+    ) -> isize {
         if max_bytes == 0 || max_rows == 0 || approx_bytes > max_bytes {
-            return;
+            return 0;
         }
+        let before_live = self.live_rows;
         if let Some(existing_idx) = self.find_slot(hash, table, id) {
             let old_bytes = self.slots[existing_idx as usize].approx_bytes;
             self.used_bytes = self.used_bytes.saturating_sub(old_bytes);
@@ -214,7 +216,7 @@ impl HotRowShard {
                 self.detach(existing_idx);
                 self.push_back_mru(existing_idx);
             }
-            return;
+            return (self.live_rows as isize) - (before_live as isize);
         }
 
         while (self.live_rows >= max_rows || self.used_bytes + approx_bytes > max_bytes)
@@ -247,18 +249,22 @@ impl HotRowShard {
         self.push_back_mru(idx);
         self.live_rows += 1;
         self.used_bytes += approx_bytes;
+        (self.live_rows as isize) - (before_live as isize)
     }
 
     #[inline]
-    fn invalidate(&mut self, hash: u64, table: &str, id: &str) {
+    fn invalidate(&mut self, hash: u64, table: &str, id: &str) -> bool {
         if let Some(idx) = self.find_slot(hash, table, id) {
             self.remove_slot(idx);
+            true
+        } else {
+            false
         }
     }
 
-    fn invalidate_table(&mut self, table: &str) {
+    fn invalidate_table(&mut self, table: &str) -> usize {
         if self.live_rows == 0 {
-            return;
+            return 0;
         }
         let mut to_remove: SmallVec<[u32; 16]> = SmallVec::new();
         for (i, s) in self.slots.iter().enumerate() {
@@ -266,12 +272,15 @@ impl HotRowShard {
                 to_remove.push(i as u32);
             }
         }
+        let n = to_remove.len();
         for idx in to_remove {
             self.remove_slot(idx);
         }
+        n
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> usize {
+        let prev = self.live_rows;
         self.slots.clear();
         self.free.clear();
         self.by_hash.clear();
@@ -279,6 +288,7 @@ impl HotRowShard {
         self.tail = LRU_NONE;
         self.live_rows = 0;
         self.used_bytes = 0;
+        prev
     }
 }
 
@@ -303,6 +313,7 @@ struct HotSecQueryShard {
 /// Bounded, generation-coherent L1 in-memory Hot Cache sitting in front of cold `mmap` segments.
 pub struct HotTierCache {
     cfg: HotCacheConfig,
+    total_live_rows: AtomicUsize,
     row_shards: [RwLock<HotRowShard>; HOT_ROW_SHARDS],
     sec_shards: [RwLock<HotSecQueryShard>; HOT_ROW_SHARDS],
     vec_queries: RwLock<HotVecQueryCache>,
@@ -312,6 +323,7 @@ impl HotTierCache {
     pub fn new(cfg: HotCacheConfig) -> Self {
         Self {
             cfg,
+            total_live_rows: AtomicUsize::new(0),
             row_shards: std::array::from_fn(|_| RwLock::new(HotRowShard::default())),
             sec_shards: std::array::from_fn(|_| RwLock::new(HotSecQueryShard::default())),
             vec_queries: RwLock::new(HotVecQueryCache::default()),
@@ -370,13 +382,19 @@ impl HotTierCache {
         let h = Self::hash_table_id(table, id);
         let idx = ((h >> 32) as usize ^ (h as usize)) & (HOT_ROW_SHARDS - 1);
         if let Ok(mut shard) = self.row_shards[idx].write() {
-            shard.insert(h, table, id, row, approx, max_bytes, max_rows);
+            let delta = shard.insert(h, table, id, row, approx, max_bytes, max_rows);
+            if delta > 0 {
+                self.total_live_rows.fetch_add(delta as usize, Ordering::Release);
+            } else if delta < 0 {
+                self.total_live_rows
+                    .fetch_sub((-delta) as usize, Ordering::Release);
+            }
         }
     }
 
     #[inline]
     pub(super) fn invalidate_row(&self, table: &str, id: &str) {
-        if !self.cfg.enabled {
+        if !self.cfg.enabled || self.total_live_rows.load(Ordering::Acquire) == 0 {
             return;
         }
         let h = Self::hash_table_id(table, id);
@@ -389,8 +407,10 @@ impl HotTierCache {
                 return;
             }
         }
-        if let Ok(mut shard) = self.row_shards[idx].write() {
-            shard.invalidate(h, table, id);
+        if let Ok(mut shard) = self.row_shards[idx].write()
+            && shard.invalidate(h, table, id)
+        {
+            self.total_live_rows.fetch_sub(1, Ordering::Release);
         }
     }
 
@@ -398,13 +418,17 @@ impl HotTierCache {
         if !self.cfg.enabled {
             return;
         }
-        for s in &self.row_shards {
-            let has_any = s
-                .read()
-                .ok()
-                .is_some_and(|g| g.live_rows > 0 && g.slots.iter().any(|sl| sl.alive && sl.table.as_ref() == table));
-            if has_any && let Ok(mut guard) = s.write() {
-                guard.invalidate_table(table);
+        if self.total_live_rows.load(Ordering::Acquire) > 0 {
+            for s in &self.row_shards {
+                let has_any = s.read().ok().is_some_and(|g| {
+                    g.live_rows > 0 && g.slots.iter().any(|sl| sl.alive && sl.table.as_ref() == table)
+                });
+                if has_any && let Ok(mut guard) = s.write() {
+                    let removed = guard.invalidate_table(table);
+                    if removed > 0 {
+                        self.total_live_rows.fetch_sub(removed, Ordering::Release);
+                    }
+                }
             }
         }
         for s in &self.sec_shards {
@@ -420,9 +444,14 @@ impl HotTierCache {
     }
 
     pub(super) fn clear_all(&self) {
-        for s in &self.row_shards {
-            if let Ok(mut guard) = s.write() {
-                guard.clear();
+        if self.total_live_rows.load(Ordering::Acquire) > 0 {
+            for s in &self.row_shards {
+                if let Ok(mut guard) = s.write() {
+                    let removed = guard.clear();
+                    if removed > 0 {
+                        self.total_live_rows.fetch_sub(removed, Ordering::Release);
+                    }
+                }
             }
         }
         for s in &self.sec_shards {

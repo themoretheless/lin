@@ -1,7 +1,7 @@
 //! Columnar, sparse-vector, and dictionary WAL codecs plus background encoder worker pool.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use crate::Cell;
@@ -15,7 +15,7 @@ use super::types::{
 };
 use super::wal::{
     append_record, append_record_v1, durable_sync, finish_in_place_frame,
-    finish_in_place_frame_buf, io_err, reserve_wal_space, write_all_vectored,
+    finish_in_place_frame_buf, io_err, reserve_wal_space_at, write_all_vectored,
     write_in_place_frame_buf,
 };
 
@@ -32,7 +32,7 @@ pub(crate) fn append_facts_v2_preencoded(
     next_id: u64,
     n: u32,
     encoded_spo: &[u8],
-    _buf: &mut Vec<u8>,
+    buf: &mut Vec<u8>,
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
@@ -55,13 +55,32 @@ pub(crate) fn append_facts_v2_preencoded(
     hdr[18..26].copy_from_slice(&next_id.to_le_bytes());
     hdr[26..30].copy_from_slice(&n.to_le_bytes());
 
+    if encoded_spo.len() <= 256 * 1024 {
+        let total_len = 34 + encoded_spo.len();
+        buf.clear();
+        buf.reserve(total_len);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(encoded_spo);
+        let crc = crate::crc::hardware_crc32c(&buf[8..]).to_le_bytes();
+        buf.extend_from_slice(&crc);
+        if payload_len >= 64 * 1024 {
+            reserve_wal_space_at(log, *log_bytes, total_len);
+        }
+        log.write_all(buf).map_err(io_err)?;
+        if sync == SyncMode::Full {
+            durable_sync(log).map_err(io_err)?;
+        }
+        *log_bytes += total_len as u64;
+        return Ok(());
+    }
+
     let mut hasher = crate::crc::Hasher::new();
     hasher.update(&hdr[8..30]);
     hasher.update(encoded_spo);
     let checksum = hasher.finalize().to_le_bytes();
 
     if payload_len >= 64 * 1024 {
-        reserve_wal_space(log, payload_len.saturating_add(13), false);
+        reserve_wal_space_at(log, *log_bytes, payload_len.saturating_add(13));
     }
     let slices = [
         io::IoSlice::new(&hdr),
@@ -2202,23 +2221,64 @@ pub(super) fn take_str(buf: &[u8], i: &mut usize) -> Result<String, ()> {
     take_str_ref(buf, i).map(str::to_owned)
 }
 
+#[inline(always)]
+fn take_raw_bytes<'a>(buf: &'a [u8], i: &mut usize) -> Result<&'a [u8], ()> {
+    let n = take_u32(buf, i)? as usize;
+    let end = (*i)
+        .checked_add(n)
+        .filter(|&end| end <= buf.len())
+        .ok_or(())?;
+    let slice = &buf[*i..end];
+    *i = end;
+    Ok(slice)
+}
+
+#[inline(always)]
+fn fast_bytes_hash(b: &[u8]) -> usize {
+    let len = b.len();
+    let mut h = (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if len >= 8 {
+        let head = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let tail = u64::from_le_bytes(b[len - 8..].try_into().unwrap());
+        h ^= head.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = h.rotate_left(27) ^ tail.wrapping_mul(0x94D0_49BB_1331_11EB);
+    } else if len >= 4 {
+        let head = u32::from_le_bytes(b[..4].try_into().unwrap()) as u64;
+        let tail = u32::from_le_bytes(b[len - 4..].try_into().unwrap()) as u64;
+        h ^= (head | (tail << 32)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    } else if len > 0 {
+        let v = (b[0] as u64) | ((b[len >> 1] as u64) << 8) | ((b[len - 1] as u64) << 16);
+        h ^= v.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    }
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (h ^ (h >> 27)) as usize
+}
+
+#[inline]
+fn arc_from_validated_str(s: &str) -> Arc<str> {
+    if s.len() <= 4 {
+        match s {
+            "rag" | "sys" | "core" | "test" => return crate::store::intern_wing(Arc::from(s)),
+            "wiki" => {
+                static WIKI: std::sync::LazyLock<Arc<str>> =
+                    std::sync::LazyLock::new(|| Arc::from("wiki"));
+                return Arc::clone(&WIKI);
+            }
+            "raw" => {
+                static RAW: std::sync::LazyLock<Arc<str>> =
+                    std::sync::LazyLock::new(|| Arc::from("raw"));
+                return Arc::clone(&RAW);
+            }
+            _ => {}
+        }
+    }
+    Arc::from(s)
+}
+
 #[inline]
 pub(super) fn take_arc_str(buf: &[u8], i: &mut usize) -> Result<Arc<str>, ()> {
     let s = take_str_ref(buf, i)?;
-    Ok(match s {
-        "rag" | "sys" | "core" | "test" => crate::store::intern_wing(Arc::from(s)),
-        "wiki" => {
-            static WIKI: std::sync::LazyLock<Arc<str>> =
-                std::sync::LazyLock::new(|| Arc::from("wiki"));
-            Arc::clone(&WIKI)
-        }
-        "raw" => {
-            static RAW: std::sync::LazyLock<Arc<str>> =
-                std::sync::LazyLock::new(|| Arc::from("raw"));
-            Arc::clone(&RAW)
-        }
-        _ => Arc::from(s),
-    })
+    Ok(arc_from_validated_str(s))
 }
 
 pub(super) fn decode_v2(buf: &[u8]) -> Result<LogRecord, ()> {
@@ -2357,18 +2417,74 @@ pub(super) fn decode_column_record_mode(
     let record = match kind {
         V2_FACTS_BULK => {
             let n = take_u32(buf, &mut i)? as usize;
+            if n > buf.len().saturating_sub(i) / 12 {
+                return Err(());
+            }
             let mut s: Vec<Arc<str>> = Vec::with_capacity(n);
             let mut p: Vec<Arc<str>> = Vec::with_capacity(n);
             let mut o: Vec<Arc<str>> = Vec::with_capacity(n);
-            for _ in 0..n {
-                s.push(take_arc_str(buf, &mut i)?);
-                let p_str = take_str_ref(buf, &mut i)?;
-                if let Some(prev) = p.last().filter(|prev| prev.as_ref() == p_str) {
-                    p.push(Arc::clone(prev));
-                } else {
-                    p.push(Arc::from(p_str));
+            if n < 8 {
+                for _ in 0..n {
+                    s.push(take_arc_str(buf, &mut i)?);
+                    let p_raw = take_raw_bytes(buf, &mut i)?;
+                    if let Some(prev) = p.last().filter(|prev| prev.as_bytes() == p_raw) {
+                        p.push(Arc::clone(prev));
+                    } else {
+                        let p_str = std::str::from_utf8(p_raw).map_err(|_| ())?;
+                        p.push(arc_from_validated_str(p_str));
+                    }
+                    o.push(take_arc_str(buf, &mut i)?);
                 }
-                o.push(take_arc_str(buf, &mut i)?);
+            } else {
+                // Per-column zero-Drop stack interners (`Copy` `(raw_bytes, vec_idx)`):
+                // isolating `s`, `p`, and `o` ensures high-cardinality `o` payloads never
+                // evict repeated predicates (`p`) or repeated subject entities (`s`), while
+                // all-unique columns pay zero `Arc` clone/drop atomic overhead on misses.
+                let mut s_slots: [(&[u8], u32); 128] = [(&[], u32::MAX); 128];
+                let mut p_slots: [(&[u8], u32); 32] = [(&[], u32::MAX); 32];
+                let mut o_slots: [(&[u8], u32); 64] = [(&[], u32::MAX); 64];
+                let mut last_s_raw: Option<&[u8]> = None;
+                let mut last_p_raw: Option<&[u8]> = None;
+                let mut last_o_raw: Option<&[u8]> = None;
+
+                #[inline(always)]
+                fn push_interned<'a, const N: usize>(
+                    raw: &'a [u8],
+                    last_raw: &mut Option<&'a [u8]>,
+                    slots: &mut [(&'a [u8], u32); N],
+                    out: &mut Vec<Arc<str>>,
+                ) -> Result<(), ()> {
+                    if *last_raw == Some(raw) {
+                        out.push(Arc::clone(out.last().unwrap()));
+                        return Ok(());
+                    }
+                    *last_raw = Some(raw);
+                    if raw.len() <= 64 {
+                        let h = fast_bytes_hash(raw) & (N - 1);
+                        let (craw, cidx) = slots[h];
+                        if cidx != u32::MAX && craw == raw {
+                            out.push(Arc::clone(&out[cidx as usize]));
+                            return Ok(());
+                        }
+                        let s_str = std::str::from_utf8(raw).map_err(|_| ())?;
+                        let idx = out.len() as u32;
+                        out.push(arc_from_validated_str(s_str));
+                        slots[h] = (raw, idx);
+                    } else {
+                        let s_str = std::str::from_utf8(raw).map_err(|_| ())?;
+                        out.push(Arc::from(s_str));
+                    }
+                    Ok(())
+                }
+
+                for _ in 0..n {
+                    let s_raw = take_raw_bytes(buf, &mut i)?;
+                    push_interned(s_raw, &mut last_s_raw, &mut s_slots, &mut s)?;
+                    let p_raw = take_raw_bytes(buf, &mut i)?;
+                    push_interned(p_raw, &mut last_p_raw, &mut p_slots, &mut p)?;
+                    let o_raw = take_raw_bytes(buf, &mut i)?;
+                    push_interned(o_raw, &mut last_o_raw, &mut o_slots, &mut o)?;
+                }
             }
             Ok(LogRecord {
                 r#gen: rec_gen,
@@ -2401,27 +2517,48 @@ pub(super) fn decode_column_record_mode(
                 let col = match ct {
                     0 => ColData::Null,
                     1 => {
-                        let mut v = Vec::with_capacity(n as usize);
-                        let mut prev_arc: Option<Arc<str>> = None;
-                        for _ in 0..n {
-                            let s_ref = take_str_ref(buf, &mut i)?;
-                            let arc = if let Some(ref prev) = prev_arc
-                                && prev.as_ref() == s_ref
-                            {
-                                Arc::clone(prev)
-                            } else {
-                                let a = match s_ref {
-                                    "rag" | "sys" | "core" | "test" => {
-                                        crate::store::intern_wing(Arc::from(s_ref))
+                        let mut v: Vec<Arc<str>> = Vec::with_capacity(n as usize);
+                        if n < 8 {
+                            let mut prev_raw: Option<&[u8]> = None;
+                            for _ in 0..n {
+                                let raw = take_raw_bytes(buf, &mut i)?;
+                                if prev_raw == Some(raw) {
+                                    v.push(Arc::clone(v.last().unwrap()));
+                                } else {
+                                    let s_ref = std::str::from_utf8(raw).map_err(|_| ())?;
+                                    v.push(arc_from_validated_str(s_ref));
+                                    if raw.len() <= 32 {
+                                        prev_raw = Some(raw);
                                     }
-                                    _ => Arc::from(s_ref),
-                                };
-                                if s_ref.len() <= 32 {
-                                    prev_arc = Some(Arc::clone(&a));
                                 }
-                                a
-                            };
-                            v.push(arc);
+                            }
+                        } else {
+                            let mut slots: [(&[u8], u32); 64] = [(&[], u32::MAX); 64];
+                            let mut prev_raw: Option<&[u8]> = None;
+                            for _ in 0..n {
+                                let raw = take_raw_bytes(buf, &mut i)?;
+                                if prev_raw == Some(raw) {
+                                    v.push(Arc::clone(v.last().unwrap()));
+                                } else {
+                                    if raw.len() <= 32 {
+                                        prev_raw = Some(raw);
+                                        let h = fast_bytes_hash(raw) & 63;
+                                        let (craw, cidx) = slots[h];
+                                        if cidx != u32::MAX && craw == raw {
+                                            v.push(Arc::clone(&v[cidx as usize]));
+                                            continue;
+                                        }
+                                        let s_ref = std::str::from_utf8(raw).map_err(|_| ())?;
+                                        let idx = v.len() as u32;
+                                        v.push(arc_from_validated_str(s_ref));
+                                        slots[h] = (raw, idx);
+                                    } else {
+                                        prev_raw = None;
+                                        let s_ref = std::str::from_utf8(raw).map_err(|_| ())?;
+                                        v.push(Arc::from(s_ref));
+                                    }
+                                }
+                            }
                         }
                         ColData::Text(v)
                     }
