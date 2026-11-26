@@ -481,3 +481,18 @@ For each fresh Lin process, subtract the mean of its two repeat 100k transaction
 The two 7763 measurements reproduce an 84–85 ms first-transaction penalty within Lin. Relative to the two 9V45 hosts, the 7763 incurred about 11–13% more extra minor faults but over three times as much extra system CPU. These process counters cannot distinguish time servicing faults from other kernel work. A kernel CPU profile during row construction on the 7763 would distinguish first-touch page allocation from allocator synchronization and scheduling costs.
 
 [Attempt 1 samples](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/1) and [attempt 2 samples](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/2), file `build-workers.json` in each matched runner artifact.
+
+## glibc arena growth padding with default pages
+
+The diagnostic worker compared glibc defaults with `glibc.malloc.top_pad=2097152`. Each host ran eight alternating-order pairs at each size. Every process validated its rows against the other side of the pair. Times below are median paired differences in milliseconds (padded minus default). For repeats, the two later transactions were averaged within each process before pairing.
+
+| CPU / runner | First 10k | Repeat 10k | First 100k | Repeat 100k | First 100k peak RSS delta MiB |
+|---|---:|---:|---:|---:|---:|
+| EPYC 9V74 / 1 | −1.064 | +0.080 | −3.242 | +9.986 | −0.561 |
+| EPYC 7763 / 2 | −1.410 | −0.783 | −5.614 | +10.564 | −0.479 |
+| EPYC 9V74 / 3 | −0.704 | +0.069 | −1.896 | +11.096 | −0.576 |
+| EPYC 7763 / 4 | −1.384 | −0.307 | −5.420 | +12.409 | −0.586 |
+
+Reject the 2 MiB padding setting. First 100k improved in 30/32 pairs, but repeat 100k regressed in 31/32. First-transaction minor faults rose on every host (median paired increases of 920–1,467). This workload compared two Lin processes with the same diagnostic binary.
+
+[Run, host details and raw process measurements](https://github.com/themoretheless/lin/actions/runs/45863266830)
