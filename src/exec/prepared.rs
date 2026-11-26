@@ -130,6 +130,26 @@ pub(crate) struct PreparedAppendFacts {
     pub encoded_spo: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PointGraphPlan {
+    pub collection: String,
+    pub field: String,
+    pub key: String,
+    pub edge_rel: String,
+    pub rel_cell: Cell,
+    pub reverse: bool,
+    pub depth: usize,
+    pub is_hop: bool,
+    pub skip: usize,
+    pub limit: Option<usize>,
+    pub step_count: usize,
+    pub id_slot: crate::store::row::OwnedFieldSlot,
+    pub uri_slot: crate::store::row::OwnedFieldSlot,
+    pub prepared_docs_epoch: u64,
+    pub prepared_rewrite_epoch: u64,
+    pub prepared_idx: Option<usize>,
+}
+
 /// Cheap-to-clone execution payload of [`Prepared`] (all `Arc` handles + `Copy` flags,
 /// without cloning `src: String`) for zero-allocation `plan_cache` hits on `&mut Db` and
 /// `&mut Transaction`.
@@ -141,6 +161,7 @@ pub(crate) struct ExecPlan {
     pub append_only: bool,
     pub schema: bool,
     pub point_get: Option<Arc<PointGetPlan>>,
+    pub point_graph: Option<Arc<PointGraphPlan>>,
     pub scan_project: Option<Arc<ScanProjectPlan>>,
     pub agg_plan: Option<Arc<AggPlan>>,
     pub point_delete: Option<Arc<PointDeletePlan>>,
@@ -163,6 +184,7 @@ pub struct Prepared {
     /// True if any statement contains `$param` placeholders.
     pub(crate) has_params: bool,
     pub(crate) point_get: Option<Arc<PointGetPlan>>,
+    pub(crate) point_graph: Option<Arc<PointGraphPlan>>,
     pub(crate) scan_project: Option<Arc<ScanProjectPlan>>,
     pub(crate) agg_plan: Option<Arc<AggPlan>>,
     pub(crate) point_delete: Option<Arc<PointDeletePlan>>,
@@ -180,6 +202,7 @@ impl Prepared {
             append_only: self.append_only,
             schema: self.schema,
             point_get: self.point_get.as_ref().map(Arc::clone),
+            point_graph: self.point_graph.as_ref().map(Arc::clone),
             scan_project: self.scan_project.as_ref().map(Arc::clone),
             agg_plan: self.agg_plan.as_ref().map(Arc::clone),
             point_delete: self.point_delete.as_ref().map(Arc::clone),
@@ -444,6 +467,233 @@ impl Db {
             o,
             encoded_spo,
         })
+    }
+
+    pub(crate) fn try_extract_point_graph(
+        q: &Query,
+        cat: &Catalog,
+        store: &Store,
+    ) -> Option<PointGraphPlan> {
+        if q.explain.is_some() {
+            return None;
+        }
+        let Source::Collection(collection) = &q.source else {
+            return None;
+        };
+        if !q.ignore_filter && cat.collection(collection).is_some_and(|c| c.filter.is_some()) {
+            return None;
+        }
+        let Some(Step::Filter(first_pred)) = q.steps.first() else {
+            return None;
+        };
+        if pred_has_param(first_pred) {
+            return None;
+        }
+        if !matches!(
+            first_pred,
+            Pred::Cmp {
+                op: CmpOp::Eq,
+                value: Value::String(_),
+                ..
+            }
+        ) {
+            return None;
+        }
+        let (field, key) = point_key(first_pred)?;
+        if field != "id" && !(field == "uri" && collection == "docs") {
+            return None;
+        }
+        let (rel, depth, is_hop) = match q.steps.get(1)? {
+            Step::Graph { rel, depth } => (rel.as_str(), depth.unwrap_or(1).clamp(1, 3) as usize, false),
+            Step::Hop { rel, depth } => (rel.as_str(), depth.unwrap_or(1).clamp(1, 3) as usize, true),
+            _ => return None,
+        };
+        let mut skip = 0usize;
+        let mut take_step: Option<Option<i64>> = None;
+        let mut saw_take = false;
+        for step in &q.steps[2..] {
+            match step {
+                Step::Skip { n } => {
+                    if saw_take {
+                        return None;
+                    }
+                    skip = skip.saturating_add((*n).max(0) as usize);
+                }
+                Step::Take { n } => {
+                    if saw_take {
+                        return None;
+                    }
+                    saw_take = true;
+                    take_step = Some(*n);
+                }
+                _ => return None,
+            }
+        }
+        let limit = match take_step {
+            Some(Some(n)) => Some(n.max(0) as usize),
+            Some(None) => None,
+            None => Some(50),
+        };
+        let (edge_rel, reverse) = match cat.rel(rel) {
+            Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+            _ => (rel, false),
+        };
+        let prepared_idx = if !store.is_disk_backed(collection) {
+            store.point_index(collection, field, key)
+        } else {
+            None
+        };
+        Some(PointGraphPlan {
+            collection: collection.clone(),
+            field: field.to_string(),
+            key: key.to_string(),
+            edge_rel: edge_rel.to_string(),
+            rel_cell: Cell::from_text(edge_rel),
+            reverse,
+            depth,
+            is_hop,
+            skip,
+            limit,
+            step_count: q.steps.len(),
+            id_slot: crate::store::row::OwnedFieldSlot::new("id"),
+            uri_slot: crate::store::row::OwnedFieldSlot::new("uri"),
+            prepared_docs_epoch: store.docs_epoch,
+            prepared_rewrite_epoch: store.collections.rewrite_epoch(),
+            prepared_idx,
+        })
+    }
+
+    pub(crate) fn execute_point_graph(
+        &self,
+        pg: &PointGraphPlan,
+        plan: &Arc<Plan>,
+        want_rows: bool,
+    ) -> Option<Result<super::Handle, Error>> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return None;
+        }
+        if self.store.is_disk_backed(&pg.collection)
+            || (pg.is_hop && self.store.is_disk_backed("docs"))
+            || ((pg.collection == "docs" || pg.is_hop) && self.store.has_deferred_doc_ops())
+            || (pg.collection == "facts" && self.store.facts_rows_stale)
+        {
+            return None;
+        }
+        let col = self.store.collection(&pg.collection);
+        let idx_opt = if let Some(i) = pg.prepared_idx
+            && i < col.len()
+            && self.store.fts_deferred_doc_swaps.is_empty()
+            && ((self.store.collections.rewrite_epoch() == pg.prepared_rewrite_epoch
+                && (pg.collection != "docs" || self.store.docs_epoch == pg.prepared_docs_epoch))
+                || (pg.collection == "docs"
+                    && pg.field == "id"
+                    && self
+                        .store
+                        .docs_id
+                        .get(i)
+                        .is_some_and(|id| id.as_ref() == pg.key.as_str())))
+        {
+            Some(i)
+        } else {
+            self.store
+                .point_index(&pg.collection, &pg.field, &pg.key)
+                .filter(|&i| i < col.len())
+        };
+
+        let Some(seed_idx) = idx_opt else {
+            return Some(Ok(super::Handle {
+                plan: Arc::clone(plan),
+                rows: Vec::new(),
+                done: Done {
+                    r#gen: self.store.r#gen,
+                    n: 0,
+                },
+                message: None,
+                ms: 0.0,
+            }));
+        };
+
+        let mut work = 3usize;
+        if work > self.quotas.max_execution_work {
+            return Some(Err(Error::runtime(format!(
+                "query execution work {} exceeds max_execution_work quota {}",
+                work, self.quotas.max_execution_work
+            ))));
+        }
+
+        let seed_row = &col[seed_idx];
+        let mut seeds: SmallVec<[&str; 2]> = SmallVec::new();
+        if let Some(id_s) = pg.id_slot.get_sync(seed_row).and_then(Cell::text) {
+            seeds.push(id_s);
+        }
+        if let Some(uri_s) = pg.uri_slot.get_sync(seed_row).and_then(Cell::text)
+            && !seeds.contains(&uri_s)
+        {
+            seeds.push(uri_s);
+        }
+
+        let walk_res = if pg.is_hop {
+            self.hop_seeds(
+                &pg.collection,
+                &seeds,
+                &pg.edge_rel,
+                pg.reverse,
+                pg.depth as i64,
+            )
+        } else {
+            self.graph_edges_seeds(
+                &seeds,
+                &pg.edge_rel,
+                &pg.rel_cell,
+                pg.reverse,
+                pg.depth as i64,
+            )
+        };
+        let mut rows = match walk_res {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+
+        for _ in 2..pg.step_count {
+            work = work.saturating_add(rows.len());
+            if work > self.quotas.max_execution_work {
+                return Some(Err(Error::runtime(format!(
+                    "query execution work {} exceeds max_execution_work quota {}",
+                    work, self.quotas.max_execution_work
+                ))));
+            }
+        }
+
+        if pg.skip >= rows.len() {
+            rows.clear();
+        } else if pg.skip > 0 {
+            rows.drain(0..pg.skip);
+        }
+        if let Some(lim) = pg.limit
+            && rows.len() > lim
+        {
+            rows.truncate(lim);
+        }
+
+        if !rows.is_empty()
+            && let Err(e) = self.check_output_quota(&rows)
+        {
+            return Some(Err(e));
+        }
+
+        let n = rows.len();
+        let out_rows = if want_rows { rows } else { Vec::new() };
+        Some(Ok(super::Handle {
+            plan: Arc::clone(plan),
+            rows: out_rows,
+            done: Done {
+                r#gen: self.store.r#gen,
+                n,
+            },
+            message: None,
+            ms: 0.0,
+        }))
     }
 
     pub(crate) fn try_extract_scan_project(

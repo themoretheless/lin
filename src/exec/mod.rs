@@ -248,6 +248,11 @@ pub struct Db {
     pub(crate) strict_embed_dim: bool,
     /// Lazily built mirrors of the declared fields, keyed by collection.
     pub(crate) col_mirrors: std::sync::RwLock<FxHashMap<String, Arc<mirror::ColMirror>>>,
+    /// Lazily built flat SQ8+f32 vector search matrices, keyed by `collection -> (len, docs_epoch, col_epoch, matrix)`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) vec_matrices: Arc<
+        std::sync::RwLock<FxHashMap<String, (usize, u64, u64, Arc<crate::embed::FlatVecMatrix>)>>,
+    >,
     /// Registered incrementally maintained `summarize` views, shared across [`ReadDb`] snapshots.
     pub(crate) mat_views: Arc<std::sync::RwLock<BTreeMap<String, Arc<matview::MaterializedSummarizeView>>>>,
     /// Registered time-range interval overlap indexes, shared across [`ReadDb`] snapshots.
@@ -449,6 +454,15 @@ fn approx_pack_wal_bytes(pack: &Pack) -> usize {
 
 impl Db {
     fn default_embedder(catalog: &Catalog) -> Arc<dyn Embedder> {
+        static DEFAULT_HASH_EMBEDDER: OnceLock<(String, Arc<dyn Embedder>)> = OnceLock::new();
+        let (cached_id, cached_emb) = DEFAULT_HASH_EMBEDDER.get_or_init(|| {
+            let id = catalog.embed_id.clone();
+            let emb: Arc<dyn Embedder> = Arc::new(HashingEmbedder::from_embed_id(&id));
+            (id, emb)
+        });
+        if cached_id == &catalog.embed_id {
+            return Arc::clone(cached_emb);
+        }
         Arc::new(HashingEmbedder::from_embed_id(&catalog.embed_id))
     }
 
@@ -478,6 +492,7 @@ impl Db {
             catalog_soa: false,
             strict_embed_dim: false,
             col_mirrors: Default::default(),
+            vec_matrices: Default::default(),
             mat_views: Default::default(),
             interval_indexes: Default::default(),
             #[cfg(feature = "gpu")]
@@ -700,6 +715,7 @@ impl Db {
                 catalog_soa: false,
                 strict_embed_dim: false,
                 col_mirrors: Default::default(),
+                vec_matrices: Default::default(),
                 mat_views: Default::default(),
                 interval_indexes: Default::default(),
                 #[cfg(feature = "gpu")]
@@ -741,6 +757,7 @@ impl Db {
             catalog_soa: false,
             strict_embed_dim: false,
             col_mirrors: Default::default(),
+            vec_matrices: Default::default(),
             mat_views: Default::default(),
             interval_indexes: Default::default(),
             #[cfg(feature = "gpu")]
@@ -820,6 +837,7 @@ impl Db {
             catalog_soa: false,
             strict_embed_dim: false,
             col_mirrors: Default::default(),
+            vec_matrices: Default::default(),
             mat_views: Default::default(),
             interval_indexes: Default::default(),
             #[cfg(feature = "gpu")]
@@ -947,6 +965,7 @@ impl Db {
                 catalog_soa: self.catalog_soa,
                 strict_embed_dim: self.strict_embed_dim,
                 col_mirrors: std::sync::RwLock::new(mirrors),
+                vec_matrices: Arc::clone(&self.vec_matrices),
                 mat_views: Arc::clone(&self.mat_views),
                 interval_indexes: Arc::clone(&self.interval_indexes),
                 #[cfg(feature = "gpu")]
@@ -1236,6 +1255,9 @@ impl Db {
         self.query_cache.clear();
         self.seen_dml_hashes = [0; 16];
         self.reader_plan_cache = None;
+        if let Ok(mut guard) = self.vec_matrices.write() {
+            guard.clear();
+        }
     }
 
     #[inline]
@@ -1338,11 +1360,22 @@ impl Db {
         } else {
             None
         };
+        let point_graph = if !has_params
+            && stmts.len() == 1
+            && let Stmt::Query(q) = &stmts[0]
+            && !writes
+            && point_get.is_none()
+        {
+            Self::try_extract_point_graph(q, plan_cat, &self.store).map(Arc::new)
+        } else {
+            None
+        };
         let agg_plan = if !has_params
             && stmts.len() == 1
             && let Stmt::Query(q) = &stmts[0]
             && !writes
             && point_get.is_none()
+            && point_graph.is_none()
         {
             Self::try_extract_agg_plan(q, plan_cat).map(Arc::new)
         } else {
@@ -1353,6 +1386,7 @@ impl Db {
             && let Stmt::Query(q) = &stmts[0]
             && !writes
             && point_get.is_none()
+            && point_graph.is_none()
             && agg_plan.is_none()
         {
             Self::try_extract_scan_project(q, plan_cat).map(Arc::new)
@@ -1383,6 +1417,7 @@ impl Db {
             schema,
             has_params,
             point_get,
+            point_graph,
             scan_project,
             agg_plan,
             point_delete,
@@ -2084,7 +2119,10 @@ impl Db {
                     )));
                 }
             }
-            Row::from([("id", Cell::from_text(&pd.key))])
+            Row::from_parts(
+                Arc::clone(crate::store::shape_id()),
+                [Cell::from_text(&pd.key)],
+            )
         } else {
             let Some(row) = self
                 .store
@@ -2799,6 +2837,221 @@ impl Db {
             .map(str::to_string)
     }
 
+    #[inline]
+    fn invalidate_disk_table_caches(&mut self, collection: &str) {
+        if let Some(d) = self.store.disk.as_mut()
+            && let Some(lazy) = d.tables.get_mut(collection)
+            && lazy.materialized.get().is_some()
+        {
+            lazy.materialized = OnceLock::new();
+        }
+        if let Some(cold) = self.store.cold_fts_disk.remove(collection) {
+            self.store
+                .dirty_fts_disk
+                .insert(collection.to_string(), cold.fields.clone());
+            if let Some((_, saved_cold, _)) = self.store.overlay_savepoint_fts.as_mut() {
+                saved_cold.entry(collection.to_string()).or_insert(cold);
+            }
+        }
+        if let Some(fts_idx) = self.store.fts.remove(collection) {
+            self.store
+                .dirty_fts_disk
+                .insert(collection.to_string(), fts_idx.fields.clone());
+            if let Some((saved_fts, _, _)) = self.store.overlay_savepoint_fts.as_mut() {
+                saved_fts.entry(collection.to_string()).or_insert(fts_idx);
+            }
+        }
+    }
+
+    #[inline]
+    fn sync_disk_table_count(&mut self, collection: &str, nrows: usize) {
+        if let Some(d) = self.store.disk.as_mut()
+            && let Some(lazy) = d.tables.get_mut(collection)
+        {
+            lazy.row_count = nrows;
+        }
+        if let Some(cnt) = self.store.col_counts.get_mut(collection) {
+            *cnt = nrows;
+        } else {
+            self.store.col_counts.insert(collection.to_string(), nrows);
+        }
+    }
+
+    /// Apply `pack` to `DiskEngine`'s in-memory overlay (`MemTable` + tombstones) without a
+    /// redundant `cold/wal` write + fsync when `Persist::log` already durably logged `pack`.
+    fn apply_pack_disk_mem_only(&mut self, pack: &Pack) -> Result<(), Error> {
+        if self.store.is_native_disk() {
+            self.store.apply_pack(pack);
+            return Ok(());
+        }
+        match pack {
+            Pack::Update { collection, rows }
+                if self.store.can_apply_disk_overlay(collection) =>
+            {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                self.invalidate_disk_table_caches(collection);
+                let nrows = {
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.upsert_rows_mem_only(collection, rows.clone())?;
+                    eng.count_table(collection)
+                };
+                self.sync_disk_table_count(collection, nrows);
+                Ok(())
+            }
+            Pack::Delete { collection, rows }
+                if self.store.can_apply_disk_overlay(collection) =>
+            {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                self.invalidate_disk_table_caches(collection);
+                let nrows = if rows.len() == 1 {
+                    let Some(id) = row_text(&rows[0], "id") else {
+                        return Ok(());
+                    };
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.delete_id_mem_only(collection, id)?;
+                    eng.count_table(collection)
+                } else {
+                    let ids: Vec<String> = rows
+                        .iter()
+                        .filter_map(|r| row_text(r, "id").map(str::to_string))
+                        .collect();
+                    if ids.is_empty() {
+                        return Ok(());
+                    }
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.delete_by_ids_mem_only(collection, &ids)?;
+                    eng.count_table(collection)
+                };
+                self.sync_disk_table_count(collection, nrows);
+                Ok(())
+            }
+            Pack::Insert {
+                collection,
+                row,
+                edges,
+            } if edges.is_empty() && self.store.can_apply_disk_overlay(collection) => {
+                self.invalidate_disk_table_caches(collection);
+                let nrows = {
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.upsert_row_mem_only(collection, row.clone())?;
+                    eng.count_table(collection)
+                };
+                self.sync_disk_table_count(collection, nrows);
+                Ok(())
+            }
+            Pack::InsertBulk {
+                collection,
+                rows,
+                edges,
+            } if edges.is_empty() && self.store.can_apply_disk_overlay(collection) => {
+                if rows.is_empty() {
+                    return Ok(());
+                }
+                self.invalidate_disk_table_caches(collection);
+                let nrows = {
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.upsert_rows_mem_only(collection, rows.clone())?;
+                    eng.count_table(collection)
+                };
+                self.sync_disk_table_count(collection, nrows);
+                Ok(())
+            }
+            Pack::InsertCols {
+                collection,
+                fields,
+                cols,
+                n,
+                edges,
+            } if edges.is_empty() && self.store.can_apply_disk_overlay(collection) => {
+                if *n == 0 {
+                    return Ok(());
+                }
+                let built = crate::persist::cols_to_rows(fields, cols, *n as usize);
+                self.invalidate_disk_table_caches(collection);
+                let nrows = {
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.upsert_rows_mem_only(collection, built)?;
+                    eng.count_table(collection)
+                };
+                self.sync_disk_table_count(collection, nrows);
+                Ok(())
+            }
+            _ => {
+                self.store.apply_pack(pack);
+                Ok(())
+            }
+        }
+    }
+
+    #[inline]
+    fn can_durable_commit_ref(pack: &Pack) -> bool {
+        match pack {
+            Pack::Update { .. } => true,
+            Pack::Delete { collection, rows } => {
+                let keys: &[&str] = if collection == "facts" {
+                    &["s", "p", "o"]
+                } else {
+                    &["id", "uri"]
+                };
+                rows.iter()
+                    .all(|r| r.iter().all(|(k, _)| keys.contains(&k.as_str())))
+            }
+            _ => false,
+        }
+    }
+
     /// Durably log `pack`, then apply it to the disk overlay. Returns the pack back.
     fn commit_disk_overlay_pack(&mut self, pack: Pack) -> Result<Pack, Error> {
         // Inside a multi-statement program or interactive transaction the pack only reaches
@@ -2816,8 +3069,12 @@ impl Db {
         let Some(p) = self.persist.as_mut() else {
             return Err(Error::runtime("disk overlay requires a durable log"));
         };
-        self.store.durable_commit(p, pack.clone())?;
-        self.store.apply_pack(&pack);
+        if Self::can_durable_commit_ref(&pack) {
+            self.store.durable_commit_ref(p, &pack)?;
+        } else {
+            self.store.durable_commit(p, pack.clone())?;
+        }
+        self.apply_pack_disk_mem_only(&pack)?;
         self.store.r#gen += 1;
         if let Some(p) = self.persist.as_mut() {
             self.store.maybe_checkpoint(p)?;
@@ -2840,28 +3097,106 @@ impl Db {
         let Some(p) = self.persist.as_mut() else {
             return Err(Error::runtime("disk overlay requires a durable log"));
         };
-        let can_ref = match &pack {
-            Pack::Update { .. } => true,
-            Pack::Delete { collection, rows } => {
-                let keys: &[&str] = if collection == "facts" {
-                    &["s", "p", "o"]
-                } else {
-                    &["id", "uri"]
-                };
-                rows.iter()
-                    .all(|r| r.iter().all(|(k, _)| keys.contains(&k.as_str())))
-            }
-            _ => false,
-        };
-        if can_ref {
+        if Self::can_durable_commit_ref(&pack) {
             self.store.durable_commit_ref(p, &pack)?;
         } else {
             self.store.durable_commit(p, pack.clone())?;
         }
-        let mut ops = Vec::new();
-        crate::store::checkpoint::pack_into_disk_wal_ops(pack, &mut ops);
-        if !ops.is_empty() {
-            let _ = self.store.apply_disk_overlay_ops_owned(ops);
+        match pack {
+            Pack::Update { collection, rows }
+                if self.store.can_apply_disk_overlay(&collection) =>
+            {
+                if !rows.is_empty() {
+                    self.invalidate_disk_table_caches(&collection);
+                    let nrows = {
+                        let d = self
+                            .store
+                            .disk
+                            .as_ref()
+                            .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                        let mut eng = d
+                            .engine
+                            .write()
+                            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                        eng.upsert_rows_mem_only(&collection, rows)?;
+                        eng.count_table(&collection)
+                    };
+                    self.sync_disk_table_count(&collection, nrows);
+                }
+            }
+            Pack::Delete { collection, rows }
+                if self.store.can_apply_disk_overlay(&collection) =>
+            {
+                if rows.len() == 1 {
+                    if let Some(id) = row_text(&rows[0], "id") {
+                        self.invalidate_disk_table_caches(&collection);
+                        let nrows = {
+                            let d = self
+                                .store
+                                .disk
+                                .as_ref()
+                                .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                            let mut eng = d
+                                .engine
+                                .write()
+                                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                            eng.delete_id_mem_only(&collection, id)?;
+                            eng.count_table(&collection)
+                        };
+                        self.sync_disk_table_count(&collection, nrows);
+                    }
+                } else if !rows.is_empty() {
+                    let ids: Vec<String> = rows
+                        .iter()
+                        .filter_map(|r| row_text(r, "id").map(str::to_string))
+                        .collect();
+                    if !ids.is_empty() {
+                        self.invalidate_disk_table_caches(&collection);
+                        let nrows = {
+                            let d = self
+                                .store
+                                .disk
+                                .as_ref()
+                                .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                            let mut eng = d
+                                .engine
+                                .write()
+                                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                            eng.delete_by_ids_mem_only(&collection, &ids)?;
+                            eng.count_table(&collection)
+                        };
+                        self.sync_disk_table_count(&collection, nrows);
+                    }
+                }
+            }
+            Pack::Insert {
+                collection,
+                row,
+                edges,
+            } if edges.is_empty() && self.store.can_apply_disk_overlay(&collection) => {
+                self.invalidate_disk_table_caches(&collection);
+                let nrows = {
+                    let d = self
+                        .store
+                        .disk
+                        .as_ref()
+                        .ok_or_else(|| Error::runtime("disk engine missing"))?;
+                    let mut eng = d
+                        .engine
+                        .write()
+                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    eng.upsert_row_mem_only(&collection, row)?;
+                    eng.count_table(&collection)
+                };
+                self.sync_disk_table_count(&collection, nrows);
+            }
+            other => {
+                let mut ops = Vec::new();
+                crate::store::checkpoint::pack_into_disk_wal_ops(other, &mut ops);
+                if !ops.is_empty() {
+                    let _ = self.store.apply_disk_overlay_ops_owned(ops);
+                }
+            }
         }
         self.store.r#gen += 1;
         if let Some(p) = self.persist.as_mut() {
@@ -3128,6 +3463,7 @@ impl Db {
             prepared.append_only,
             prepared.schema,
             prepared.point_get.as_deref(),
+            prepared.point_graph.as_deref(),
             prepared.scan_project.as_deref(),
             prepared.agg_plan.as_deref(),
             prepared.point_delete.as_deref(),
@@ -3150,6 +3486,7 @@ impl Db {
             ep.append_only,
             ep.schema,
             ep.point_get.as_deref(),
+            ep.point_graph.as_deref(),
             ep.scan_project.as_deref(),
             ep.agg_plan.as_deref(),
             ep.point_delete.as_deref(),
@@ -3168,6 +3505,7 @@ impl Db {
         append_only: bool,
         schema: bool,
         point_get: Option<&prepared::PointGetPlan>,
+        point_graph: Option<&prepared::PointGraphPlan>,
         scan_project: Option<&prepared::ScanProjectPlan>,
         agg_plan: Option<&prepared::AggPlan>,
         point_delete: Option<&prepared::PointDeletePlan>,
@@ -3175,6 +3513,20 @@ impl Db {
         append_facts: Option<&prepared::PreparedAppendFacts>,
         want_rows: bool,
     ) -> Result<Handle, Error> {
+        if let Some(pgr) = point_graph {
+            if (pgr.collection == "docs" || pgr.is_hop) && self.store.has_deferred_doc_ops() {
+                self.store.flush_fts_deferred_docs();
+            }
+            if pgr.collection == "facts"
+                && self.store.facts_rows_stale
+                && !self.store.is_disk_backed("facts")
+            {
+                self.store.ensure_facts_rows();
+            }
+            if let Some(res) = self.execute_point_graph(pgr, plan, want_rows) {
+                return res;
+            }
+        }
         if let Some(pg) = point_get {
             if !self.store.fts_deferred_doc_swaps.is_empty()
                 || (!pg.is_docs_id_title && !self.store.deferred_doc_wing_updates.is_empty())
@@ -3899,6 +4251,13 @@ impl Db {
         {
             return Some(batch);
         }
+        if !self.uses_gpu_filter(&q)
+            && !self.uses_gpu_join(&q)
+            && !self.uses_gpu_sort(&q)
+            && let Some(batch) = self.try_vectorized_pipeline_batch(&q, &bindings, now)
+        {
+            return Some(batch);
+        }
         None
     }
 
@@ -3937,6 +4296,11 @@ impl Db {
         }
         if let Some(h) = self.try_fast_docs_id_title_get(prepared) {
             return Ok(h);
+        }
+        if let Some(pgr) = &prepared.point_graph
+            && let Some(res) = self.execute_point_graph(pgr, &prepared.plan, true)
+        {
+            return res;
         }
         if let Some(pg) = &prepared.point_get {
             let row = self.execute_point_get(pg);
@@ -4789,17 +5153,40 @@ impl Db {
     /// Enable or disable dynamic `Catalog`-driven columnar SoA mirroring across all typed
     /// collections in memory (`ColMirror` + `Column::Dict`).
     pub fn enable_catalog_columns(&mut self, enabled: bool) {
+        let changed = self.catalog_soa != enabled;
         self.catalog_soa = enabled;
         self.reader_cache = None;
-        if !enabled
+        if changed
             && let Ok(mut cache) = self.col_mirrors.write()
         {
-            cache.retain(|k, _| self.declared_cols.contains_key(k));
+            cache.clear();
         }
     }
 
     pub(crate) fn get_or_build_mirror(&self, name: &str) -> Option<Arc<mirror::ColMirror>> {
-        let cat_fields: Option<Vec<String>> = if !self.declared_cols.contains_key(name) && self.catalog_soa {
+        if self.store.is_disk_backed(name)
+            || (name == "facts" && self.store.facts_rows_stale)
+            || (name == "docs" && self.store.has_deferred_doc_ops())
+        {
+            return None;
+        }
+        let rows = self.store.collections.get(name)?;
+        let auto_custom_soa = !self.declared_cols.contains_key(name)
+            && (self.catalog_soa
+                || (rows.len() >= 256
+                    && !matches!(name, "docs" | "orders" | "users" | "facts" | "catalog")));
+        let force_text_dict = self.catalog_soa;
+        let epoch = self.store.collections.epoch();
+        if (self.declared_cols.contains_key(name) || auto_custom_soa)
+            && let Ok(cache) = self.col_mirrors.read()
+            && let Some(m) = cache.get(name)
+            && m.epoch == epoch
+            && m.len == rows.len()
+            && m.force_text_dict == force_text_dict
+        {
+            return Some(Arc::clone(m));
+        }
+        let cat_fields: Option<Vec<String>> = if auto_custom_soa {
             let col_def = self.catalog.collection(name)?;
             let fs: Vec<String> = col_def
                 .fields
@@ -4816,29 +5203,25 @@ impl Db {
             (None, Some(cf)) => cf.as_slice(),
             (None, None) => return None,
         };
-        if self.store.is_disk_backed(name)
-            || (name == "facts" && self.store.facts_rows_stale)
-            || (name == "docs" && self.store.has_deferred_doc_ops())
-        {
-            return None;
-        }
-        let rows = self.store.collections.get(name)?;
-        let epoch = self.store.collections.epoch();
-        if let Ok(cache) = self.col_mirrors.read()
-            && let Some(m) = cache.get(name)
-            && m.epoch == epoch
-            && m.len == rows.len()
-        {
-            return Some(Arc::clone(m));
-        }
         let mut cache = self
             .col_mirrors
             .write()
             .unwrap_or_else(|e| e.into_inner());
         match cache.get(name) {
-            Some(m) if m.epoch == epoch && m.len == rows.len() => Some(Arc::clone(m)),
+            Some(m)
+                if m.epoch == epoch
+                    && m.len == rows.len()
+                    && m.force_text_dict == force_text_dict =>
+            {
+                Some(Arc::clone(m))
+            }
             _ => {
-                let m = Arc::new(mirror::ColMirror::build(rows, fields, epoch));
+                let m = Arc::new(mirror::ColMirror::build(
+                    rows,
+                    fields,
+                    epoch,
+                    force_text_dict,
+                ));
                 cache.insert(name.to_string(), Arc::clone(&m));
                 Some(m)
             }
@@ -5463,9 +5846,47 @@ impl Db {
                     && !self.store.is_disk_backed(name)
                     && let Some((uses, covered)) =
                         crate::index::pick_index_with_coverage(&self.catalog, name, pred)
-                    && let Some(idxs) = self.store.index_seek(name, &uses, now)
                 {
-                    self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, covered)
+                    if covered
+                        && name == "docs"
+                        && let Some(pfs) = project_fields_step
+                    {
+                        let pnames = field_names(pfs);
+                        if let Some(rows) = self.try_docs_direct_id_title(
+                            pred,
+                            Some(&uses),
+                            true,
+                            now,
+                            &pnames,
+                            None,
+                        ) {
+                            rows
+                        } else if let Some(idxs) = self.store.index_seek(name, &uses, now) {
+                            self.fetch_idxs_filtered(
+                                name,
+                                &idxs,
+                                pred,
+                                now,
+                                project_fields_step,
+                                covered,
+                            )
+                        } else {
+                            self.filter_scan(name, pred, now, project_fields_step)
+                        }
+                    } else if let Some(idxs) = self.store.index_seek(name, &uses, now) {
+                        self.fetch_idxs_filtered(
+                            name,
+                            &idxs,
+                            pred,
+                            now,
+                            project_fields_step,
+                            covered,
+                        )
+                    } else if let Some(idxs) = self.mirror_select(name, pred, now) {
+                        self.fetch_idxs_filtered(name, &idxs, pred, now, project_fields_step, true)
+                    } else {
+                        self.filter_scan(name, pred, now, project_fields_step)
+                    }
                 } else if let Some(pred) = first_filter {
                     let col_len = self.store.get_col_count(name);
                     if col_len > self.quotas.max_execution_work {
@@ -5875,6 +6296,157 @@ impl Db {
             }
         }
         out
+    }
+
+    /// Direct zero-`Vec<usize>` materialization of `docs | pred | { id, title }` straight from
+    /// either `docs_wing` (`memchr`) or a single `LiveIndex` (`seek_ordered_limit` over `PostingList`),
+    /// reusing pooled `id+title` `Vec<Row>` buffers when available.
+    pub(crate) fn try_docs_direct_id_title(
+        &self,
+        pred: &Pred,
+        uses: Option<&[crate::index::IndexUse]>,
+        covered: bool,
+        now: i64,
+        names: &[String],
+        limit: Option<usize>,
+    ) -> Option<Vec<Row>> {
+        let is_id_title = names.len() == 2
+            && ((names[0] == "id" && names[1] == "title")
+                || (names[0] == "title" && names[1] == "id"));
+        if !is_id_title || self.store.is_disk_backed("docs") || self.store.has_deferred_doc_ops() {
+            return None;
+        }
+        let n = self.store.docs_id.len();
+        if n != self.store.docs_title.len()
+            || n != self.store.collections.get("docs").map_or(0, Vec::len)
+        {
+            return None;
+        }
+        if limit == Some(0) {
+            return Some(Vec::new());
+        }
+
+        let docs_id = &self.store.docs_id;
+        let docs_title = &self.store.docs_title;
+        let shape = crate::store::shape_id_title();
+
+        #[inline]
+        fn write_or_push_id_title(
+            rows: &mut Vec<Row>,
+            offset: usize,
+            reuse_len: usize,
+            shape: &Arc<crate::store::RowShape>,
+            id: &Arc<str>,
+            title: &Arc<str>,
+        ) {
+            if offset < reuse_len {
+                let row = &mut rows[offset];
+                if row.shape_arc().is_some_and(|s| Arc::ptr_eq(s, shape))
+                    && let [v1, v2] = row.cells_mut()
+                {
+                    if !matches!(v1, Cell::Text(a) if Arc::ptr_eq(a, id)) {
+                        *v1 = Cell::Text(Arc::clone(id));
+                    }
+                    if !matches!(v2, Cell::Text(a) if Arc::ptr_eq(a, title)) {
+                        *v2 = Cell::Text(Arc::clone(title));
+                    }
+                    return;
+                }
+                *row = Row::from_parts(
+                    Arc::clone(shape),
+                    [Cell::Text(Arc::clone(id)), Cell::Text(Arc::clone(title))],
+                );
+            } else {
+                rows.push(Row::from_parts(
+                    Arc::clone(shape),
+                    [Cell::Text(Arc::clone(id)), Cell::Text(Arc::clone(title))],
+                ));
+            }
+        }
+
+        // Fast path A: `wing == "<target>"` directly over 1-byte `docs_wing` codes via `memchr`
+        // without allocating an intermediate `Vec<usize>`.
+        if uses.is_none()
+            && let Pred::Cmp {
+                field,
+                op: CmpOp::Eq,
+                value: Value::String(target),
+            } = pred
+            && field.leaf() == Some("wing")
+            && self.store.docs_wing.len() == n
+            && let Some((codes, dict)) = self.store.docs_wing.as_indices()
+        {
+            let Some(code) = dict
+                .iter()
+                .position(|v| v.as_ref() == target.as_ref())
+                .map(|p| p as u8)
+            else {
+                return Some(Vec::new());
+            };
+            let max_take = limit.unwrap_or(usize::MAX);
+            let mut rows = if limit.is_none() && n >= 1024 {
+                crate::store::take_recycled_id_title_vec().unwrap_or_else(|| {
+                    Vec::with_capacity((codes.len() / 2 + 16).min(codes.len()))
+                })
+            } else {
+                Vec::with_capacity(limit.unwrap_or(codes.len() / 2 + 16).min(codes.len()))
+            };
+            let reuse_len = rows.len();
+            let mut emitted = 0usize;
+            for i in memchr::memchr_iter(code, codes) {
+                write_or_push_id_title(&mut rows, emitted, reuse_len, shape, &docs_id[i], &docs_title[i]);
+                emitted += 1;
+                if emitted >= max_take {
+                    break;
+                }
+            }
+            rows.truncate(emitted);
+            return Some(rows);
+        }
+
+        // Fast path B: Covered single-index equality seek directly over `&PostingList` / `BTreeMap`
+        // without allocating an intermediate `Vec<usize>`.
+        if covered
+            && let Some([use_]) = uses
+            && use_.range.is_none()
+            && let Some(live_idx) = self.store.indexes.get(&use_.def.label())
+            && live_idx.def.collection == "docs"
+        {
+            let total = live_idx.seek_count(use_, now);
+            let want = limit.map_or(total, |lim| total.min(lim));
+            if want == 0 {
+                return Some(Vec::new());
+            }
+            let mut rows = if limit.is_none() && want >= 1024 {
+                crate::store::take_recycled_id_title_vec()
+                    .unwrap_or_else(|| Vec::with_capacity(want))
+            } else {
+                Vec::with_capacity(want)
+            };
+            if rows.capacity() < want {
+                rows.reserve(want - rows.len());
+            }
+            let reuse_len = rows.len();
+            let mut emitted = 0usize;
+            live_idx.seek_ordered_limit(use_, now, false, |i| {
+                if i < n {
+                    write_or_push_id_title(
+                        &mut rows,
+                        emitted,
+                        reuse_len,
+                        shape,
+                        &docs_id[i],
+                        &docs_title[i],
+                    );
+                    emitted += 1;
+                }
+                emitted < want
+            });
+            rows.truncate(emitted);
+            return Some(rows);
+        }
+
+        None
     }
 
     pub(super) fn fetch_idxs_filtered(

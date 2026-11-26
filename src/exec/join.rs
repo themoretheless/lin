@@ -558,6 +558,11 @@ impl Db {
                 self.store
                     .scan_docs_hot_project(&names, Some(needle.as_str()))?
             } else if name == "docs"
+                && let Some(rows) =
+                    self.try_docs_direct_id_title(pred, None, false, now, &names, dict_limit)
+            {
+                rows
+            } else if name == "docs"
                 && let Pred::Cmp {
                     field,
                     op: CmpOp::Eq,
@@ -571,16 +576,50 @@ impl Db {
                 rows
             } else if let Some((uses, covered)) =
                 crate::index::pick_index_with_coverage(&self.catalog, name, pred)
-                && let Some(idxs) = self.store.index_seek(name, &uses, now)
             {
-                if name == "docs" && covered {
-                    if let Some(rows) = self.store.project_docs_hot(&idxs, &names) {
-                        rows
+                if name == "docs"
+                    && covered
+                    && let Some(rows) = self.try_docs_direct_id_title(
+                        pred,
+                        Some(&uses),
+                        true,
+                        now,
+                        &names,
+                        dict_limit,
+                    )
+                {
+                    rows
+                } else if let Some(idxs) = self.store.index_seek(name, &uses, now) {
+                    if name == "docs" && covered {
+                        if let Some(rows) = self.store.project_docs_hot(&idxs, &names) {
+                            rows
+                        } else {
+                            self.fetch_idxs_filtered(name, &idxs, pred, now, Some(fields), covered)
+                        }
                     } else {
                         self.fetch_idxs_filtered(name, &idxs, pred, now, Some(fields), covered)
                     }
+                } else if let Some(idxs) = self.mirror_select(name, pred, now) {
+                    let start = skip_n.min(idxs.len());
+                    let take_n = match explicit_take {
+                        Some(Some(n)) => Some(n.max(0) as usize),
+                        Some(None) => None,
+                        None => Some(50),
+                    };
+                    let end = match take_n {
+                        Some(t) => start.saturating_add(t).min(idxs.len()),
+                        None => idxs.len(),
+                    };
+                    return Some(self.fetch_idxs_filtered(
+                        name,
+                        &idxs[start..end],
+                        pred,
+                        now,
+                        Some(fields),
+                        true,
+                    ));
                 } else {
-                    self.fetch_idxs_filtered(name, &idxs, pred, now, Some(fields), covered)
+                    self.filter_scan(name, pred, now, Some(fields))
                 }
             } else if let Some(idxs) = self.mirror_select(name, pred, now) {
                 let start = skip_n.min(idxs.len());
@@ -5283,6 +5322,494 @@ fn partition_into(
             }
         }
         Ok(out)
+    }
+
+    /// Vectorized `RecordBatch` pipeline over post-scan / post-join `Filter` (conjunctions of
+    /// scalar `Pred::Cmp`), `Project`, `Without`, `Sort`, `Skip`, and `Take` using
+    /// [`RecordBatch::eval_cmp_indices`], [`RecordBatch::filter_indices`],
+    /// [`RecordBatch::into_filtered_indices`], [`RecordBatch::project_cols`],
+    /// [`RecordBatch::into_projected_cols`], [`RecordBatch::without_cols`], and
+    /// [`RecordBatch::sort_by_col`] without materializing `Vec<Row>`.
+    pub(super) fn try_vectorized_pipeline_batch(
+        &self,
+        q: &Query,
+        bindings: &BTreeMap<String, Vec<Row>>,
+        now: i64,
+    ) -> Option<RecordBatch> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return None;
+        }
+        let Source::Collection(left_name) = &q.source else {
+            return None;
+        };
+        if left_name == "catalog" || bindings.contains_key(left_name) {
+            return None;
+        }
+        if self.store.get_col_count(left_name) > self.quotas.max_execution_work {
+            return None;
+        }
+
+        #[inline]
+        fn parse_field_str(s: &str) -> Field {
+            Field {
+                parts: s.split('.').map(str::to_string).collect(),
+            }
+        }
+
+        fn collect_conjunctive_cmp_fields(pred: &Pred, out: &mut Vec<String>) -> bool {
+            match pred {
+                Pred::And(a, b) => {
+                    collect_conjunctive_cmp_fields(a, out) && collect_conjunctive_cmp_fields(b, out)
+                }
+                Pred::Cmp { field, value, .. } => {
+                    if matches!(value, Value::Param(_)) {
+                        return false;
+                    }
+                    let name = field.as_str();
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn eval_conjunctive_cmp(
+            batch: &RecordBatch,
+            pred: &Pred,
+            now: i64,
+            scratch: &mut Vec<u32>,
+            acc: &mut Option<Vec<u32>>,
+        ) -> bool {
+            match pred {
+                Pred::And(a, b) => {
+                    if !eval_conjunctive_cmp(batch, a, now, scratch, acc) {
+                        return false;
+                    }
+                    eval_conjunctive_cmp(batch, b, now, scratch, acc)
+                }
+                Pred::Cmp { field, op, value } => {
+                    let lit = super::eval::value_cell(value, now);
+                    if matches!(lit, Cell::Null | Cell::Vec(_)) {
+                        return false;
+                    }
+                    let fname = field.as_str();
+                    scratch.clear();
+                    if let Some(col_idx) = batch.names.iter().position(|n| n == &fname) {
+                        if !batch.eval_cmp_indices(col_idx, *op, &lit, scratch) {
+                            return false;
+                        }
+                    } else if matches!(op, CmpOp::Ne) {
+                        let n = batch.n();
+                        if n > u32::MAX as usize {
+                            return false;
+                        }
+                        scratch.extend(0..n as u32);
+                    }
+                    match acc {
+                        None => {
+                            *acc = Some(std::mem::take(scratch));
+                        }
+                        Some(cur) => {
+                            if cur.is_empty() {
+                                return true;
+                            }
+                            if scratch.is_empty() {
+                                cur.clear();
+                                return true;
+                            }
+                            let mut w = 0usize;
+                            let mut j = 0usize;
+                            for r in 0..cur.len() {
+                                let target = cur[r];
+                                while j < scratch.len() && scratch[j] < target {
+                                    j += 1;
+                                }
+                                if j < scratch.len() && scratch[j] == target {
+                                    cur[w] = target;
+                                    w += 1;
+                                    j += 1;
+                                }
+                            }
+                            cur.truncate(w);
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        let mut join_idx: Option<usize> = None;
+        for (i, step) in q.steps.iter().enumerate() {
+            match step {
+                Step::Join { .. } => {
+                    if join_idx.is_some() {
+                        return None;
+                    }
+                    if i > 1 || (i == 1 && !matches!(q.steps[0], Step::Filter(_))) {
+                        return None;
+                    }
+                    join_idx = Some(i);
+                }
+                Step::Filter(_)
+                | Step::Project(_)
+                | Step::Without(_)
+                | Step::Sort { .. }
+                | Step::Skip { .. }
+                | Step::Take { .. } => {}
+                _ => return None,
+            }
+        }
+
+        let post_start: usize;
+        let base_steps_prefix: Vec<Step>;
+        let uniform_all_cols: Option<Vec<String>>;
+
+        if let Some(j_pos) = join_idx {
+            let Step::Join {
+                collection: right_col,
+                ..
+            } = &q.steps[j_pos]
+            else {
+                unreachable!()
+            };
+            if bindings.contains_key(right_col) {
+                return None;
+            }
+            post_start = j_pos + 1;
+            let mut prefix = Vec::with_capacity(j_pos + 2);
+            for s in &q.steps[..=j_pos] {
+                prefix.push(s.clone());
+            }
+            base_steps_prefix = prefix;
+
+            let has_post_project = q.steps[post_start..]
+                .iter()
+                .any(|s| matches!(s, Step::Project(_)));
+            if has_post_project {
+                uniform_all_cols = None;
+            } else if !self.store.is_disk_backed(left_name) && !self.store.is_disk_backed(right_col)
+            {
+                let l_rows = self.store.collection(left_name);
+                let r_rows = self.store.collection(right_col);
+                if l_rows.is_empty() {
+                    return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
+                }
+                let ls = l_rows[0].shape_arc()?;
+                if !l_rows
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, ls)))
+                {
+                    return None;
+                }
+                let mut merged_names: Vec<String> = ls.names().to_vec();
+                if !r_rows.is_empty() {
+                    let rs = r_rows[0].shape_arc()?;
+                    if !r_rows
+                        .iter()
+                        .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, rs)))
+                    {
+                        return None;
+                    }
+                    if let Step::Join { left: true, .. } = &q.steps[j_pos] {
+                        return None;
+                    }
+                    for rn in rs.names() {
+                        merged_names.push(format!("{right_col}.{rn}"));
+                    }
+                    merged_names.sort_unstable();
+                    merged_names.dedup();
+                }
+                uniform_all_cols = Some(merged_names);
+            } else {
+                return None;
+            }
+        } else {
+            let has_pre_filter = matches!(q.steps.first(), Some(Step::Filter(_)));
+            post_start = usize::from(has_pre_filter);
+            let mut prefix = Vec::with_capacity(2);
+            if has_pre_filter {
+                prefix.push(q.steps[0].clone());
+            }
+            base_steps_prefix = prefix;
+
+            let has_post_project = q.steps[post_start..]
+                .iter()
+                .any(|s| matches!(s, Step::Project(_)));
+            if has_post_project {
+                uniform_all_cols = None;
+            } else if self.store.is_disk_backed(left_name) {
+                let eng = self.store.disk_engine_read()?;
+                let mut cols = eng.uniform_non_null_columns(left_name)?;
+                cols.sort_unstable();
+                cols.dedup();
+                uniform_all_cols = Some(cols);
+            } else {
+                let l_rows = self.store.collection(left_name);
+                if l_rows.is_empty() {
+                    return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
+                }
+                let ls = l_rows[0].shape_arc()?;
+                if !l_rows
+                    .iter()
+                    .all(|r| r.shape_arc().is_some_and(|s| Arc::ptr_eq(s, ls)))
+                {
+                    return None;
+                }
+                uniform_all_cols = Some(ls.names().to_vec());
+            }
+        }
+
+        let mut needed: Vec<String> = match uniform_all_cols {
+            Some(cols) => cols,
+            None => {
+                let mut cols: Vec<String> = Vec::new();
+                let mut saw_first_proj = false;
+                for step in &q.steps[post_start..] {
+                    match step {
+                        Step::Filter(p) => {
+                            if !collect_conjunctive_cmp_fields(p, &mut cols) {
+                                return None;
+                            }
+                        }
+                        Step::Sort { field, .. } => {
+                            let nm = field.as_str();
+                            if !saw_first_proj && !cols.contains(&nm) {
+                                cols.push(nm);
+                            }
+                        }
+                        Step::Project(fs) => {
+                            if !saw_first_proj {
+                                for f in fs {
+                                    let nm = f.as_str();
+                                    if !cols.contains(&nm) {
+                                        cols.push(nm);
+                                    }
+                                }
+                                saw_first_proj = true;
+                            }
+                        }
+                        Step::Without(fs) => {
+                            if !saw_first_proj {
+                                for f in fs {
+                                    if f.leaf().is_none() && !f.as_str().contains('.') {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                        Step::Skip { .. } | Step::Take { .. } => {}
+                        _ => return None,
+                    }
+                }
+                cols
+            }
+        };
+        if needed.is_empty() {
+            return None;
+        }
+
+        let needed_fields: Vec<Field> = needed.drain(..).map(|s| parse_field_str(&s)).collect();
+        let mut base_steps = base_steps_prefix;
+        base_steps.push(Step::Project(needed_fields));
+        base_steps.push(Step::Take { n: None });
+        let base_q = Query {
+            source: q.source.clone(),
+            steps: base_steps,
+            explain: None,
+            ignore_filter: q.ignore_filter,
+        };
+
+        let mut batch = if join_idx.is_some() {
+            self.try_join_project_batch(&base_q, bindings, now)?
+        } else {
+            self.try_filter_project_batch(&base_q, bindings, now)?
+        };
+
+        let mut active_projection = false;
+        let mut implicit_take = true;
+        let mut cmp_scratch: Vec<u32> = Vec::new();
+        let post_steps = &q.steps[post_start..];
+        let mut idx = 0usize;
+
+        while idx < post_steps.len() {
+            match &post_steps[idx] {
+                Step::Filter(pred) => {
+                    if !batch.is_empty() {
+                        let mut keep: Option<Vec<u32>> = None;
+                        if !eval_conjunctive_cmp(&batch, pred, now, &mut cmp_scratch, &mut keep) {
+                            return None;
+                        }
+                        if let Some(indices) = keep
+                            && indices.len() < batch.n()
+                        {
+                            batch = if indices.is_empty() {
+                                batch.filter_indices(&[])
+                            } else {
+                                batch.into_filtered_indices(&indices)
+                            };
+                        }
+                    }
+                    idx += 1;
+                }
+                Step::Project(fields) => {
+                    let out_names = field_names(fields);
+                    let row_n = batch.n();
+                    if out_names
+                        .iter()
+                        .all(|nm| batch.names.iter().any(|bn| bn == nm))
+                    {
+                        let col_idxs: Vec<usize> = out_names
+                            .iter()
+                            .map(|nm| batch.names.iter().position(|bn| bn == nm).unwrap())
+                            .collect();
+                        batch = if row_n == 0 {
+                            batch.project_cols(&col_idxs, out_names.into())
+                        } else {
+                            batch.into_projected_cols(&col_idxs, out_names.into())
+                        };
+                    } else {
+                        let mut rem: smallvec::SmallVec<[usize; 16]> =
+                            smallvec::SmallVec::from_elem(0, batch.cols.len());
+                        let mut mapping: smallvec::SmallVec<[Option<usize>; 16]> =
+                            smallvec::SmallVec::with_capacity(out_names.len());
+                        for nm in &out_names {
+                            let pos = batch.names.iter().position(|bn| bn == nm);
+                            if let Some(p) = pos {
+                                rem[p] += 1;
+                            }
+                            mapping.push(pos);
+                        }
+                        let mut cols = Vec::with_capacity(out_names.len());
+                        for pos_opt in mapping {
+                            match pos_opt {
+                                Some(p) => {
+                                    rem[p] -= 1;
+                                    if rem[p] == 0 {
+                                        cols.push(std::mem::take(&mut batch.cols[p]));
+                                    } else {
+                                        cols.push(batch.cols[p].clone());
+                                    }
+                                }
+                                None => cols.push(Column::Nulls {
+                                    n: row_n,
+                                    cap: 0,
+                                }),
+                            }
+                        }
+                        batch = RecordBatch {
+                            names: out_names.into(),
+                            cols,
+                        };
+                    }
+                    active_projection = true;
+                    idx += 1;
+                }
+                Step::Without(fields) => {
+                    let drop_owned = field_names(fields);
+                    let drop_refs: smallvec::SmallVec<[&str; 8]> =
+                        drop_owned.iter().map(String::as_str).collect();
+                    batch = batch.without_cols(&drop_refs);
+                    active_projection = false;
+                    idx += 1;
+                }
+                Step::Sort { field, desc } => {
+                    let key_name = field.as_str();
+                    let mut tail_only = true;
+                    let mut look_skip = 0usize;
+                    let mut look_take: Option<Option<i64>> = None;
+                    for s in &post_steps[idx + 1..] {
+                        match s {
+                            Step::Skip { n } if look_take.is_none() => {
+                                look_skip = look_skip.saturating_add((*n).max(0) as usize);
+                            }
+                            Step::Take { n } if look_take.is_none() => {
+                                look_take = Some(*n);
+                            }
+                            _ => {
+                                tail_only = false;
+                                break;
+                            }
+                        }
+                    }
+                    if tail_only {
+                        let eff_take: Option<usize> = match look_take {
+                            Some(Some(t)) => {
+                                implicit_take = false;
+                                Some(t.max(0) as usize)
+                            }
+                            Some(None) => {
+                                implicit_take = false;
+                                None
+                            }
+                            None => implicit_take.then_some(50),
+                        };
+                        if eff_take.is_some() {
+                            implicit_take = false;
+                        }
+                        if let Some(col_idx) = batch.names.iter().position(|n| n == &key_name) {
+                            batch = batch.sort_by_col(col_idx, *desc, look_skip, eff_take);
+                        } else {
+                            finish_batch(
+                                &mut batch,
+                                look_skip,
+                                Some(eff_take.map(|t| t as i64)),
+                            );
+                        }
+                        break;
+                    }
+                    if let Some(col_idx) = batch.names.iter().position(|n| n == &key_name) {
+                        batch = batch.sort_by_col(col_idx, *desc, 0, None);
+                    }
+                    idx += 1;
+                }
+                Step::Skip { n } => {
+                    let s = (*n).max(0) as usize;
+                    if s >= batch.n() {
+                        batch.truncate(0);
+                    } else if s > 0 {
+                        batch.drain_prefix(s);
+                    }
+                    idx += 1;
+                }
+                Step::Take { n } => {
+                    implicit_take = false;
+                    if let Some(t) = n {
+                        batch.truncate((*t).max(0) as usize);
+                    }
+                    idx += 1;
+                }
+                _ => return None,
+            }
+        }
+
+        if implicit_take && batch.n() > 50 {
+            batch.truncate(50);
+        }
+
+        if !active_projection {
+            if batch.is_empty() {
+                return Some(RecordBatch::empty(Arc::<[String]>::from(Vec::<String>::new())));
+            }
+            let is_sorted_unique = batch
+                .names
+                .windows(2)
+                .all(|w| w[0].as_str() < w[1].as_str());
+            if !is_sorted_unique {
+                let mut map: BTreeMap<String, usize> = BTreeMap::new();
+                for (i, nm) in batch.names.iter().enumerate() {
+                    map.insert(nm.clone(), i);
+                }
+                let sorted_names: Vec<String> = map.keys().cloned().collect();
+                let idxs: Vec<usize> = map.into_values().collect();
+                batch = batch.into_projected_cols(&idxs, sorted_names.into());
+            }
+        }
+
+        Some(batch)
     }
 }
 

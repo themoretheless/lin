@@ -2052,21 +2052,135 @@ impl Db {
             }
         }
 
-        // 2b. Declared ColMirror dictionary-code histogram counting for general collections
-        if let AggKind::Count { by: Some(by_field) } = &plan.kind
-            && let Some(by_leaf) = by_field.leaf()
-            && let Some(mirror) = self.get_or_build_mirror(&plan.collection)
-            && let Some(map) = mirror.group_count(by_leaf, plan.filter.as_ref(), now)
-        {
-            let state_bytes: usize = map
-                .keys()
-                .map(|c| match c {
-                    Cell::Text(s) => s.len() + 32 + 64,
-                    _ => 16 + 64,
-                })
-                .sum();
-            if state_bytes <= self.quotas.max_aggregate_bytes {
-                return Ok(count_cell_map_to_rows(&by_field.as_str(), map));
+        // 2b. ColMirror (declared or schema-driven SoA) fast paths for general collections
+        if let Some(mirror) = self.get_or_build_mirror(&plan.collection) {
+            match &plan.kind {
+                AggKind::Count { by: None } => {
+                    if let Some(ref p) = plan.filter {
+                        if let Some(n) = mirror.count(p, now) {
+                            return Ok(vec![hits_row(n as i64)]);
+                        }
+                    } else {
+                        return Ok(vec![hits_row(mirror.len as i64)]);
+                    }
+                }
+                AggKind::Count { by: Some(by_field) } => {
+                    if let Some(by_leaf) = by_field.leaf()
+                        && let Some(map) = mirror.group_count(by_leaf, plan.filter.as_ref(), now)
+                    {
+                        let state_bytes: usize = map
+                            .keys()
+                            .map(|c| match c {
+                                Cell::Text(s) => s.len() + 32 + 64,
+                                _ => 16 + 64,
+                            })
+                            .sum();
+                        if state_bytes <= self.quotas.max_aggregate_bytes {
+                            return Ok(count_cell_map_to_rows(&by_field.as_str(), map));
+                        }
+                    }
+                }
+                AggKind::Sum { field, by: None } | AggKind::Avg { field, by: None } => {
+                    if let Some(val_leaf) = field.leaf() {
+                        let idxs_opt = match &plan.filter {
+                            Some(p) => mirror.select(p, now),
+                            None => None,
+                        };
+                        if (plan.filter.is_none() || idxs_opt.is_some())
+                            && let Some(batch) = mirror.project_batch(
+                                std::slice::from_ref(&val_leaf.to_string()),
+                                idxs_opt.as_deref(),
+                            )
+                            && let Some(vcol) = batch.cols.first()
+                        {
+                            let fk = field.as_str();
+                            if matches!(plan.kind, AggKind::Sum { .. }) {
+                                if let Some(s) = vcol.sum_f64() {
+                                    return Ok(vec![single_cell_row(&fk, Cell::Float(s))]);
+                                }
+                            } else {
+                                let mut sum = crate::exact_sum::ExactSum::default();
+                                let mut cnt = 0usize;
+                                match vcol {
+                                    crate::batch::Column::Int { vals, valid } => {
+                                        if valid.null_count() == 0 {
+                                            for &v in vals {
+                                                sum.add_i64(v);
+                                            }
+                                            cnt = vals.len();
+                                        } else {
+                                            for (i, &v) in vals.iter().enumerate() {
+                                                if valid.is_valid(i) {
+                                                    sum.add_i64(v);
+                                                    cnt += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    crate::batch::Column::Float { vals, valid } => {
+                                        if valid.null_count() == 0 {
+                                            for &v in vals {
+                                                if !v.is_nan() {
+                                                    sum.add_f64(v);
+                                                    cnt += 1;
+                                                }
+                                            }
+                                        } else {
+                                            for (i, &v) in vals.iter().enumerate() {
+                                                if valid.is_valid(i) && !v.is_nan() {
+                                                    sum.add_f64(v);
+                                                    cnt += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        for i in 0..vcol.len() {
+                                            let c = vcol.get(i);
+                                            if sum.add_numeric(Some(&c)) {
+                                                cnt += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                let avg = if cnt == 0 {
+                                    0.0
+                                } else {
+                                    sum.value() / (cnt as f64)
+                                };
+                                return Ok(vec![single_cell_row(&fk, Cell::Float(avg))]);
+                            }
+                        }
+                    }
+                }
+                AggKind::Sum {
+                    field,
+                    by: Some(by_field),
+                } => {
+                    if let (Some(by_leaf), Some(val_leaf)) = (by_field.leaf(), field.leaf())
+                        && by_leaf != val_leaf
+                        && let Some(mut entries) =
+                            mirror.group_sum(by_leaf, val_leaf, plan.filter.as_ref(), now)
+                    {
+                        let state_bytes: usize = entries
+                            .iter()
+                            .map(|(kcell, _)| match kcell {
+                                Cell::Text(s) => s.len() + 32 + 64,
+                                _ => 16 + 64,
+                            })
+                            .sum();
+                        if state_bytes <= self.quotas.max_aggregate_bytes {
+                            entries.sort_unstable_by(|(a, _), (b, _)| cmp_sort(a, b));
+                            return Ok(pair_entries_to_rows(
+                                &by_field.as_str(),
+                                &field.as_str(),
+                                entries,
+                                Cell::Float,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

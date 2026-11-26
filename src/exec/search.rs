@@ -392,7 +392,7 @@ impl Db {
             SearchMode::Vec => {
                 let all = self.store.collection(collection);
                 Ok(self
-                    .vector_search_indices(all, query, rank_limit)?
+                    .vector_search_indices_with_hint(Some(collection), all, query, rank_limit)?
                     .into_iter()
                     .map(|(_, i)| i)
                     .collect())
@@ -410,7 +410,12 @@ impl Db {
                     rank_limit.map(|k| k.saturating_mul(8).max(128))
                 };
                 let lex = self.search_fts_lex_indices(collection, query, leg_limit)?;
-                let vec = self.vector_search_indices(all, query, leg_limit)?;
+                let vec = self.vector_search_indices_with_hint(
+                    Some(collection),
+                    all,
+                    query,
+                    leg_limit,
+                )?;
                 #[cfg(feature = "gpu")]
                 if let Some(gpu) = &self.gpu {
                     let lex_keys: Vec<usize> = lex.iter().map(|&(_, i)| i).collect();
@@ -466,8 +471,19 @@ impl Db {
             .store
             .fts_get(collection)
             .expect("checked FTS collection");
-        let mut idxs = fts.candidate_idxs(query);
         let col = self.store.collection(collection);
+        #[cfg(feature = "gpu")]
+        let gpu_on = self.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let gpu_on = false;
+        if !gpu_on
+            && !(collection == "docs" && !self.store.fts_deferred_doc_swaps.is_empty())
+            && let Some(k) = rank_limit
+            && let Some(idxs) = fts.single_alnum_term_first_k(query, k, col.len())
+        {
+            return Ok(idxs.into_iter().map(|i| (6i64, i)).collect());
+        }
+        let mut idxs = fts.candidate_idxs(query);
         if collection == "docs" && !self.store.fts_deferred_doc_swaps.is_empty() {
             for &(p, _, _) in &self.store.fts_deferred_doc_swaps {
                 if p < col.len() && !idxs.contains(&p) {
@@ -542,6 +558,16 @@ impl Db {
         query: &str,
         rank_limit: Option<usize>,
     ) -> Result<Vec<(f64, usize)>, Error> {
+        self.vector_search_indices_with_hint(None, rows, query, rank_limit)
+    }
+
+    pub(crate) fn vector_search_indices_with_hint(
+        &self,
+        collection_hint: Option<&str>,
+        rows: &[Row],
+        query: &str,
+        rank_limit: Option<usize>,
+    ) -> Result<Vec<(f64, usize)>, Error> {
         let Some(emb) = self.embedder.as_ref() else {
             return Ok(Vec::new());
         };
@@ -569,6 +595,47 @@ impl Db {
         let has_gpu = self.gpu.is_some();
         #[cfg(not(feature = "gpu"))]
         let has_gpu = false;
+
+        if !has_gpu
+            && let Some(col_name) = collection_hint
+            && rows.len() >= 256
+            && let Some(k) = rank_limit
+        {
+            if k == 0 || qv.is_empty() {
+                return Ok(Vec::new());
+            }
+            let emb_slot = crate::store::row::OwnedFieldSlot::new("embedding");
+            let cache_key = (
+                rows.len(),
+                self.store.docs_epoch,
+                self.store.collections.epoch(),
+            );
+            let cached_mat = self.vec_matrices.read().ok().and_then(|guard| {
+                let (len, d_ep, c_ep, mat) = guard.get(col_name)?;
+                ((*len, *d_ep, *c_ep) == cache_key && mat.dim() == qv.len())
+                    .then(|| Arc::clone(mat))
+            });
+            let mat = match cached_mat {
+                Some(m) => m,
+                None => {
+                    let built = Arc::new(embed::FlatVecMatrix::build(
+                        rows.len(),
+                        qv.len(),
+                        |i| emb_slot.get_sync(&rows[i]).and_then(Cell::as_vec),
+                    ));
+                    if let Ok(mut guard) = self.vec_matrices.write() {
+                        guard.insert(
+                            col_name.to_string(),
+                            (cache_key.0, cache_key.1, cache_key.2, Arc::clone(&built)),
+                        );
+                    }
+                    built
+                }
+            };
+            return Ok(mat.search_top_k(&qv, k, |i| {
+                emb_slot.get_sync(&rows[i]).and_then(Cell::as_vec)
+            }));
+        }
 
         // Streaming top-k heap path on CPU for bounded `rank_limit` without allocating
         // full-table `vectors` and `scored` buffers.

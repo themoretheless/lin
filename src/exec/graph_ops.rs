@@ -169,6 +169,32 @@ impl Db {
             return Ok(Vec::new());
         }
 
+        let mut seeds: SmallVec<[&str; 8]> = SmallVec::new();
+        let mut id_slot = FieldSlot::new("id");
+        let mut uri_slot = FieldSlot::new("uri");
+        for r in rows {
+            if let Some(id) = id_slot.get(r).and_then(Cell::text) {
+                seeds.push(id);
+            }
+            if let Some(uri) = uri_slot.get(r).and_then(Cell::text) {
+                seeds.push(uri);
+            }
+        }
+        self.hop_seeds(primary, &seeds, edge_rel, reverse, depth)
+    }
+
+    pub(crate) fn hop_seeds(
+        &self,
+        primary: &str,
+        seeds: &[&str],
+        edge_rel: &str,
+        reverse: bool,
+        depth: i64,
+    ) -> Result<Vec<Row>, Error> {
+        if seeds.is_empty() || self.store.edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let synced = edges_index_synced(&self.store);
         let by_node: Option<&FxHashMap<Arc<str>, Vec<Arc<str>>>> = if synced {
             let map = if reverse {
@@ -188,18 +214,9 @@ impl Db {
         let mut frontier: SmallVec<[&str; 8]> = SmallVec::new();
         let mut next: SmallVec<[&str; 8]> = SmallVec::new();
         let mut seen = VisitedNodes::new();
-        let mut id_slot = FieldSlot::new("id");
-        let mut uri_slot = FieldSlot::new("uri");
-        for r in rows {
-            if let Some(id) = id_slot.get(r).and_then(Cell::text)
-                && seen.insert(id)
-            {
-                frontier.push(id);
-            }
-            if let Some(uri) = uri_slot.get(r).and_then(Cell::text)
-                && seen.insert(uri)
-            {
-                frontier.push(uri);
+        for &s in seeds {
+            if seen.insert(s) {
+                frontier.push(s);
             }
         }
         if frontier.is_empty() {
@@ -345,6 +362,33 @@ impl Db {
             return Ok(Vec::new());
         }
 
+        let mut seeds: SmallVec<[&str; 8]> = SmallVec::new();
+        let mut id_slot = FieldSlot::new("id");
+        let mut uri_slot = FieldSlot::new("uri");
+        for r in rows {
+            if let Some(id) = id_slot.get(r).and_then(Cell::text) {
+                seeds.push(id);
+            }
+            if let Some(uri) = uri_slot.get(r).and_then(Cell::text) {
+                seeds.push(uri);
+            }
+        }
+        let rel_cell = Cell::from_text(edge_rel);
+        self.graph_edges_seeds(&seeds, edge_rel, &rel_cell, reverse, depth)
+    }
+
+    pub(crate) fn graph_edges_seeds(
+        &self,
+        seeds: &[&str],
+        edge_rel: &str,
+        rel_cell: &Cell,
+        reverse: bool,
+        depth: i64,
+    ) -> Result<Vec<Row>, Error> {
+        if seeds.is_empty() || self.store.edges.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let synced = edges_index_synced(&self.store);
         let by_node: Option<&FxHashMap<Arc<str>, Vec<Arc<str>>>> = if synced {
             let map = if reverse {
@@ -364,18 +408,9 @@ impl Db {
         let mut frontier: SmallVec<[&str; 8]> = SmallVec::new();
         let mut next: SmallVec<[&str; 8]> = SmallVec::new();
         let mut seen_nodes = VisitedNodes::new();
-        let mut id_slot = FieldSlot::new("id");
-        let mut uri_slot = FieldSlot::new("uri");
-        for r in rows {
-            if let Some(id) = id_slot.get(r).and_then(Cell::text)
-                && seen_nodes.insert(id)
-            {
-                frontier.push(id);
-            }
-            if let Some(uri) = uri_slot.get(r).and_then(Cell::text)
-                && seen_nodes.insert(uri)
-            {
-                frontier.push(uri);
+        for &s in seeds {
+            if seen_nodes.insert(s) {
+                frontier.push(s);
             }
         }
         if frontier.is_empty() {
@@ -386,29 +421,29 @@ impl Db {
         let mut out = Vec::new();
         let depth = depth.clamp(1, 3);
         let shape = edge_shape();
-        let rel_cell = Cell::from_text(edge_rel);
 
         for _ in 0..depth {
             next.clear();
             if let Some(by_node) = by_node {
-                let mut active_src: Option<(&str, &[Arc<str>])> = None;
+                let mut active_src: Option<(&Arc<str>, &[Arc<str>])> = None;
                 let mut multi_active = false;
                 for &src in &frontier {
-                    if let Some(list) = by_node.get(src)
+                    if let Some((src_arc, list)) = by_node.get_key_value(src)
                         && !list.is_empty()
                     {
                         if active_src.is_some() {
                             multi_active = true;
                             break;
                         }
-                        active_src = Some((src, list.as_slice()));
+                        active_src = Some((src_arc, list.as_slice()));
                     }
                 }
                 if !multi_active {
-                    let Some((src, list)) = active_src else {
+                    let Some((src_arc, list)) = active_src else {
                         break;
                     };
-                    let src_cell = Cell::from_text(src);
+                    let src = src_arc.as_ref();
+                    let src_cell = Cell::from_arc_str(src_arc);
                     for dst_arc in list {
                         let dst = dst_arc.as_ref();
                         let edge_pair = if reverse { (dst, src) } else { (src, dst) };
