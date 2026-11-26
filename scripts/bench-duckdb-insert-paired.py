@@ -45,10 +45,10 @@ def measure_lin(worker, rows, allocator="lin"):
     env.pop("LIN_BENCH_FTS_SMALLER_HEAD", None)
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
-    if allocator in ("jemalloc", "tuned_jemalloc"):
+    if allocator == "jemalloc":
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_JEMALLOC"]
-    if allocator == "tuned_jemalloc":
-        env["MALLOC_CONF"] = f"abort_conf:true,narenas:{len(os.sched_getaffinity(0))}"
+    if allocator == "tcmalloc":
+        env["LD_PRELOAD"] = os.environ["LIN_BENCH_TCMALLOC"]
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
@@ -57,11 +57,11 @@ def measure_lin(worker, rows, allocator="lin"):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "jemalloc", "tuned_jemalloc", "duckdb")
+    roles = ("lin", "control", "jemalloc", "tcmalloc", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
-        tuned_narenas=len(os.sched_getaffinity(0)), samples=[],
+        samples=[],
     )
     rng = random.Random(2929273)
     for n in (10_000, 100_000):
@@ -93,13 +93,13 @@ def main(worker, output):
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
         jemalloc_gain = median(1 - x["jemalloc"] / x["lin"] for x in pairs)
-        tuned_jemalloc_gain = median(1 - x["tuned_jemalloc"] / x["jemalloc"] for x in pairs)
-        tuned_jemalloc_wins = sum(x["tuned_jemalloc"] < x["duckdb"] for x in pairs)
+        tcmalloc_gain = median(1 - x["tcmalloc"] / x["jemalloc"] for x in pairs)
+        tcmalloc_wins = sum(x["tcmalloc"] < x["duckdb"] for x in pairs)
         jemalloc_wins = sum(x["jemalloc"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
               f"A/A {noise:.2%}, jemalloc gain {jemalloc_gain:.2%}, "
-              f"jemalloc wins {jemalloc_wins}/{len(pairs)}, tuned_jemalloc gain vs jemalloc "
-              f"{tuned_jemalloc_gain:.2%}, tuned_jemalloc wins {tuned_jemalloc_wins}/{len(pairs)}", flush=True)
+              f"jemalloc wins {jemalloc_wins}/{len(pairs)}, tcmalloc gain vs jemalloc "
+              f"{tcmalloc_gain:.2%}, tcmalloc wins {tcmalloc_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":

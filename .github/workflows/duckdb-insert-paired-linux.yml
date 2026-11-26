@@ -39,16 +39,19 @@ jobs:
         run: |
           cargo build --locked --release -p lin-peer-worker
           python3 -m pip install -r scripts/bench-peers-requirements.lock
-      - name: Locate jemalloc for the comparison
+      - name: Locate Linux allocators for the comparison
         if: steps.cpu.outputs.matched == 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libjemalloc2
+          sudo apt-get install -y libjemalloc2 libtcmalloc-minimal4
           library=$(ldconfig -p | awk '/libjemalloc\.so\.2 / { print $NF }' | head -1)
           test -f "$library"
           echo "LIN_BENCH_JEMALLOC=$library" >> "$GITHUB_ENV"
-          dpkg-query -W libjemalloc2 > jemalloc-provenance.txt
-          sha256sum "$library" >> jemalloc-provenance.txt
+          tcmalloc=$(ldconfig -p | awk '/libtcmalloc_minimal\.so\.4 / { print $NF }' | head -1)
+          test -f "$tcmalloc"
+          echo "LIN_BENCH_TCMALLOC=$tcmalloc" >> "$GITHUB_ENV"
+          dpkg-query -W libjemalloc2 libtcmalloc-minimal4 > allocator-provenance.txt
+          sha256sum "$library" "$tcmalloc" >> allocator-provenance.txt
       - name: Measure prepared INSERT and validate readback
         if: steps.cpu.outputs.matched == 'true'
         run: |
@@ -66,7 +69,7 @@ jobs:
           name: paired-duckdb-insert-${{ matrix.replica }}
           path: |
             runner-cpu.txt
-            jemalloc-provenance.txt
+            allocator-provenance.txt
             duckdb-results.json
             duckdb-summary.txt
             duckdb-phases.json
