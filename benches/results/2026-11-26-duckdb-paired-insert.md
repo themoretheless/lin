@@ -166,3 +166,7 @@ The Lin fixture in `tools/peer-worker/src/main.rs` supplies seven fields (id, ur
 Candidate `7bbab9732` won 20 of 32 first-100k pairs against the previous worker. Median paired changes were −0.55 and −3.38 ms on two EPYC 7763 hosts, −0.52 ms on EPYC 9V74 and −1.06 ms on ARM N2. Repeat 100k slowed by 1.04 ms on the first 7763. With default settings, DuckDB won all 75 first-100k EPYC pairs. Lin won all 400 comparisons with THP enabled for both engines. The candidate was withdrawn and the wide-row WAL regression test retained.
 
 [Raw paired measurements](https://github.com/themoretheless/lin/actions/runs/45806695900)
+
+## Scope of a huge-page hint on the output vector
+
+A local arm64 macOS layout probe on the restored constructor measured 112 bytes per Row and 24 per Cell. The public worker splits 100k records into ten 10k statements, so each row-builder output vector requests 1,120,000 bytes at this layout. Such a vector cannot contain a complete 2 MiB page. Its storage also excludes separately allocated row cells and vectors. Across 100k records the ten output requests total 11.2 MB, while the EPYC 7763 heap profile above attributed 308.8 MB to embedding construction. These figures concern requested storage rather than elapsed time. No engine change or Linux speedup is claimed from the layout probe.
