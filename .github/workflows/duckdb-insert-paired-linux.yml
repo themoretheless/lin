@@ -1,7 +1,7 @@
 name: Qualify linked Linux allocator against DuckDB and SQLite
 on:
   push:
-    branches: [codex/linux-linked-tcmalloc]
+    branches: [codex/linked-allocator-7763]
 permissions:
   contents: read
 jobs:
@@ -15,7 +15,10 @@ jobs:
           - {runner: ubuntu-22.04, replica: amd-2}
           - {runner: ubuntu-22.04, replica: amd-3}
           - {runner: ubuntu-22.04, replica: amd-4}
-          - {runner: ubuntu-24.04-arm, replica: arm64}
+          - {runner: ubuntu-22.04, replica: amd-5}
+          - {runner: ubuntu-22.04, replica: amd-6}
+          - {runner: ubuntu-22.04, replica: amd-7}
+          - {runner: ubuntu-22.04, replica: amd-8}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +28,7 @@ jobs:
         id: cpu
         run: |
           lscpu > runner-cpu.txt
-          if [[ "$(uname -m)" = aarch64 ]] || grep -Eq 'AMD EPYC (7763|9V74|9V45)' runner-cpu.txt; then
+          if grep -q 'AMD EPYC 7763' runner-cpu.txt; then
             echo 'matched=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@master
