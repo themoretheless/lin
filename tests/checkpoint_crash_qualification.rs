@@ -220,3 +220,116 @@ fn repeated_checkpoints_are_idempotent() {
         db.close().unwrap();
     }
 }
+
+#[test]
+fn seeded_recovery_and_replica_replay_match_model() {
+    use std::collections::BTreeMap;
+
+    for seed in [1_u64, 7, 42, 0xfeed] {
+        let mut dir = tmp();
+        let mut primary = Db::open(&dir).unwrap();
+        let mut replica = Db::fixture();
+        let mut model = BTreeMap::new();
+        let mut random = seed;
+        primary.run("col sim { id: text, n: i64 }").unwrap();
+        for step in 0..96 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let id = format!("k{}", (random >> 8) % 12);
+            match random % 8 {
+                0 => {
+                    ship(&primary, &mut replica);
+                    primary.checkpoint().unwrap();
+                }
+                1 => {
+                    let image = tmp();
+                    for (name, bytes) in files(&dir) {
+                        fs::write(image.join(name), bytes).unwrap();
+                    }
+                    let frames = primary.export_wal_since(replica.r#gen()).unwrap();
+                    if frames.len() > 3 && random & 0x10 != 0 {
+                        use std::io::Write;
+                        fs::OpenOptions::new()
+                            .append(true)
+                            .open(image.join(lin::persist::LOG_NAME))
+                            .unwrap()
+                            .write_all(&frames[..3])
+                            .unwrap();
+                    }
+                    let mut recovered = Db::open(&image).unwrap();
+                    assert_eq!(
+                        recovered.r#gen(),
+                        primary.r#gen(),
+                        "seed={seed}, step={step}"
+                    );
+                    assert_eq!(
+                        read_model(&mut recovered),
+                        model,
+                        "seed={seed}, step={step}"
+                    );
+                    ship(&recovered, &mut replica);
+                    primary.close().unwrap();
+                    fs::remove_dir_all(dir).unwrap();
+                    primary = recovered;
+                    dir = image;
+                }
+                2 => {
+                    if model.remove(&id).is_some() {
+                        primary
+                            .run(&format!(r#"delete sim[id == "{id}"] cas each"#))
+                            .unwrap();
+                    }
+                }
+                3 => ship(&primary, &mut replica),
+                _ => {
+                    if model.insert(id.clone(), step).is_some() {
+                        primary
+                            .run(&format!(
+                                r#"update sim[id == "{id}"] cas each {{ n: {step} }}"#
+                            ))
+                            .unwrap();
+                    } else {
+                        primary
+                            .run(&format!(r#"insert sim {{ id: "{id}", n: {step} }}"#))
+                            .unwrap();
+                    }
+                }
+            }
+            assert_eq!(read_model(&mut primary), model, "seed={seed}, step={step}");
+            if replica.r#gen() == primary.r#gen() {
+                assert_eq!(
+                    read_model(&mut replica),
+                    model,
+                    "replica seed={seed}, step={step}"
+                );
+            }
+        }
+        ship(&primary, &mut replica);
+        assert_eq!(read_model(&mut replica), model, "replica seed={seed}");
+        primary.close().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn ship(primary: &Db, replica: &mut Db) {
+        let frames = primary.export_wal_since(replica.r#gen()).unwrap();
+        replica.apply_wal(&frames).unwrap();
+        assert_eq!(replica.r#gen(), primary.r#gen());
+        assert_eq!(replica.apply_wal(&frames).unwrap(), 0);
+    }
+
+    fn read_model(db: &mut Db) -> BTreeMap<String, i64> {
+        db.run("sim | take all")
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| {
+                let id = row.get("id").unwrap().text().unwrap().to_owned();
+                let lin::Cell::Int(n) = row.get("n").unwrap() else {
+                    panic!("expected integer")
+                };
+                (id, *n)
+            })
+            .collect()
+    }
+}

@@ -748,6 +748,79 @@ impl Db {
         Ok(scored.into_iter().map(|(_, i)| i).collect())
     }
 
+    pub(super) fn search_filtered_vectors(
+        &self,
+        collection: &str,
+        rows: &[Row],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Row>, Error> {
+        if self.store.embed_id != self.catalog.embed_id {
+            return Err(Error::runtime(format!(
+                "embed_id mismatch: store={} catalog={}",
+                self.store.embed_id, self.catalog.embed_id
+            )));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let collection_len = self.store.get_col_count(collection);
+        // Exact scoring is cheaper for small or highly selective candidate sets.
+        if self.store.filtered_hnsw_enabled
+            && rows.len() >= 4096
+            && rows.len().saturating_mul(8) >= collection_len
+            && limit <= 512
+            && let Some(index) = self.store.hnsw.get(collection)
+            && !index.is_empty()
+            && let Some(embedder) = self.embedder.as_ref()
+        {
+            let mut positions = FxHashMap::with_capacity_and_hasher(rows.len(), Default::default());
+            for (input, row) in rows.iter().enumerate() {
+                let Some(pos) = row
+                    .get("id")
+                    .and_then(Cell::text)
+                    .and_then(|id| self.store.row_index(collection, id))
+                else {
+                    break;
+                };
+                positions.insert(pos, input);
+            }
+            if positions.len() == rows.len() {
+                let vector = embedder.embed(query);
+                self.check_embed_dim(embedder.as_ref(), &vector)?;
+                let max_candidates = collection_len.min(4096);
+                let mut candidates = limit.saturating_mul(2).max(64).min(max_candidates);
+                loop {
+                    // The traversal budget is separate from the returned candidate count.
+                    // A small top-k still needs a broad enough neighborhood on high-dimensional data.
+                    let ef = candidates.saturating_mul(4).max(512).min(max_candidates);
+                    let hits: Vec<_> = index
+                        .search(&vector, candidates, ef)
+                        .into_iter()
+                        .filter_map(|(score, pos)| {
+                            (score > 0.01)
+                                .then(|| positions.get(&pos).copied())
+                                .flatten()
+                        })
+                        .take(limit)
+                        .collect();
+                    if hits.len() == limit {
+                        return Ok(hits.into_iter().map(|i| rows[i].clone()).collect());
+                    }
+                    if candidates == max_candidates {
+                        break;
+                    }
+                    candidates = candidates.saturating_mul(2).min(max_candidates);
+                }
+            }
+        }
+        Ok(self
+            .vector_search_indices(rows, query, Some(limit))?
+            .into_iter()
+            .map(|(_, i)| rows[i].clone())
+            .collect())
+    }
+
     pub(super) fn search_rows(
         &self,
         rows: &[Row],

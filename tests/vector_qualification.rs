@@ -21,25 +21,29 @@ impl Embedder for Seeded {
         16
     }
     fn embed(&self, text: &str) -> Arc<[f32]> {
-        if text.contains("zero") {
-            return Arc::from(vec![0.0f32; 16]);
-        }
-        let key = if text.contains("dup") { "dup" } else { text };
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in key.bytes() {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
-        let v: Vec<f32> = (0..16)
-            .map(|_| {
-                h ^= h << 13;
-                h ^= h >> 7;
-                h ^= h << 17;
-                ((h % 2001) as f32 - 1000.0) / 1000.0
-            })
-            .collect();
-        Arc::from(v)
+        seeded_vector(text, self.dim())
     }
+}
+
+fn seeded_vector(text: &str, dim: usize) -> Arc<[f32]> {
+    if text.contains("zero") {
+        return Arc::from(vec![0.0f32; dim]);
+    }
+    let key = if text.contains("dup") { "dup" } else { text };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    let v: Vec<f32> = (0..dim)
+        .map(|_| {
+            h ^= h << 13;
+            h ^= h >> 7;
+            h ^= h << 17;
+            ((h % 2001) as f32 - 1000.0) / 1000.0
+        })
+        .collect();
+    Arc::from(v)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -219,5 +223,118 @@ fn text_updates_re_embed_on_every_tier() {
         copy(&dir, &image);
         let mut recovered = Db::open_with(&image, opts()).unwrap().with_embedder(Arc::new(Seeded));
         assert_eq!(embedding_of(&mut recovered, "raw://v/010"), after, "cold={cold}: crash image");
+    }
+}
+
+#[test]
+fn filtered_hnsw_top_k_respects_filter_and_exact_fallback() {
+    let mut db = Db::empty().with_embedder(Arc::new(Seeded));
+    load(&mut db, 6200);
+    let exact_query = r#"docs | layer == "wiki" | search vec "doc number 6" | take 10"#;
+    let expected = search(&mut db, exact_query);
+    db.build_hnsw("docs").unwrap();
+    db.set_filtered_hnsw(true);
+    let result = search(
+        &mut db,
+        r#"docs | layer == "raw" | search vec "doc number 7" | take 10"#,
+    );
+    assert_eq!(result.len(), 10);
+    assert!(
+        result
+            .iter()
+            .all(|uri| uri.rsplit('/').next().unwrap().parse::<usize>().unwrap() % 3 != 0)
+    );
+    assert_eq!(search(&mut db, exact_query), expected);
+}
+
+/// Run with `cargo test --release --test vector_qualification filtered_hnsw_benchmark -- --ignored --nocapture`.
+#[test]
+#[ignore = "manual latency and recall benchmark"]
+fn filtered_hnsw_benchmark() {
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    struct WideSeeded;
+    impl Embedder for WideSeeded {
+        fn id(&self) -> &str {
+            "seeded/384"
+        }
+        fn dim(&self) -> usize {
+            384
+        }
+        fn embed(&self, text: &str) -> Arc<[f32]> {
+            seeded_vector(text, self.dim())
+        }
+    }
+    let mut exact = Db::empty().with_embedder(Arc::new(WideSeeded));
+    let mut adaptive = Db::empty().with_embedder(Arc::new(WideSeeded));
+    for i in 0..12000 {
+        let tag = match i % 100 {
+            0 => "one ten fifty",
+            1..=9 => "ten fifty",
+            10..=49 => "fifty",
+            _ => "rest",
+        };
+        let insert = format!(
+            r#"insert docs {{ uri: "raw://bench/{i}", title: "item {i}", layer: "raw", body: "{tag}" }}"#
+        );
+        exact.run(&insert).unwrap();
+        adaptive.run(&insert).unwrap();
+    }
+    let queries: Vec<_> = ["one", "ten", "fifty"]
+        .into_iter()
+        .map(|tag| {
+            (0..200)
+                .map(|i| {
+                    format!(
+                        r#"docs | body has "{tag}" | search vec "item {}" | take 10"#,
+                        i * 23,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    adaptive.build_hnsw("docs").unwrap();
+    adaptive.set_filtered_hnsw(true);
+    for (selectivity, qs) in [1, 10, 50].into_iter().zip(&queries) {
+        for q in qs {
+            drop(exact.run(q).unwrap());
+            drop(adaptive.run(q).unwrap());
+        }
+        let sample = |db: &mut Db, q: &str, times: &mut Vec<u128>| {
+            let start = Instant::now();
+            let rows = search(db, q);
+            times.push(start.elapsed().as_micros());
+            rows
+        };
+        let mut exact_times = Vec::new();
+        let mut adaptive_times = Vec::new();
+        let mut found = 0;
+        let mut wanted = 0;
+        for (i, q) in qs.iter().enumerate() {
+            let (expected, actual) = if i % 2 == 0 {
+                (
+                    sample(&mut exact, q, &mut exact_times),
+                    sample(&mut adaptive, q, &mut adaptive_times),
+                )
+            } else {
+                let actual = sample(&mut adaptive, q, &mut adaptive_times);
+                (sample(&mut exact, q, &mut exact_times), actual)
+            };
+            let expected: HashSet<_> = expected.iter().collect();
+            found += actual.iter().filter(|uri| expected.contains(uri)).count();
+            wanted += expected.len();
+        }
+        exact_times.sort_unstable();
+        adaptive_times.sort_unstable();
+        let p99_idx = qs.len() * 99 / 100 - 1;
+        assert!(wanted > 0 && found > 0);
+        println!(
+            "{selectivity}%: exact p99 {} µs, adaptive p99 {} µs, recall@10 {:.3}",
+            exact_times[p99_idx],
+            adaptive_times[p99_idx],
+            found as f64 / wanted as f64
+        );
     }
 }

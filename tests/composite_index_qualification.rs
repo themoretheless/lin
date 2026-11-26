@@ -44,3 +44,49 @@ fn composite_bounds_in_both_directions() {
         }
     }
 }
+
+#[test]
+fn composite_index_seeks_both_range_bounds() {
+    let mut db = Db::empty();
+    db.run("col events { id: text, tenant: text, tick: i64, tag: text }")
+        .unwrap();
+    for (id, tenant, tick) in [
+        ("a", "x", 10),
+        ("b", "x", 20),
+        ("c", "x", 30),
+        ("d", "y", 20),
+    ] {
+        db.run(&format!(
+            r#"insert events {{ id: "{id}", tenant: "{tenant}", tick: {tick}, tag: "ok" }}"#
+        ))
+        .unwrap();
+    }
+    let queries = [
+        (r#"tenant == "x" and tick > 10 and tick <= 20"#, 1),
+        (r#"tenant == "x" and tick <= 20 and tick > 10"#, 1),
+        (r#"tenant == "x" and tick >= 20 and tick <= 20"#, 1),
+        (r#"tenant == "x" and tick > 20 and tick <= 20"#, 0),
+        (r#"tenant == "x" and tick > 30 and tick < 10"#, 0),
+    ];
+    db.run("index events [tenant, tick, tag]").unwrap();
+    for (filter, count) in queries {
+        let result = db.run(&format!("events | {filter} | count")).unwrap();
+        assert_eq!(
+            result.rows[0].get("hits"),
+            Some(&lin::Cell::Int(count)),
+            "{filter}"
+        );
+    }
+}
+
+#[test]
+fn descending_prefix_top_k_preserves_ties_and_residuals() {
+    let mut indexed = seed(true);
+    let mut plain = seed(false);
+    for dir in ["", " desc"] {
+        for extra in ["", " and k >= 10 and k < 50", r#" and id != "r007""#] {
+            let query = format!("t | g == 1{extra} | sort k{dir} | take 20");
+            assert_eq!(ids(&mut indexed, &query), ids(&mut plain, &query));
+        }
+    }
+}

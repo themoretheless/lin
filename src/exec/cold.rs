@@ -113,8 +113,81 @@ impl Db {
             self.quotas.max_query_bytes,
             self.quotas.max_ast_depth,
         )?;
+        if let Some(result) = self.try_run_remote_filtered(src, &stmts)? {
+            return Ok(result);
+        }
         let _ = self.hydrate_stmts_cold_tables(&stmts)?;
         self.run_preparsed_ext(src, stmts, true)
+    }
+
+    fn try_run_remote_filtered(
+        &mut self,
+        src: &str,
+        stmts: &[Stmt],
+    ) -> Result<Option<crate::Handle>, Error> {
+        let [Stmt::Query(query)] = stmts else {
+            return Ok(None);
+        };
+        let Source::Collection(table) = &query.source else {
+            return Ok(None);
+        };
+        let Some(Step::Filter(pred)) = query.steps.first() else {
+            return Ok(None);
+        };
+        if query.explain.is_some()
+            || !self.store.is_disk_backed(table)
+            || !query.steps.iter().all(|step| {
+                matches!(
+                    step,
+                    Step::Filter(_)
+                        | Step::Project(_)
+                        | Step::Take { .. }
+                        | Step::Skip { .. }
+                        | Step::Count { .. }
+                )
+            })
+        {
+            return Ok(None);
+        }
+        let Some(disk) = self.store.disk.as_ref() else {
+            return Ok(None);
+        };
+        let engine = disk
+            .engine
+            .read()
+            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
+        let Some(segments) = engine.remote_pruned_segments(table, pred) else {
+            return Ok(None);
+        };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let staging = engine.dir().join(format!(
+            ".remote-scan-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&staging).map_err(|err| Error::runtime(err.to_string()))?;
+        struct Staging(std::path::PathBuf);
+        impl Drop for Staging {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let staging = Staging(staging);
+        let view = engine.remote_filtered_view(table, segments, &staging.0)?;
+        drop(engine);
+        let mut store = self.store.clone_mem();
+        let disk = store
+            .disk
+            .as_mut()
+            .expect("disk backing copied into read snapshot");
+        disk.engine = Arc::new(std::sync::RwLock::new(view));
+        let mut scan = Self::bare(self.catalog.clone(), store);
+        scan.quotas = self.quotas.clone();
+        #[cfg(feature = "gpu")]
+        {
+            scan.gpu = self.gpu.clone();
+        }
+        scan.run_preparsed_ext(src, stmts.to_vec(), true).map(Some)
     }
 
     /// Evict least-recently-used hydrated cold tables (at whole-table granularity) down to `max_bytes`.

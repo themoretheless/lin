@@ -303,6 +303,7 @@ pub struct Store {
     pub(crate) fts: BTreeMap<String, crate::fts::FtsIndex>,
     /// collection → HNSW vector index (f32 or SQ8)
     pub(crate) hnsw: BTreeMap<String, crate::embed::VectorIndex>,
+    pub(crate) filtered_hnsw_enabled: bool,
     /// collection → id → row index (O(1) Get / IndexSeek fetch).
     pub(crate) by_id: BTreeMap<String, FxHashMap<Arc<str>, usize>>,
     /// docs uri → row index.
@@ -441,6 +442,7 @@ impl Store {
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
             hnsw: BTreeMap::new(),
+            filtered_hnsw_enabled: false,
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
@@ -1099,6 +1101,7 @@ impl Store {
                 .collect(),
             fts: self.fts.clone(),
             hnsw: self.hnsw.clone(),
+            filtered_hnsw_enabled: self.filtered_hnsw_enabled,
             by_id: self.by_id.clone(),
             docs_by_uri: self.docs_by_uri.clone(),
             facts_by_spo: self.facts_by_spo.clone(),

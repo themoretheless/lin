@@ -1472,3 +1472,41 @@ fn replica_push_wakeup_status_and_lag_cutoff_bootstrap() {
     f1.shutdown().unwrap().close().unwrap();
     primary.shutdown().unwrap().close().unwrap();
 }
+
+#[test]
+fn remote_integer_filter_downloads_only_matching_segments() {
+    let source = TempDir::new("prune_src");
+    let cache = TempDir::new("prune_cache");
+    let mut disk = lin::DiskEngine::open(source.path(), true).unwrap();
+    for n in [10_i64, 20, 30] {
+        let mut row = Row::new();
+        row.insert("id", Cell::Text(Arc::from(n.to_string())));
+        row.insert("code", Cell::Int(n));
+        disk.write_bulk_segment("prunable", &[row]).unwrap();
+    }
+    let objects = Arc::new(MemoryObjectStore::new());
+    disk.push_to_object_store(objects.as_ref(), "prune", false)
+        .unwrap();
+    let mut db = Db::open_cold_from_object_store(
+        cache.path(),
+        objects.clone(),
+        "prune",
+        RemoteCacheConfig {
+            lazy: true,
+            max_local_bytes: u64::MAX,
+        },
+    )
+    .unwrap();
+    let gets = objects.counters().gets;
+    let filtered = db
+        .run_remote("prunable | code >= 20 and code < 30 | count")
+        .unwrap();
+    assert_eq!(filtered.rows[0].get("hits"), Some(&Cell::Int(1)));
+    assert_eq!(objects.counters().gets - gets, 1);
+    let gets = objects.counters().gets;
+    let empty = db.run_remote("prunable | code > 100 | count").unwrap();
+    assert_eq!(empty.rows[0].get("hits"), Some(&Cell::Int(0)));
+    assert_eq!(objects.counters().gets, gets);
+    let full = db.run_remote("prunable | count").unwrap();
+    assert_eq!(full.rows[0].get("hits"), Some(&Cell::Int(3)));
+}
