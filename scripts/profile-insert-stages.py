@@ -14,16 +14,18 @@ for trial in range(8):
             env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
         run = subprocess.run([sys.argv[1]], text=True, input=request, env=env, capture_output=True, check=True)
         data = json.loads(run.stdout)
-        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": []}
+        components = {"build": [], "reserve": [], "minor_faults": [], "shape_setup_sum": [], "sampled_vector_ns": [], "sampled_cells_ns": [], "sampled_rows": []}
         for line in run.stderr.splitlines():
             if line.startswith("insert_profile "):
                 _, component, ns = line.split()
                 components[component].append(int(ns))
         assert all(len(values) == 30 for values in components.values())
+        sampled_rows = components.pop("sampled_rows")
+        assert sampled_rows == [625] * 30
         assert len(data["result"]) == 100000
         ends = data["stage_end_ns"]
         assert len(ends) == 3 and all(len(sample) == 12 for sample in ends)
         durations = [[b-a for a,b in zip([0]+sample, sample)] for sample in ends]
         assert all(min(sample) >= 0 for sample in durations)
-        results.append(dict(trial=trial, mode=mode, stage_ns=durations, minor_faults=components.pop("minor_faults"), component_ns=components, total_ns=data["samples_ns"]))
+        results.append(dict(trial=trial, mode=mode, stage_ns=durations, sampled_rows=sampled_rows, minor_faults=components.pop("minor_faults"), component_ns=components, total_ns=data["samples_ns"]))
 print(json.dumps(results))

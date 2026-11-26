@@ -1,8 +1,8 @@
 diff --git a/src/exec/dml.rs b/src/exec/dml.rs
-index 063c5b1e2..71e9885ef 100644
+index 063c5b1e2..57c844af3 100644
 --- a/src/exec/dml.rs
 +++ b/src/exec/dml.rs
-@@ -1205,8 +1205,20 @@ impl Db {
+@@ -1205,8 +1205,23 @@ impl Db {
          } else {
              None
          };
@@ -18,21 +18,27 @@ index 063c5b1e2..71e9885ef 100644
 +        let build_ns = started.elapsed().as_nanos();
 +        let faults = minor_faults() - faults_before;
 +        eprintln!("insert_profile build {build_ns}");
++        eprintln!("insert_profile sampled_vector_ns {}", SAMPLED_VECTOR_NS.swap(0, Ordering::Relaxed));
++        eprintln!("insert_profile sampled_cells_ns {}", SAMPLED_CELLS_NS.swap(0, Ordering::Relaxed));
++        eprintln!("insert_profile sampled_rows {}", SAMPLED_ROWS.swap(0, Ordering::Relaxed));
 +        eprintln!("insert_profile shape_setup_sum {}", SHAPE_SETUP_NS.swap(0, Ordering::Relaxed));
 +        eprintln!("insert_profile minor_faults {faults}");
          // Any record without an explicit id gets a generated one, wherever it sits in the
          // batch (deciding from the first record left later id-less rows without an id).
          let needs_id = records.is_empty()
-@@ -2696,6 +2708,8 @@ fn build_insert_rows(
+@@ -2696,6 +2711,11 @@ fn build_insert_rows(
      (rows, all_uniform, all_embedded, lossless_cols)
  }
  
++static SAMPLED_VECTOR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static SAMPLED_CELLS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++static SAMPLED_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 +static SHAPE_SETUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 +
  fn build_batch_shape_rows_into(
      out: &mut [std::mem::MaybeUninit<Row>],
      records: &[Record],
-@@ -2713,6 +2727,7 @@ fn build_batch_shape_rows_into(
+@@ -2713,6 +2733,7 @@ fn build_batch_shape_rows_into(
          }
          return (false, !needs_embed, false);
      }
@@ -40,14 +46,55 @@ index 063c5b1e2..71e9885ef 100644
      let body_idx = first.fields.iter().rposition(|(k, _)| k == "body");
      let has_hash = first.fields.iter().any(|(k, _)| k == "hash");
      let needs_hash = !has_hash && body_idx.is_some();
-@@ -2775,6 +2790,7 @@ fn build_batch_shape_rows_into(
+@@ -2775,8 +2796,12 @@ fn build_batch_shape_rows_into(
      let mut first_kinds = [0u8; 32];
      let mut have_first_kinds = false;
  
 +    SHAPE_SETUP_NS.fetch_add(setup_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
      let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
-         for (slot_out, record) in out.iter_mut().zip(records) {
+-        for (slot_out, record) in out.iter_mut().zip(records) {
++        let mut vector_ns = 0;
++        let mut cells_ns = 0;
++        let mut samples = 0;
++        for (i, (slot_out, record)) in out.iter_mut().zip(records).enumerate() {
              let same_shape = record.fields.len() == first.fields.len()
+                 && record
+                     .fields
+@@ -2792,6 +2817,7 @@ fn build_batch_shape_rows_into(
+                 slot_out.write(record_row(record, now));
+                 continue;
+             }
++            let sampled = (i % 16 == 7).then(std::time::Instant::now);
+             let mut emb_vec = if let Some(batch) = embed_batch.as_deref_mut() {
+                 let t_opt = title_idx.map(|i| &record.fields[i].1);
+                 let b_opt = body_idx.map(|i| &record.fields[i].1);
+@@ -2830,6 +2856,11 @@ fn build_batch_shape_rows_into(
+                 None
+             };
+ 
++            let cell_start = sampled.map(|start| {
++                let now = std::time::Instant::now();
++                vector_ns += (now - start).as_nanos() as u64;
++                now
++            });
+             macro_rules! eval_slot_cell {
+                 ($slot:expr) => {
+                     match $slot {
+@@ -2903,7 +2934,14 @@ fn build_batch_shape_rows_into(
+                 }
+                 slot_out.write(Row::from_vec_parts(Arc::clone(&shape), cells));
+             }
++            if let Some(start) = cell_start {
++                cells_ns += start.elapsed().as_nanos() as u64;
++                samples += 1;
++            }
+         }
++        SAMPLED_VECTOR_NS.fetch_add(vector_ns, Ordering::Relaxed);
++        SAMPLED_CELLS_NS.fetch_add(cells_ns, Ordering::Relaxed);
++        SAMPLED_ROWS.fetch_add(samples, Ordering::Relaxed);
+     };
+     if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
+         crate::embed::with_hashing_scratch(dim, |batch| process_rows(Some(batch)));
 diff --git a/src/store/mod.rs b/src/store/mod.rs
 index 6ce068290..78bb24b95 100644
 --- a/src/store/mod.rs
