@@ -97,3 +97,20 @@ Median milliseconds across eight fresh processes in each mode. The separate prof
 | Neoverse-N2 | thp | 72.92 | 40.55 | 3.82 | 11.34 | 2.48 |
 
 [Raw component profiles and separate uninstrumented DuckDB comparisons](https://github.com/themoretheless/lin/actions/runs/45798842879)
+
+## Cold versus repeat component timings
+
+For each fresh process, subtract the median of its two repeat transactions from its first transaction. The table reports the median paired differences across eight processes in milliseconds. Each transaction inserts 100,000 rows.
+
+| CPU | Mode | Transaction difference | Row construction difference | ID-map reservation difference |
+|---|---|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor | default | 61.06 | 50.76 | 2.06 |
+| AMD EPYC 9V74 80-Core Processor | thp | 14.80 | 8.59 | 1.45 |
+| AMD EPYC 7763 64-Core Processor | default | 80.03 | 66.00 | 2.53 |
+| AMD EPYC 7763 64-Core Processor | thp | 24.44 | 15.70 | 2.09 |
+| AMD EPYC 9V45 96-Core Processor | default | 16.02 | 13.32 | 0.59 |
+| AMD EPYC 9V45 96-Core Processor | thp | 10.09 | 5.96 | 0.83 |
+| Neoverse-N2 | default | 38.86 | 32.31 | 1.76 |
+| Neoverse-N2 | thp | 9.03 | 7.27 | 1.19 |
+
+[Source profiles](https://github.com/themoretheless/lin/actions/runs/45798842879)
