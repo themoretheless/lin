@@ -231,12 +231,13 @@ pub struct Db {
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
     /// Cached read-only snapshot keyed by `(gen, docs_epoch, collections_epoch, collections_len, edges_len, facts_len)`.
     pub(crate) reader_cache: Option<((u64, u64, u64, usize, usize, usize), ReadDb)>,
-    /// Shared read-only plan cache preserved across `reader()` snapshots while catalog is unchanged.
+    /// Shared read-only plan & query caches preserved across `reader()` snapshots while catalog is unchanged.
     #[allow(clippy::type_complexity)]
     pub(crate) reader_plan_cache: Option<
         (
             (u64, usize, usize),
             Arc<std::sync::RwLock<FxHashMap<String, Prepared>>>,
+            Arc<std::sync::RwLock<FxHashMap<u64, Prepared>>>,
         ),
     >,
     /// Fields per collection declared with [`Db::declare_columns`].
@@ -264,6 +265,7 @@ pub struct Db {
 pub struct ReadDb {
     inner: Arc<Db>,
     plan_cache: Arc<std::sync::RwLock<FxHashMap<String, Prepared>>>,
+    query_cache: Arc<std::sync::RwLock<FxHashMap<u64, Prepared>>>,
 }
 
 /// Row / edge / log byte / query resource caps. Defaults suit embeddable single-node.
@@ -829,6 +831,7 @@ impl Db {
         Ok(ReadDb {
             inner: Arc::new(inner),
             plan_cache: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
+            query_cache: Arc::new(std::sync::RwLock::new(FxHashMap::default())),
         })
     }
 
@@ -907,12 +910,16 @@ impl Db {
             self.catalog.fks.len(),
             self.catalog.guards.len(),
         );
-        let shared_plans = match &self.reader_plan_cache {
-            Some((sig, arc)) if *sig == cat_sig => Arc::clone(arc),
+        let (shared_plans, shared_queries) = match &self.reader_plan_cache {
+            Some((sig, plans, queries)) if *sig == cat_sig => {
+                (Arc::clone(plans), Arc::clone(queries))
+            }
             _ => {
-                let arc = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
-                self.reader_plan_cache = Some((cat_sig, Arc::clone(&arc)));
-                arc
+                let plans = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+                let queries = Arc::new(std::sync::RwLock::new(FxHashMap::default()));
+                self.reader_plan_cache =
+                    Some((cat_sig, Arc::clone(&plans), Arc::clone(&queries)));
+                (plans, queries)
             }
         };
         let rdb = ReadDb {
@@ -948,6 +955,7 @@ impl Db {
                 gpu_cache: Default::default(),
             }),
             plan_cache: shared_plans,
+            query_cache: shared_queries,
         };
         self.reader_cache = Some((cache_key, rdb.clone()));
         rdb
@@ -4393,6 +4401,13 @@ impl Db {
         Ok(())
     }
 
+    /// Allow approximate HNSW for eligible filtered vector top-k queries.
+    /// Disabled by default. The setting is local to this database instance.
+    pub fn set_filtered_hnsw(&mut self, enabled: bool) {
+        self.store.filtered_hnsw_enabled = enabled;
+        self.reader_cache = None;
+    }
+
     /// Build or rebuild a compact SQ8-quantized HNSW vector index for a collection (75% less RAM).
     pub fn build_hnsw_sq8(&mut self, collection: &str) -> Result<(), Error> {
         self.store.build_hnsw_sq8(collection, 16, 64);
@@ -5184,6 +5199,41 @@ impl Db {
         self.exec_query_lim(q, bindings, true)
     }
 
+    /// Stable index-order top-k for an equality prefix followed by the sort column.
+    fn ordered_index_top_k(&self, q: &Query, now: i64) -> Option<Vec<Row>> {
+        let Source::Collection(name) = &q.source else { return None };
+        let [Step::Filter(pred), Step::Sort { field, desc }, Step::Take { n: Some(limit) }] =
+            q.steps.as_slice() else { return None };
+        if self.store.is_disk_backed(name) || (name == "docs" && self.store.has_deferred_doc_ops()) {
+            return None;
+        }
+        let sort = field.leaf()?;
+        let ty = &self.catalog.collection(name)?.field(sort)?.ty;
+        if !matches!(ty, crate::catalog::Type::I64 | crate::catalog::Type::Time) {
+            return None;
+        }
+        let (uses, covered) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)?;
+        let [access] = uses.as_slice() else { return None };
+        if access.eqs.is_empty() || access.def.fields.len() != access.eqs.len() + 1
+            || access.def.fields.last()?.as_str() != sort {
+            return None;
+        }
+        let index = self.store.indexes.get(&access.def.label())?;
+        let limit = (*limit).max(0) as usize;
+        let mut rows = Vec::new();
+        if limit > 0 {
+            let mut slots = eval::PredSlots::new(pred);
+            index.seek_ordered_limit(access, now, *desc, |pos| {
+                if let Some(row) = self.store.get_by_idx(name, pos)
+                    && (covered || slots.eval(row, now)) {
+                    rows.push(row.clone());
+                }
+                rows.len() < limit
+            });
+        }
+        Some(rows)
+    }
+
     fn exec_query_lim(
         &self,
         q: &Query,
@@ -5207,6 +5257,9 @@ impl Db {
             || self.uses_gpu_sort(q)
             || self.uses_gpu_graph(q);
         if !gpu_filter {
+            if bindings.is_empty() && let Some(rows) = self.ordered_index_top_k(q, now) {
+                return Ok(rows);
+            }
             if let Some(rows) = self.try_point_get(q) {
                 return Ok(rows);
             }
@@ -5511,7 +5564,22 @@ impl Db {
                     rows = self.match_path(&primary, rows, start.as_deref(), hops)?;
                 }
                 Step::Search { mode, query } => {
-                    rows = self.search_rows(&rows, *mode, query)?;
+                    if matches!(mode, crate::ast::SearchMode::Vec)
+                        && let crate::ast::Source::Collection(collection) = &q.source
+                        && !bindings.contains_key(collection)
+                        && !self.store.is_disk_backed(collection)
+                        && step_idx > 0
+                        && q.steps[..step_idx].iter().all(|s| matches!(s, Step::Filter(_)))
+                        && let Some(Step::Take { n: Some(n) }) = q.steps[step_idx + 1..]
+                            .iter()
+                            .find(|step| !matches!(step, Step::Project(_) | Step::Without(_)))
+                        && *n > 0
+                    {
+                        rows =
+                            self.search_filtered_vectors(collection, &rows, query, *n as usize)?;
+                    } else {
+                        rows = self.search_rows(&rows, *mode, query)?;
+                    }
                 }
                 Step::Count { by } => {
                     implicit_take = false;
@@ -6070,6 +6138,34 @@ impl ReadDb {
 
     pub fn prepare_stmt(&self, stmt: Stmt) -> Result<Prepared, Error> {
         self.inner.prepare_stmt(stmt)
+    }
+
+    pub fn prepare_query(&self, q: &Query) -> Result<Prepared, Error> {
+        let key = self.inner.query_cache_key(q);
+        if let Ok(guard) = self.query_cache.read()
+            && let Some(p) = guard.get(&key)
+        {
+            return Ok(p.clone());
+        }
+        let prepared = self.inner.prepare_stmt(Stmt::Query(q.clone()))?;
+        if let Ok(mut guard) = self.query_cache.write() {
+            if guard.len() >= 1024 {
+                guard.clear();
+            }
+            guard.insert(key, prepared.clone());
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn run_query(&self, q: &Query) -> Result<Handle, Error> {
+        let key = self.inner.query_cache_key(q);
+        if let Ok(guard) = self.query_cache.read()
+            && let Some(prepared) = guard.get(&key)
+        {
+            return self.inner.run_prepared_readonly(prepared);
+        }
+        let prepared = self.prepare_query(q)?;
+        self.inner.run_prepared_readonly(&prepared)
     }
 
     pub fn prepare_stmts(&self, stmts: Vec<Stmt>) -> Result<Prepared, Error> {

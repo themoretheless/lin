@@ -359,7 +359,7 @@ impl Queryable {
 
     pub fn prepare_read(&self, db: &ReadDb) -> Result<crate::exec::Prepared, Error> {
         self.ensure()?;
-        db.prepare_stmt(self.stmt())
+        db.prepare_query(&self.query)
     }
 
     pub(crate) fn ensure(&self) -> Result<(), Error> {
@@ -817,7 +817,7 @@ impl Queryable {
 
     pub fn run_read(&self, db: &ReadDb) -> Result<Handle, Error> {
         self.ensure()?;
-        db.run_stmt(self.stmt())
+        db.run_query(&self.query)
     }
 
     pub fn to_vec(&self, db: &mut Db) -> Result<Vec<Row>, Error> {

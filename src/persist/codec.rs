@@ -671,6 +671,7 @@ pub(crate) enum PreparedEncoding {
         fields: Vec<String>,
         rows: u32,
         magic: [u8; 4],
+        checksum: Option<[u8; 4]>,
     },
     Failed(Error),
     Panicked(Box<dyn std::any::Any + Send>),

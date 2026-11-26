@@ -4624,7 +4624,7 @@ fn partition_into(
                                         let uid = orders_uid[idx].as_ref();
                                         let Some(ui) = lookup_user_ref(uid) else {
                                             if left_join {
-                                                c0.push(Cell::from_arc_str(&orders_id[idx]));
+                                                c0.push(Cell::Text(Arc::clone(&orders_id[idx])));
                                                 c1.push(Cell::Null);
                                                 match &mut c2 {
                                                     WorkerTotalCol::Int(v) => {
@@ -4646,8 +4646,8 @@ fn partition_into(
                                             }
                                             continue;
                                         };
-                                        c0.push(Cell::from_arc_str(&orders_id[idx]));
-                                        c1.push(Cell::from_arc_str(&users_email[ui]));
+                                        c0.push(Cell::Text(Arc::clone(&orders_id[idx])));
+                                        c1.push(Cell::Text(Arc::clone(&users_email[ui])));
                                         match &mut c2 {
                                             WorkerTotalCol::Int(v) => {
                                                 v.push(orders_total[idx] as i64)
@@ -4770,8 +4770,8 @@ fn partition_into(
                                 for (col_i, p) in plan_ref.iter().enumerate() {
                                     let cell = match p {
                                         JoinFieldPlan::Left(k) => match k.as_str() {
-                                            "id" => Cell::from_arc_str(&orders_id[idx]),
-                                            "user_id" => Cell::from_arc_str(&orders_uid[idx]),
+                                            "id" => Cell::Text(Arc::clone(&orders_id[idx])),
+                                            "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
                                             "total" => order_total_cell(
                                                 &mut total_slot,
                                                 orders_rows,
@@ -4790,9 +4790,11 @@ fn partition_into(
                                                     .get(*r_idx)
                                                     .map(String::as_str)
                                                 {
-                                                    Some("id") => Cell::from_arc_str(&users_id[ui]),
+                                                    Some("id") => {
+                                                        Cell::Text(Arc::clone(&users_id[ui]))
+                                                    }
                                                     Some("email") => {
-                                                        Cell::from_arc_str(&users_email[ui])
+                                                        Cell::Text(Arc::clone(&users_email[ui]))
                                                     }
                                                     _ => Cell::Null,
                                                 },
@@ -4885,7 +4887,7 @@ fn partition_into(
                 let uid = orders_uid[idx].as_ref();
                 let Some(ui) = lookup_user(uid) else {
                     if left_join {
-                        col0.push(Cell::from_arc_str(&orders_id[idx]));
+                        col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
                         col1.push(Cell::Null);
                         match &mut total_col {
                             TotalCol::Int(vals) => vals.push(orders_total[idx] as i64),
@@ -4904,8 +4906,8 @@ fn partition_into(
                     }
                     continue;
                 };
-                col0.push(Cell::from_arc_str(&orders_id[idx]));
-                col1.push(Cell::from_arc_str(&users_email[ui]));
+                col0.push(Cell::Text(Arc::clone(&orders_id[idx])));
+                col1.push(Cell::Text(Arc::clone(&users_email[ui])));
                 match &mut total_col {
                     TotalCol::Int(vals) => vals.push(orders_total[idx] as i64),
                     TotalCol::Float(vals) => vals.push(orders_total[idx]),
@@ -4981,8 +4983,8 @@ fn partition_into(
             for (col_i, p) in plan.iter().enumerate() {
                 let cell = match p {
                     JoinFieldPlan::Left(k) => match k.as_str() {
-                        "id" => Cell::from_arc_str(&orders_id[idx]),
-                        "user_id" => Cell::from_arc_str(&orders_uid[idx]),
+                        "id" => Cell::Text(Arc::clone(&orders_id[idx])),
+                        "user_id" => Cell::Text(Arc::clone(&orders_uid[idx])),
                         "total" => order_total_cell(
                             &mut total_slot,
                             orders_rows,
@@ -5002,8 +5004,8 @@ fn partition_into(
                         };
                         let fname = right_fields.get(*ri).map(|s| s.as_str()).unwrap_or("");
                         match fname {
-                            "id" => Cell::from_arc_str(&users_id[ui]),
-                            "email" => Cell::from_arc_str(&users_email[ui]),
+                            "id" => Cell::Text(Arc::clone(&users_id[ui])),
+                            "email" => Cell::Text(Arc::clone(&users_email[ui])),
                             _ => Cell::Null,
                         }
                     }

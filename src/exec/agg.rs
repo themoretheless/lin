@@ -1781,7 +1781,7 @@ impl Db {
                             let uid_cell = match key.0.first() {
                                 Some(crate::index::IndexPart::Text(s)) => {
                                     state_bytes = state_bytes.saturating_add(s.len() + 32 + 64);
-                                    Cell::from_arc_str(s)
+                                    Cell::Text(Arc::clone(s))
                                 }
                                 Some(crate::index::IndexPart::SmallText(s)) => {
                                     state_bytes = state_bytes.saturating_add(16 + 64);
@@ -1822,7 +1822,7 @@ impl Db {
                             entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                             let cell_entries: Vec<(Cell, i64)> = entries
                                 .into_iter()
-                                .map(|(uid, c)| (Cell::from_arc_str(&uid), c))
+                                .map(|(uid, c)| (Cell::Text(uid), c))
                                 .collect();
                             return Ok(pair_entries_to_rows(
                                 &out_key,
@@ -1855,7 +1855,7 @@ impl Db {
                                 for (key, list) in &live_idx.forward {
                                     let uid_cell = match key.0.first() {
                                         Some(crate::index::IndexPart::Text(s)) => {
-                                            Cell::from_arc_str(s)
+                                            Cell::Text(Arc::clone(s))
                                         }
                                         Some(crate::index::IndexPart::SmallText(s)) => {
                                             Cell::SmallText(*s)
@@ -1907,7 +1907,7 @@ impl Db {
                             entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                             let cell_entries: Vec<(Cell, f64)> = entries
                                 .into_iter()
-                                .map(|(uid, tot)| (Cell::from_arc_str(&uid), tot))
+                                .map(|(uid, tot)| (Cell::Text(uid), tot))
                                 .collect();
                             return Ok(pair_entries_to_rows(
                                 "user_id",
@@ -1945,7 +1945,7 @@ impl Db {
                                 entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                                 let cell_entries: Vec<(Cell, f64)> = entries
                                     .into_iter()
-                                    .map(|(uid, tot)| (Cell::from_arc_str(&uid), tot))
+                                    .map(|(uid, tot)| (Cell::Text(uid), tot))
                                     .collect();
                                 return Ok(pair_entries_to_rows(
                                     "user_id",
@@ -2013,8 +2013,15 @@ impl Db {
                         v.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                         v
                     } else {
-                        let col_vec = dict_col.to_vec();
-                        let (s0, s1, overflow) = Self::count_arc_slice_low_cardinality(&col_vec);
+                        let borrowed;
+                        let col_slice: &[Arc<str>] = match dict_col.as_spilled() {
+                            Some(s) => s,
+                            None => {
+                                borrowed = dict_col.to_vec();
+                                &borrowed
+                            }
+                        };
+                        let (s0, s1, overflow) = Self::count_arc_slice_low_cardinality(col_slice);
                         let mut combined: FxHashMap<Arc<str>, i64> = overflow.unwrap_or_default();
                         if let Some((k, v)) = s0 {
                             *combined.entry(k).or_insert(0) += v;
@@ -2033,7 +2040,7 @@ impl Db {
                 if state_bytes <= self.quotas.max_aggregate_bytes {
                     let cell_entries: Vec<(Cell, i64)> = entries
                         .into_iter()
-                        .map(|(arc, count)| (Cell::from_arc_str(&arc), count))
+                        .map(|(arc, count)| (Cell::Text(arc), count))
                         .collect();
                     return Ok(pair_entries_to_rows(
                         col_leaf,

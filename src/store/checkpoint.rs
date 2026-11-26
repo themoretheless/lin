@@ -618,6 +618,7 @@ impl Store {
             indexes: BTreeMap::new(),
             fts: BTreeMap::new(),
             hnsw: BTreeMap::new(),
+            filtered_hnsw_enabled: false,
             by_id: BTreeMap::new(),
             docs_by_uri: FxHashMap::default(),
             facts_by_spo: FxHashMap::default(),
@@ -911,13 +912,20 @@ impl Store {
                     fields,
                     rows,
                     magic,
+                    checksum,
                 }) => {
                     let valid = rec.r#gen == generation
                         && rec.next_id == next_id
                         && matches!(&rec.pack, Pack::InsertCols { collection: c, fields: f, n, edges, .. }
                             if c == &collection && f == &fields && *n == rows && edges.is_empty());
                     if valid {
-                        persist::write_frame(log, &magic, encode_buf, sync, log_bytes)?;
+                        if let Some(csum) = checksum {
+                            persist::write_frame_precomputed(
+                                log, &magic, encode_buf, csum, sync, log_bytes,
+                            )?;
+                        } else {
+                            persist::write_frame(log, &magic, encode_buf, sync, log_bytes)?;
+                        }
                     } else {
                         persist::append_record(log, &rec, encode_buf, sync, log_bytes)?;
                     }

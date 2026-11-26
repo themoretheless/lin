@@ -511,6 +511,7 @@ impl Db {
                             fields: fields.clone(),
                             rows: n,
                             magic,
+                            checksum: None,
                         });
                         Pack::InsertCols {
                             collection: collection.clone(),
@@ -1511,14 +1512,18 @@ impl Db {
                             &mut encode_buf,
                         )
                     });
-                    (res, encode_buf)
+                    let checksum = res
+                        .as_ref()
+                        .map(|(magic, _)| crate::persist::compute_frame_checksum(magic, &encode_buf));
+                    (res, checksum, encode_buf)
                 },
                 || self.maintain_insert_slab(collection, start, built_ref),
             );
             if let Some(p) = self.persist.as_mut() {
-                p.encode_buf = direct_res.1;
+                p.encode_buf = direct_res.2;
             }
             maint_res?;
+            let precomputed_checksum = direct_res.1;
             direct_res
                 .0
                 .map(|(magic, fields)| crate::persist::PreparedInsert {
@@ -1536,6 +1541,7 @@ impl Db {
                         fields,
                         rows: n as u32,
                         magic,
+                        checksum: precomputed_checksum,
                     },
                 })
         } else {
