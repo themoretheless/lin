@@ -2451,6 +2451,65 @@ struct BuildTask {
     finished: AtomicBool,
     caller: std::thread::Thread,
 }
+struct WaitBuildGuard<'a>(&'a BuildTask);
+impl Drop for WaitBuildGuard<'_> {
+    fn drop(&mut self) {
+        let claimed = if std::thread::panicking() {
+            // Stop new claims and wait only for chunks already handed out.
+            self.0.next_chunk
+                .fetch_max(self.0.total_chunks, Ordering::AcqRel)
+                .min(self.0.total_chunks)
+        } else {
+            self.0.total_chunks
+        };
+        while self.0.done_chunks.load(Ordering::Acquire) < claimed {
+            if !self.0.finished.load(Ordering::Acquire) {
+                std::thread::park_timeout(std::time::Duration::from_micros(50));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn caller_unwind_waits_only_for_claimed_insert_chunks() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // Two chunks have been claimed, one is still in flight, six remain unclaimed.
+    // The guard uses only the counters in this test.
+    let task = BuildTask {
+        records_ptr: 0, out_ptr: 0, n: 512, chunk_size: 64, total_chunks: 8,
+        now: 0, needs_embed: false, hashing_dim: None,
+        next_chunk: AtomicUsize::new(2), done_chunks: AtomicUsize::new(1),
+        neg_flags: AtomicU8::new(0), panicked: AtomicBool::new(false),
+        finished: AtomicBool::new(false), caller: std::thread::current(),
+    };
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        let task = &task;
+        scope.spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                let _guard = WaitBuildGuard(task);
+                panic!("injected insert caller failure");
+            });
+            tx.send(result.is_err()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while task.next_chunk.load(Ordering::Acquire) < task.total_chunks && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let cancelled = task.next_chunk.load(Ordering::Acquire) >= task.total_chunks;
+        let held = rx.try_recv().is_err();
+        task.done_chunks.store(2, Ordering::Release);
+        let exited = rx.recv_timeout(Duration::from_secs(5));
+        // Let an incorrect wait-for-all implementation exit before the scope joins.
+        task.done_chunks.store(task.total_chunks, Ordering::Release);
+        assert!(cancelled && held);
+        assert_eq!(exited, Ok(true));
+    });
+}
+
 fn run_build_chunks(task: &BuildTask, is_caller: bool) {
     loop {
         let c = task.next_chunk.fetch_add(1, Ordering::AcqRel);
@@ -2570,24 +2629,6 @@ fn build_insert_rows(
                 finished: AtomicBool::new(false),
                 caller: std::thread::current(),
             });
-            struct WaitBuildGuard<'a>(&'a BuildTask);
-            impl Drop for WaitBuildGuard<'_> {
-                fn drop(&mut self) {
-                    let claimed = if std::thread::panicking() {
-                        // Stop new claims and wait only for chunks already handed out.
-                        self.0.next_chunk
-                            .fetch_max(self.0.total_chunks, Ordering::AcqRel)
-                            .min(self.0.total_chunks)
-                    } else {
-                        self.0.total_chunks
-                    };
-                    while self.0.done_chunks.load(Ordering::Acquire) < claimed {
-                        if !self.0.finished.load(Ordering::Acquire) {
-                            std::thread::park_timeout(std::time::Duration::from_micros(50));
-                        }
-                    }
-                }
-            }
             let _wait_guard = WaitBuildGuard(&task);
             let wake = (total_chunks - 1).min(workers.len());
             for worker in workers.iter().take(wake) {
