@@ -21,3 +21,20 @@ Median paired Lin minus peer time in milliseconds, with paired Lin wins in paren
 The same revision ran on three EPYC 9V45 hosts and one Neoverse-N2. One Xeon runner skipped timing. With default pages, Lin won all 400 DuckDB pairs (two sizes, first and repeat). On EPYC the first 100k advantage ranged from 53.522 to 59.248 ms. On N2 it was 120.406 ms. Lin won 184 of 192 SQLite comparisons and all eight host-size medians after recovery. No EPYC 7763 timings were collected in either attempt.
 
 [CI and raw samples](https://github.com/themoretheless/lin/actions/runs/45867410306/attempts/2)
+
+## Targeted EPYC 7763 qualification
+
+Two of eight allocated runners matched the target CPU. Both used the same linked binary build procedure as above. The table uses default pages and reports paired Lin minus peer milliseconds and Lin wins.
+
+| Runner | DuckDB first 10k | DuckDB repeat 10k | DuckDB first 100k | DuckDB repeat 100k | SQLite FULL 1k | SQLite FULL 10k |
+|---|---:|---:|---:|---:|---:|---:|
+| EPYC 7763 amd-5 | −3.615 (25/25) | −12.263 (25/25) | −7.692 (24/25) | −96.742 (25/25) | −0.833 (23/24) | −14.473 (24/24) |
+| EPYC 7763 amd-6 | −3.687 (25/25) | −12.104 (25/25) | −2.968 (20/25) | −92.293 (25/25) | −0.771 (24/24) | −13.138 (24/24) |
+
+[CPU provenance and measurements](https://github.com/themoretheless/lin/actions/runs/45870525222)
+
+## Linked worker read and server matrix
+
+On a separate Linux x64 runner, the linked worker won 54/54 read comparisons per peer against SQLite, DuckDB, pandas, PostgreSQL, MySQL and MongoDB. The six read workloads ran at 1k, 10k and 100k in three independent processes. Server-native insertion won 9/9 comparisons per peer against PostgreSQL, MySQL and MongoDB. SQLite and DuckDB INSERT are qualified separately above.
+
+[Read and native INSERT measurements](https://github.com/themoretheless/lin/actions/runs/45870700571)
