@@ -1,7 +1,7 @@
-name: Pair glibc huge-page hint against DuckDB
+name: Qualify linked Linux allocator against DuckDB and SQLite
 on:
   push:
-    branches: [codex/duckdb-process-warmup]
+    branches: [codex/linux-linked-tcmalloc]
 permissions:
   contents: read
 jobs:
@@ -39,7 +39,19 @@ jobs:
       - name: Build Lin peer worker and install pinned Python peers
         if: steps.cpu.outputs.matched == 'true'
         run: |
-          cargo build --locked --release -p lin-peer-worker
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y libgoogle-perftools-dev
+          fi
+          scripts/build-linux-release.sh
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            for binary in target/release/{lin,lin-peer-worker}; do
+              nm --defined-only "$binary" > symbols.txt
+              grep -Eq ' [TW] malloc$' symbols.txt
+              grep -Eq ' [TW] tc_malloc$' symbols.txt
+              if ldd "$binary" | grep -q tcmalloc; then exit 1; fi
+            done
+          fi
           python3 -m pip install -r scripts/bench-peers-requirements.lock
       - name: Record huge-page and glibc settings
         if: steps.cpu.outputs.matched == 'true'
@@ -58,12 +70,9 @@ jobs:
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
           python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
-      - name: Compare row construction with the previous worker
+      - name: Compare verified durable inserts to SQLite
         if: steps.cpu.outputs.matched == 'true'
-        run: |
-          git worktree add --detach "$RUNNER_TEMP/base" 9f518bd41
-          (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
-          python3 scripts/profile-build-workers.py "$RUNNER_TEMP/base/target/release/lin-peer-worker" target/release/lin-peer-worker > build-workers.json
+        run: python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -75,4 +84,4 @@ jobs:
             duckdb-results.json
             duckdb-summary.txt
             duckdb-provenance.txt
-            build-workers.json
+            wal-full.json
