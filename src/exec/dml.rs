@@ -2502,11 +2502,10 @@ fn run_build_chunks(task: &BuildTask, is_caller: bool) {
             std::slice::from_raw_parts(task.records_ptr as *const Record, task.n)
         };
         let recs = &records[start..end];
+        // Each worker claims a distinct chunk before creating its mutable slice.
         let out = unsafe {
-            &mut std::slice::from_raw_parts_mut(
-                task.out_ptr as *mut std::mem::MaybeUninit<Row>,
-                task.n,
-            )[start..end]
+            let chunk_ptr = (task.out_ptr as *mut std::mem::MaybeUninit<Row>).add(start);
+            std::slice::from_raw_parts_mut(chunk_ptr, end - start)
         };
         let (u, e, l) = build_batch_shape_rows_into(
             out,
