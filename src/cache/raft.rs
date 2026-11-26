@@ -1,12 +1,37 @@
+use std::sync::atomic::Ordering;
+
 use crate::error::Error;
 
 use super::client::send_peer_rpc;
-use super::cluster::{NodeMember, NodeRole, PubSubEvent, RaftCommand, RaftLogEntry};
+use super::cluster::{NodeMember, NodeRole, PubSubEvent, RaftCommand, RaftLogEntry, RaftState};
 use super::protocol::{CacheRequest, CacheResponse};
 use super::server::CacheNode;
 use super::unix_ms;
 
 impl CacheNode {
+    /// Synchronizes `RaftState` with lock-free single-node `raft_log_idx` progress so
+    /// `last_log_index()`, `commit_index`, and `last_applied` stay monotonic across transitions.
+    #[inline]
+    pub(crate) fn sync_raft_atomic_progress(&self, raft: &mut RaftState) {
+        let atomic_idx = self.store.raft_log_idx.load(Ordering::Acquire);
+        let raft_idx = raft.last_log_index();
+        if atomic_idx > raft_idx {
+            if raft.log.is_empty() {
+                raft.base_index = atomic_idx;
+                raft.base_term = raft.current_term;
+            } else if let Some(last) = raft.log.last() {
+                let _ = last;
+                raft.log.clear();
+                raft.base_index = atomic_idx;
+                raft.base_term = raft.current_term;
+            }
+            raft.commit_index = atomic_idx;
+            raft.last_applied = atomic_idx;
+        } else if raft_idx > atomic_idx {
+            self.store.raft_log_idx.store(raft_idx, Ordering::Release);
+        }
+    }
+
     /// Parallel inter-node RPC broadcast: 0 peers = no-op, 1 peer = inline on calling thread,
     /// `K > 1` peers = `K - 1` scoped threads + last peer inline on calling thread.
     pub(crate) fn broadcast_peer_rpc(peers: &[String], rpc: &CacheRequest) {
@@ -48,9 +73,7 @@ impl CacheNode {
         }
     }
 
-    /// Held from reading the current value until the resulting command is applied and
-    /// sent, so concurrent read-modify-write commands cannot overwrite each other and
-    /// peers receive entries in index order.
+    /// Held across multi-node replicated mutations so peers receive entries in strict index order.
     pub(crate) fn mutation_order(&self) -> std::sync::MutexGuard<'_, ()> {
         self.mutation_order
             .lock()
@@ -62,56 +85,72 @@ impl CacheNode {
         self.propose(&order, cmd, true);
     }
 
-    pub(crate) fn propose_and_apply_held(
-        &self,
-        order: &std::sync::MutexGuard<'_, ()>,
-        cmd: RaftCommand,
-    ) {
-        self.propose(order, cmd, true);
-    }
-
     pub(crate) fn propose_raft_only(&self, cmd: RaftCommand) {
         let order = self.mutation_order();
         self.propose(&order, cmd, false);
     }
 
+    pub(crate) fn propose_raft_only_held(
+        &self,
+        order: &std::sync::MutexGuard<'_, ()>,
+        cmd: RaftCommand,
+    ) {
+        self.propose(order, cmd, false);
+    }
+
     fn propose(&self, _order: &std::sync::MutexGuard<'_, ()>, cmd: RaftCommand, apply: bool) {
-        let (entry, prev_idx, prev_term, term, peers) = {
-            let mut st = self.state.write().unwrap();
-            let prev_idx = st.raft.last_log_index();
-            let prev_term = st.raft.last_log_term();
-            let term = st.raft.current_term;
+        let (entry_for_rpc, prev_idx, prev_term, term, idx, peers) = {
+            let mut raft = self.raft.lock().unwrap();
+            self.sync_raft_atomic_progress(&mut raft);
+            let prev_idx = raft.last_log_index();
+            let prev_term = raft.last_log_term();
+            let term = raft.current_term;
             let idx = prev_idx + 1;
-            if apply {
-                st.apply_raft_command(&cmd, self.cfg.max_entries, self.cfg.max_bytes);
-            }
+            self.store.raft_log_idx.store(idx, Ordering::Release);
+
+            let peers: Vec<String> = if self.cfg.raft_replication {
+                let cl = self.cluster.read().unwrap();
+                if cl.members.len() > 1 {
+                    cl.members
+                        .values()
+                        .filter(|m| m.node_id != self.cfg.node_id && m.alive)
+                        .map(|m| m.addr.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             let entry = RaftLogEntry {
                 index: idx,
                 term,
-                command: cmd,
-            };
-            let peers: Vec<String> = if self.cfg.raft_replication && st.members.len() > 1 {
-                st.members
-                    .values()
-                    .filter(|m| m.node_id != self.cfg.node_id && m.alive)
-                    .map(|m| m.addr.clone())
-                    .collect()
-            } else {
-                Vec::new()
+                command: cmd.clone(),
             };
             let entry_for_rpc = if peers.is_empty() {
                 None
             } else {
                 Some(entry.clone())
             };
-            st.raft.log.push(entry);
-            st.raft.commit_index = idx;
-            st.raft.last_applied = idx;
-            st.raft.maybe_compact();
-            (entry_for_rpc, prev_idx, prev_term, term, peers)
+            raft.log.push(entry);
+            raft.commit_index = idx;
+            raft.last_applied = idx;
+            raft.maybe_compact();
+            (entry_for_rpc, prev_idx, prev_term, term, idx, peers)
         };
 
-        let Some(entry) = entry else {
+        if apply {
+            self.store.apply_raft_command(
+                &self.state,
+                &cmd,
+                idx,
+                self.cfg.max_entries,
+                self.cfg.max_bytes,
+            );
+        }
+
+        let Some(entry) = entry_for_rpc else {
             return;
         };
         let rpc = CacheRequest::RaftAppendEntries {
@@ -121,7 +160,7 @@ impl CacheNode {
             prev_log_index: prev_idx,
             prev_log_term: prev_term,
             entries: vec![entry],
-            leader_commit: prev_idx + 1,
+            leader_commit: idx,
         };
         Self::broadcast_peer_rpc(&peers, &rpc);
     }
@@ -133,24 +172,30 @@ impl CacheNode {
         incoming_members: Vec<NodeMember>,
         pubsub_events: Vec<PubSubEvent>,
     ) -> CacheResponse {
-        let mut st = self.state.write().unwrap();
         let now = unix_ms();
+        let (role, term) = {
+            let raft = self.raft.lock().unwrap();
+            (raft.role.clone(), raft.current_term)
+        };
 
-        st.ring.add_node(&sender_id, &sender_addr);
-        st.merge_gossip_members(&self.cfg.node_id, incoming_members, now);
-        self.sync_has_peers(&st);
+        let members = {
+            let mut cl = self.cluster.write().unwrap();
+            cl.ring.add_node(&sender_id, &sender_addr);
+            cl.merge_gossip_members(&self.cfg.node_id, incoming_members, now);
+            self.sync_has_peers(&cl);
+            cl.sync_local_member(&self.cfg.node_id, true, role, term, now);
+            cl.members.values().cloned().collect()
+        };
 
-        // Process incoming Pub/Sub events
-        for ev in pubsub_events {
-            if st.pubsub.mark_seen(ev.id) {
-                st.publish_local(&ev.channel, &ev.payload, &ev.origin_node);
+        if !pubsub_events.is_empty() {
+            let mut ps = self.pubsub.lock().unwrap();
+            for ev in pubsub_events {
+                if ps.mark_seen(ev.id) {
+                    ps.publish_local(&ev.channel, &ev.payload, &ev.origin_node);
+                }
             }
         }
 
-        // Update our own heartbeat in membership table
-        st.sync_local_member(&self.cfg.node_id, true, now);
-
-        let members = st.members.values().cloned().collect();
         CacheResponse::GossipAck {
             node_id: self.cfg.node_id.clone(),
             members,
@@ -164,40 +209,44 @@ impl CacheNode {
         last_log_index: u64,
         last_log_term: u64,
     ) -> CacheResponse {
-        let mut st = self.state.write().unwrap();
-        if term < st.raft.current_term {
+        let mut raft = self.raft.lock().unwrap();
+        self.sync_raft_atomic_progress(&mut raft);
+        if term < raft.current_term {
             return CacheResponse::RaftVoteReply {
-                term: st.raft.current_term,
+                term: raft.current_term,
                 vote_granted: false,
             };
         }
-        if term > st.raft.current_term {
-            st.raft.current_term = term;
-            st.raft.role = NodeRole::Follower;
-            st.raft.voted_for = None;
+        if term > raft.current_term {
+            raft.current_term = term;
+            raft.role = NodeRole::Follower;
+            raft.voted_for = None;
         }
-        let my_last_term = st.raft.last_log_term();
-        let my_last_idx = st.raft.last_log_index();
+        let my_last_term = raft.last_log_term();
+        let my_last_idx = raft.last_log_index();
         let log_ok = last_log_term > my_last_term
             || (last_log_term == my_last_term && last_log_index >= my_last_idx);
-        let can_vote = st
-            .raft
+        let can_vote = raft
             .voted_for
             .as_ref()
             .is_none_or(|v| v == &candidate_id);
 
         if can_vote && log_ok {
             let now = unix_ms();
-            st.raft.voted_for = Some(candidate_id);
-            st.raft.last_leader_contact_ms = now;
-            st.sync_local_member(&self.cfg.node_id, false, now);
+            raft.voted_for = Some(candidate_id);
+            raft.last_leader_contact_ms = now;
+            let cur_term = raft.current_term;
+            let role = raft.role.clone();
+            drop(raft);
+            let mut cl = self.cluster.write().unwrap();
+            cl.sync_local_member(&self.cfg.node_id, false, role, cur_term, now);
             CacheResponse::RaftVoteReply {
-                term: st.raft.current_term,
+                term: cur_term,
                 vote_granted: true,
             }
         } else {
             CacheResponse::RaftVoteReply {
-                term: st.raft.current_term,
+                term: raft.current_term,
                 vote_granted: false,
             }
         }
@@ -213,68 +262,90 @@ impl CacheNode {
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     ) -> CacheResponse {
-        let mut st = self.state.write().unwrap();
-        if term < st.raft.current_term {
-            return CacheResponse::RaftAppendReply {
-                term: st.raft.current_term,
-                success: false,
-                match_index: st.raft.last_log_index(),
-            };
-        }
-
-        let now = unix_ms();
-        st.raft.current_term = term;
-        st.raft.role = NodeRole::Follower;
-        st.ring.add_node(&leader_id, &leader_addr);
-        st.raft.leader_id = Some(leader_id);
-        st.raft.leader_addr = Some(leader_addr);
-        st.raft.last_leader_contact_ms = now;
-        self.sync_has_peers(&st);
-        st.sync_local_member(&self.cfg.node_id, false, now);
-
-        for entry in entries {
-            if entry.index > st.raft.last_log_index() {
-                st.apply_raft_command(&entry.command, self.cfg.max_entries, self.cfg.max_bytes);
-                st.raft.last_applied = entry.index;
-                st.raft.log.push(entry);
+        let _order = self.mutation_order();
+        let (reply_term, match_idx, to_apply) = {
+            let mut raft = self.raft.lock().unwrap();
+            self.sync_raft_atomic_progress(&mut raft);
+            if term < raft.current_term {
+                return CacheResponse::RaftAppendReply {
+                    term: raft.current_term,
+                    success: false,
+                    match_index: raft.last_log_index(),
+                };
             }
+
+            let now = unix_ms();
+            raft.current_term = term;
+            raft.role = NodeRole::Follower;
+            raft.leader_id = Some(leader_id.clone());
+            raft.leader_addr = Some(leader_addr.clone());
+            raft.last_leader_contact_ms = now;
+
+            {
+                let mut cl = self.cluster.write().unwrap();
+                cl.ring.add_node(&leader_id, &leader_addr);
+                self.sync_has_peers(&cl);
+                cl.sync_local_member(&self.cfg.node_id, false, NodeRole::Follower, term, now);
+            }
+
+            let mut to_apply: Vec<(u64, RaftCommand)> = Vec::new();
+            for entry in entries {
+                if entry.index > raft.last_log_index() {
+                    to_apply.push((entry.index, entry.command.clone()));
+                    raft.last_applied = entry.index;
+                    raft.log.push(entry);
+                }
+            }
+            let last_idx = raft.last_log_index();
+            self.store.raft_log_idx.store(last_idx, Ordering::Release);
+            if leader_commit > raft.commit_index {
+                raft.commit_index = leader_commit.min(last_idx);
+            }
+            raft.maybe_compact();
+            (raft.current_term, last_idx, to_apply)
+        };
+
+        for (ver, cmd) in to_apply {
+            self.store.apply_raft_command(
+                &self.state,
+                &cmd,
+                ver,
+                self.cfg.max_entries,
+                self.cfg.max_bytes,
+            );
         }
-        if leader_commit > st.raft.commit_index {
-            st.raft.commit_index = leader_commit.min(st.raft.last_log_index());
-        }
-        st.raft.maybe_compact();
 
         CacheResponse::RaftAppendReply {
-            term: st.raft.current_term,
+            term: reply_term,
             success: true,
-            match_index: st.raft.last_log_index(),
+            match_index: match_idx,
         }
     }
 
     /// Trigger a Raft leader election across known cluster peers.
     pub fn run_leader_election(&self) -> bool {
         let (term, last_idx, last_term, peers, total_nodes) = {
-            let mut st = self.state.write().unwrap();
+            let mut raft = self.raft.lock().unwrap();
+            self.sync_raft_atomic_progress(&mut raft);
             let now = unix_ms();
-            st.raft.current_term += 1;
-            st.raft.role = NodeRole::Candidate;
-            st.raft.voted_for = Some(self.cfg.node_id.clone());
-            let term = st.raft.current_term;
-            st.sync_local_member(&self.cfg.node_id, false, now);
-            let peers: Vec<String> = st
+            raft.current_term += 1;
+            raft.role = NodeRole::Candidate;
+            raft.voted_for = Some(self.cfg.node_id.clone());
+            let term = raft.current_term;
+            let last_idx = raft.last_log_index();
+            let last_term = raft.last_log_term();
+            drop(raft);
+
+            let mut cl = self.cluster.write().unwrap();
+            cl.sync_local_member(&self.cfg.node_id, false, NodeRole::Candidate, term, now);
+            let peers: Vec<String> = cl
                 .members
                 .values()
                 .filter(|m| m.node_id != self.cfg.node_id && m.alive)
                 .map(|m| m.addr.clone())
                 .collect();
-            let total = st.members.values().filter(|m| m.alive).count().max(1);
-            (
-                term,
-                st.raft.last_log_index(),
-                st.raft.last_log_term(),
-                peers,
-                total,
-            )
+            let total = cl.members.values().filter(|m| m.alive).count().max(1);
+            (term, last_idx, last_term, peers, total)
         };
 
         let mut votes = 1usize; // Vote for self
@@ -293,12 +364,21 @@ impl CacheNode {
             }) = res
             {
                 if reply_term > term {
-                    let mut st = self.state.write().unwrap();
                     let now = unix_ms();
-                    st.raft.current_term = reply_term;
-                    st.raft.role = NodeRole::Follower;
-                    st.raft.voted_for = None;
-                    st.sync_local_member(&self.cfg.node_id, false, now);
+                    {
+                        let mut raft = self.raft.lock().unwrap();
+                        raft.current_term = reply_term;
+                        raft.role = NodeRole::Follower;
+                        raft.voted_for = None;
+                    }
+                    let mut cl = self.cluster.write().unwrap();
+                    cl.sync_local_member(
+                        &self.cfg.node_id,
+                        false,
+                        NodeRole::Follower,
+                        reply_term,
+                        now,
+                    );
                     return false;
                 }
                 if vote_granted {
@@ -309,15 +389,21 @@ impl CacheNode {
 
         let won = votes >= quorum;
         if won {
-            let mut st = self.state.write().unwrap();
-            if st.raft.current_term == term {
-                let now = unix_ms();
-                st.raft.role = NodeRole::Leader;
-                st.raft.leader_id = Some(self.cfg.node_id.clone());
-                st.raft.leader_addr = Some(self.cfg.listen_addr.clone());
-                st.sync_local_member(&self.cfg.node_id, false, now);
+            let mut became_leader = false;
+            let now = unix_ms();
+            {
+                let mut raft = self.raft.lock().unwrap();
+                if raft.current_term == term {
+                    raft.role = NodeRole::Leader;
+                    raft.leader_id = Some(self.cfg.node_id.clone());
+                    raft.leader_addr = Some(self.cfg.listen_addr.clone());
+                    became_leader = true;
+                }
             }
-            drop(st);
+            if became_leader {
+                let mut cl = self.cluster.write().unwrap();
+                cl.sync_local_member(&self.cfg.node_id, false, NodeRole::Leader, term, now);
+            }
             // Send immediate heartbeat AppendEntries in parallel to establish leadership
             let hb = CacheRequest::RaftAppendEntries {
                 term,
@@ -336,14 +422,25 @@ impl CacheNode {
     /// Perform one Gossip round with a specific peer address.
     pub fn gossip_once_with(&self, peer_addr: &str) -> Result<(), Error> {
         let req = {
-            let mut st = self.state.write().unwrap();
             let now = unix_ms();
-            st.sync_local_member(&self.cfg.node_id, true, now);
+            let (role, term) = {
+                let raft = self.raft.lock().unwrap();
+                (raft.role.clone(), raft.current_term)
+            };
+            let members: Vec<NodeMember> = {
+                let mut cl = self.cluster.write().unwrap();
+                cl.sync_local_member(&self.cfg.node_id, true, role, term, now);
+                cl.members.values().cloned().collect()
+            };
+            let pubsub_events: Vec<PubSubEvent> = {
+                let ps = self.pubsub.lock().unwrap();
+                ps.recent_outbox.iter().cloned().collect()
+            };
             CacheRequest::GossipSync {
                 sender_id: self.cfg.node_id.clone(),
                 sender_addr: self.cfg.listen_addr.clone(),
-                members: st.members.values().cloned().collect(),
-                pubsub_events: st.pubsub.recent_outbox.iter().cloned().collect(),
+                members,
+                pubsub_events,
             }
         };
 
@@ -353,10 +450,10 @@ impl CacheNode {
             members,
         } = resp
         {
-            let mut st = self.state.write().unwrap();
+            let mut cl = self.cluster.write().unwrap();
             let now = unix_ms();
-            st.merge_gossip_members(&self.cfg.node_id, members, now);
-            self.sync_has_peers(&st);
+            cl.merge_gossip_members(&self.cfg.node_id, members, now);
+            self.sync_has_peers(&cl);
         }
         Ok(())
     }

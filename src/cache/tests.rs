@@ -312,3 +312,193 @@ fn concurrent_read_modify_write_commands_do_not_lose_updates() {
         CacheResponse::Int(total)
     );
 }
+
+#[test]
+fn slab_lru_slot_recycling_second_chance_and_exact_byte_accounting() {
+    use std::sync::atomic::Ordering;
+    use super::store::NUM_SHARDS;
+
+    let cfg = CacheConfig {
+        node_id: "node-slab".to_string(),
+        listen_addr: "127.0.0.1:0".to_string(),
+        max_entries: 128,
+        max_bytes: 64 * 1024 * 1024,
+        vnodes: 32,
+        replication_factor: 1,
+        sharding_enabled: false,
+        raft_replication: false,
+        gossip_interval_ms: 100,
+        node_timeout_ms: 5_000,
+    };
+    let node = CacheNode::new_in_memory(cfg).unwrap();
+
+    // Populate 128 keys, delete half, reinsert 64 new keys on the same shards and verify slab
+    // free-list recycling + exact byte/entry accounting across all data structures.
+    for i in 0..128 {
+        node.execute(CacheRequest::Set {
+            key: format!("k:{i}"),
+            value: format!("val-{i:04}").into_bytes(),
+            ttl_ms: None,
+        });
+    }
+    assert_eq!(node.store.total_entries.load(Ordering::Acquire), 128);
+
+    let peak_slots_before_del: usize = (0..NUM_SHARDS)
+        .map(|s| node.store.stripe(s).lock.read().unwrap().slots.len())
+        .sum();
+    assert_eq!(peak_slots_before_del, 128);
+
+    // Delete all 128 keys and reinsert 128 fresh keys -> total slab slots across shards stays
+    // bounded by recycled free_head slots where shard distribution matches!
+    for i in 0..128 {
+        assert_eq!(
+            node.execute(CacheRequest::Del {
+                keys: vec![format!("k:{i}")],
+            }),
+            CacheResponse::Int(1)
+        );
+    }
+    assert_eq!(node.store.total_entries.load(Ordering::Acquire), 0);
+    assert_eq!(node.store.used_bytes.load(Ordering::Acquire), 0);
+
+    // Reinsert the exact same 128 keys -> every shard reuses its `free_head` slots with 0 growth!
+    for i in 0..128 {
+        node.execute(CacheRequest::Set {
+            key: format!("k:{i}"),
+            value: format!("new-value-{i:06}").into_bytes(),
+            ttl_ms: None,
+        });
+    }
+    let slots_after_reinsert: usize = (0..NUM_SHARDS)
+        .map(|s| node.store.stripe(s).lock.read().unwrap().slots.len())
+        .sum();
+    assert_eq!(slots_after_reinsert, peak_slots_before_del);
+
+    // Exercise in-place mutations (INCRBY, HSET, HDEL, LPUSH, LPOP, SADD, SREM) and verify
+    // global `used_bytes` matches the exact sum of live entries across all 64 shards.
+    node.execute(CacheRequest::FlushAll);
+    assert_eq!(node.store.used_bytes.load(Ordering::Acquire), 0);
+    assert_eq!(node.store.total_entries.load(Ordering::Acquire), 0);
+
+    node.execute(CacheRequest::Set {
+        key: "num".into(),
+        value: b"100".to_vec(),
+        ttl_ms: None,
+    });
+    node.execute(CacheRequest::IncrBy {
+        key: "num".into(),
+        delta: 42,
+    });
+    node.execute(CacheRequest::HSet {
+        key: "h".into(),
+        field: "f1".into(),
+        value: b"alpha".to_vec(),
+    });
+    node.execute(CacheRequest::HSet {
+        key: "h".into(),
+        field: "f1".into(),
+        value: b"alphabet".to_vec(),
+    });
+    node.execute(CacheRequest::HSet {
+        key: "h".into(),
+        field: "f2".into(),
+        value: b"beta".to_vec(),
+    });
+    node.execute(CacheRequest::HDel {
+        key: "h".into(),
+        fields: vec!["f2".into()],
+    });
+    node.execute(CacheRequest::RPush {
+        key: "l".into(),
+        values: vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+    });
+    assert_eq!(
+        node.execute(CacheRequest::LPop { key: "l".into() }),
+        CacheResponse::Bulk(b"one".to_vec())
+    );
+    node.execute(CacheRequest::SAdd {
+        key: "s".into(),
+        members: vec!["x".into(), "y".into(), "z".into()],
+    });
+    node.execute(CacheRequest::SRem {
+        key: "s".into(),
+        members: vec!["y".into()],
+    });
+
+    let mut expected_bytes = 0usize;
+    let mut expected_entries = 0usize;
+    for s in 0..NUM_SHARDS {
+        let sh = node.store.stripe(s).lock.read().unwrap();
+        let mut shard_sum = 0usize;
+        for (k, &slot_idx) in &sh.entries {
+            let occ = sh.occupied(slot_idx);
+            let exact = k.len() + occ.entry.value.estimated_bytes();
+            assert_eq!(occ.entry_bytes, exact);
+            shard_sum += exact;
+            expected_entries += 1;
+        }
+        assert_eq!(sh.used_bytes, shard_sum);
+        expected_bytes += shard_sum;
+    }
+    assert_eq!(node.store.total_entries.load(Ordering::Acquire), expected_entries);
+    assert_eq!(node.store.used_bytes.load(Ordering::Acquire), expected_bytes);
+}
+
+#[test]
+fn sharded_64_concurrent_mixed_reads_writes_and_evictions() {
+    use std::sync::atomic::Ordering;
+    use super::store::NUM_SHARDS;
+
+    let cfg = CacheConfig {
+        node_id: "node-64shard".to_string(),
+        listen_addr: "127.0.0.1:0".to_string(),
+        max_entries: 512,
+        max_bytes: 64 * 1024 * 1024,
+        vnodes: 32,
+        replication_factor: 1,
+        sharding_enabled: false,
+        raft_replication: false,
+        gossip_interval_ms: 100,
+        node_timeout_ms: 5_000,
+    };
+    let node = CacheNode::new_in_memory(cfg).unwrap();
+
+    const THREADS: usize = 8;
+    const OPS: usize = 400;
+    thread::scope(|s| {
+        for t in 0..THREADS {
+            let node = &node;
+            s.spawn(move || {
+                for i in 0..OPS {
+                    let k = format!("stripe:{t}:{i}");
+                    node.execute(CacheRequest::Set {
+                        key: k.clone(),
+                        value: format!("payload-{t}-{i}").into_bytes(),
+                        ttl_ms: if i % 10 == 0 { Some(5_000) } else { None },
+                    });
+                    let _ = node.execute(CacheRequest::Get { key: k });
+                    node.execute(CacheRequest::IncrBy {
+                        key: format!("counter:{}", i % 16),
+                        delta: 1,
+                    });
+                }
+            });
+        }
+    });
+
+    let live_entries = node.store.total_entries.load(Ordering::Acquire);
+    assert!(
+        live_entries <= 512,
+        "expected <= 512 entries after concurrent eviction, got {live_entries}"
+    );
+
+    let mut actual_entries = 0usize;
+    let mut actual_bytes = 0usize;
+    for s in 0..NUM_SHARDS {
+        let sh = node.store.stripe(s).lock.read().unwrap();
+        actual_entries += sh.entries.len();
+        actual_bytes += sh.used_bytes;
+    }
+    assert_eq!(live_entries, actual_entries);
+    assert_eq!(node.store.used_bytes.load(Ordering::Acquire), actual_bytes);
+}
