@@ -146,6 +146,20 @@ fn measure_insert(
             .collect::<Result<Vec<_>, _>>()?;
         #[cfg(target_os = "linux")]
         let before = profile_usage.then(process_usage).transpose()?;
+        #[cfg(target_os = "linux")]
+        let record_pages = |phase: &str| -> std::io::Result<()> {
+            if std::env::var_os("LIN_BENCH_INSERT_SMAPS").is_some() {
+                let rollup = std::fs::read_to_string("/proc/self/smaps_rollup")?;
+                for line in rollup.lines().filter(|line| {
+                    line.starts_with("AnonHugePages:") || line.starts_with("Anonymous:")
+                }) {
+                    eprintln!("insert_pages {phase} {line}");
+                }
+            }
+            Ok(())
+        };
+        #[cfg(target_os = "linux")]
+        record_pages("before")?;
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
@@ -180,6 +194,9 @@ fn measure_insert(
                 "peak_rss_kib": after.ru_maxrss,
             }));
         }
+
+        #[cfg(target_os = "linux")]
+        record_pages("after")?;
 
         if affected != n {
             return Err("insert affected count mismatch".into());
