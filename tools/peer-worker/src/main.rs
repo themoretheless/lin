@@ -19,7 +19,7 @@ fn canonical(rows: &[lin::Row], fields: &[String]) -> Value {
                                 row.get(field)
                             };
                             match cell {
-                                Some(Cell::Text(v)) => json!(v.as_ref()),
+                                Some(cell) if let Some(text) = cell.text() => json!(text),
                                 Some(Cell::Int(v)) | Some(Cell::Time(v)) => json!(v),
                                 Some(Cell::Float(v)) => json!(v),
                                 Some(Cell::Bool(v)) => json!(v),
