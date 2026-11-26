@@ -248,6 +248,19 @@ cargo bench --bench compare -- --profile thorough --tag fts
 cargo bench --bench compare -- --profile thorough --tag phase
 ```
 
+### Большие страницы для пакетной вставки на Linux
+
+На Linux с системным аллокатором glibc можно запросить прозрачные большие страницы (THP) для процесса, который выполняет INSERT. Для воспроизведения замера WAL/FULL на 1k и 10k соберите release-версию и запустите сравнение из корня проекта.
+
+```sh
+cargo build --locked --release -p lin-peer-worker
+env GLIBC_TUNABLES=glibc.malloc.hugetlb=1 python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full-thp.json
+```
+
+Python с SQLite и дочерний процесс Lin наследуют одну настройку. Для замера по умолчанию запустите тот же скрипт через `env -u GLIBC_TUNABLES` и укажите другой выходной JSON. Для приложения на базе Lin задайте параметр в окружении исполняемого процесса до его запуска. Если приложение использует другие параметры `GLIBC_TUNABLES`, сохраните их в списке через двоеточие. Фактическое выделение больших страниц зависит от поддержки glibc и политики ядра.
+
+На двух EPYC 9V74 медиана Lin для WAL/FULL на 10k снизилась с 24,55 до 16,98 мс и с 28,06 до 19,86 мс. На ARM64 Neoverse N2 — с 15,38 до 13,17 мс. В отдельном профиле первого INSERT на 100k у EPYC 7763 пиковая резидентная память выросла примерно на 7–8 МиБ. [Парные замеры WAL/FULL](benches/results/2026-11-26-sqlite-wal-full.md) · [Замеры первого INSERT и памяти](benches/results/2026-11-26-duckdb-paired-insert.md)
+
 ### CI
 
 Workflow [`.github/workflows/bench.yml`](.github/workflows/bench.yml) на `push`/`pull_request` → `main`: `--profile quick`, без Docker. В отчёте Lin / SQLite / DuckDB / HashMap; Postgres и MySQL пропускаются без серверов. FTS query cases включены; диагностические `*phase*` и шумные durable/cold/wal/reopen cases исключены. После прогона `scripts/check-bench-budget.py` требует победу Lin над SQLite и DuckDB в том же запуске на `point_get` / `filter_eq` / `join_inner`; отсутствие измерения, проигрыш или ничья — ошибка. Исторические числа [`benches/ci-baseline.json`](benches/ci-baseline.json) сохраняют **warn** >1.5× и **fail** >3× только при совпадении OS/architecture. На другой платформе они выводятся как справка. Это шесть peer-сравнений одного CI-процесса, а не полная восьми-peer квалификация; совпадение OS/architecture не гарантирует одинаковое железо.
