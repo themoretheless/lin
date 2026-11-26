@@ -78,3 +78,5 @@ Revision 8950abf0a, macOS ARM64, SQLite 3.54.1. Four blocks cover all six proces
 |---:|---:|---:|---:|---:|
 | 1000 | 1.365 | 1.636 | -0.256 | 20/24 |
 | 10000 | 6.915 | 15.434 | -8.649 | 24/24 |
+
+On the same M4 Max, compare candidate 8950abf0a directly with Lin baseline 28d181d78. Each of 24 pairs per size alternated process order, used a fresh durable database for each binary, and checked every row after reopening. Median paired candidate minus baseline was −0.030 ms at 1k (14/24 wins) and +0.020 ms at 10k (11/24 wins). This comparison provides no consistent durable latency win.
