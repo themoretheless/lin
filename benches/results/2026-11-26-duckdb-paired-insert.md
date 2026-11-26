@@ -320,3 +320,19 @@ Candidate 8950abf0a also removed the destination reserve on an empty collection.
 The revised candidate lost all 50 default first 100k pairs on the two 9V74 hosts. It won all 400 THP pairs. Against the Lin baseline the first 10k improved on all four hosts (25/32 wins), but first 100k on ARM64 slowed by a paired median of 1.747 ms (3/8 wins). Both changes were withdrawn.
 
 [First candidate](https://github.com/themoretheless/lin/actions/runs/45830890614) and [revised candidate](https://github.com/themoretheless/lin/actions/runs/45831180568).
+
+## Eight builders on four Linux x64 vCPUs
+
+Withdraw candidate 2aea0f92b. On two EPYC 7763 hosts it lost all 16 first 100k pairs against the four-builder baseline. Median paired slowdowns were 21.69 and 19.17 ms. System CPU increased by 56.22 and 48.67 ms summed across threads, and involuntary context switches increased by 126 and 119.5. Minor faults increased by a median of only 24.5 per host. The ARM64 configuration remained at four builders.
+
+Median paired Lin minus DuckDB latency in milliseconds, default / transparent huge pages:
+
+| Host | First 10k | Repeat 10k | First 100k | Repeat 100k |
+|---|---:|---:|---:|---:|
+| EPYC 7763 amd-1 | +1.30 / −5.26 | −8.40 / −8.96 | +45.33 / −10.47 | −67.93 / −73.16 |
+| EPYC 7763 amd-4 | +1.15 / −5.33 | −8.85 / −9.04 | +43.94 / −8.08 | −68.91 / −75.60 |
+| Neoverse-N2 | −13.46 / −15.65 | −18.84 / −18.58 | −114.06 / −142.19 | −154.86 / −156.67 |
+
+All eight THP losses in 300 comparisons occurred on first inserts on EPYC: one at 10k and seven at 100k.
+
+[Paired timings and process counters](https://github.com/themoretheless/lin/actions/runs/45833579837)
