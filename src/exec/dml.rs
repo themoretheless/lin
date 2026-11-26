@@ -1207,10 +1207,14 @@ impl Db {
         };
         let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
-        // Any record without an explicit id gets a generated one, wherever it sits in the
-        // batch (deciding from the first record left later id-less rows without an id).
-        let needs_id = records.is_empty()
-            || records
+        // A uniform batch has the same source fields in every record.
+        let id_check_records = if all_uniform {
+            &records[..1]
+        } else {
+            records
+        };
+        let needs_id = id_check_records.is_empty()
+            || id_check_records
                 .iter()
                 .any(|r| !r.fields.iter().any(|(k, _)| k == "id"));
         self.insert_bulk_built(
