@@ -448,7 +448,7 @@ impl Row {
     /// Shape for a set of field names (any order, duplicates ignored); pair with
     /// [`Row::from_parts`] to build many rows without per-row name handling.
     pub fn shape_of<S: AsRef<str>>(names: &[S]) -> Arc<Shape> {
-        let mut sorted: SmallVec<[&str; 12]> = names.iter().map(AsRef::as_ref).collect();
+        let mut sorted: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
         sorted.sort_unstable();
         sorted.dedup();
         Shape::of_sorted(sorted.into_iter())

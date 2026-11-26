@@ -208,3 +208,9 @@ Six fresh processes per setting and host from the allocator experiment at 16cc0d
 | Neoverse-N2 arm64 | 102.0 / 73.5 | 194.4 / 111.9 | 120.1 / 106.7 | 91285.5 / 38576.0 | 546.1 / 552.9 |
 
 [Raw resource samples and host details](https://github.com/themoretheless/lin/actions/runs/45767474001)
+
+## Inline temporary shape buffers
+
+Candidate 417c1fc8d won 17 of 32 first-100k pairs against d922ce2a8. On the second EPYC 7763 it slowed first 100k by a paired median 2.29 ms and repeat 100k by 3.28 ms. ARM64 repeat 100k slowed by 1.34 ms. The candidate was withdrawn. Against DuckDB, EPYC default first-100k margins were losses of 24.85, 27.74 and 34.59 ms. Lin won 399 of 400 THP pairs, with a single first-10k loss on the first 7763.
+
+[Raw samples and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45821850933)
