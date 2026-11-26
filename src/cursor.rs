@@ -863,6 +863,9 @@ fn try_disk_join(db: &CursorDb<'_>, q: &Query) -> Option<DiskJoinCursor> {
         return None;
     };
     let (store, catalog) = db.store_catalog();
+    if !store.is_disk_backed(name) {
+        return None;
+    }
     let mut filter: Option<&Pred> = None;
     let mut join: Option<(bool, &str, &str)> = None;
     let mut project: Option<Vec<String>> = None;
@@ -889,9 +892,6 @@ fn try_disk_join(db: &CursorDb<'_>, q: &Query) -> Option<DiskJoinCursor> {
         }
     }
     let (left_join, right_col, on) = join?;
-    if !store.is_disk_backed(name) {
-        return None;
-    }
     let to_field = catalog
         .find_fk(name, on, right_col)
         .map(|fk| fk.to_field.as_str())
@@ -1069,7 +1069,10 @@ impl UserProbe<'_> {
     }
 }
 
-/// Columnar left + user-index probe; emits compact 3-field rows.
+const SOA_JOIN_BATCH: usize = 64;
+const UNMATCHED_USER_IDX: u32 = u32::MAX;
+
+/// Columnar left + user-index probe with 64-row resolved prefetch batching; emits compact 3-field rows.
 struct LazyJoinSoa<'a> {
     source: RowSource,
     pos: usize,
@@ -1083,10 +1086,18 @@ struct LazyJoinSoa<'a> {
     /// Fallback rows behind the SoA buffers (only consulted when `orders_total_tag` == `2`).
     orders_rows: &'a [Row],
     total_slot: crate::store::row::FieldSlot<'static>,
+    users_id: &'a [Arc<str>],
     users_email: &'a [Arc<str>],
+    unique_users: bool,
     probe: UserProbe<'a>,
     skip_left: usize,
     take_left: Option<usize>,
+    out_shape: Arc<crate::store::RowShape>,
+    proj_fields: Arc<[String]>,
+    buf_idx: [u32; SOA_JOIN_BATCH],
+    buf_ui: [u32; SOA_JOIN_BATCH],
+    buf_pos: u8,
+    buf_len: u8,
 }
 
 enum RowSource {
@@ -1194,9 +1205,19 @@ impl<'a> QueryCursor<'a> {
 
     /// Pull a compact projected row. Projection schemas are shared across rows;
     /// non-projected or buffered plans fall back to converting the regular row.
+    #[inline]
     pub fn next_projected(&mut self) -> Option<Result<ProjectedRow, Error>> {
-        let native = matches!(&self.state, CursorState::Lazy(lazy) if lazy.project.is_some())
-            || matches!(self.state, CursorState::LazyJoinSoa(_));
+        if let CursorState::LazyJoinSoa(join) = &mut self.state {
+            let item = next_lazy_join_soa_projected(join);
+            if item.is_none() {
+                self.state = CursorState::Done;
+            }
+            return item;
+        }
+        if matches!(self.state, CursorState::Done) {
+            return None;
+        }
+        let native = matches!(&self.state, CursorState::Lazy(lazy) if lazy.project.is_some());
         #[cfg(feature = "gpu")]
         let native = native
             || matches!(&self.state, CursorState::GpuStream(stream) if stream.project.is_some());
@@ -1219,7 +1240,6 @@ impl<'a> QueryCursor<'a> {
                 })
             }),
             CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
-            CursorState::LazyJoinSoa(join) => next_lazy_join_soa_projected(join),
             _ => unreachable!("native projected state checked above"),
         };
         if item.is_none() {
@@ -1237,7 +1257,15 @@ impl<'a> QueryCursor<'a> {
 impl Iterator for QueryCursor<'_> {
     type Item = Result<Row, Error>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        if let CursorState::LazyJoinSoa(join) = &mut self.state {
+            let item = next_lazy_join_soa(join);
+            if item.is_none() {
+                self.state = CursorState::Done;
+            }
+            return item;
+        }
         if matches!(self.state, CursorState::Done) {
             return None;
         }
@@ -1258,7 +1286,6 @@ impl Iterator for QueryCursor<'_> {
             CursorState::DiskIds(ids) => next_disk_ids(store, ids),
             CursorState::DiskJoin(join) => next_disk_join(store, join),
             CursorState::LazyJoin(join) => next_lazy_join(store, join),
-            CursorState::LazyJoinSoa(join) => next_lazy_join_soa(join),
             _ => None,
         };
 
@@ -1270,8 +1297,8 @@ impl Iterator for QueryCursor<'_> {
 }
 
 fn next_lazy(store: &Store, lazy: &mut LazyCursor) -> Option<Result<Row, Error>> {
-    let idx = next_lazy_match_idx(store, lazy)?;
-    let row = store.get_by_idx(&lazy.collection, idx)?;
+    let rows = store.collection(&lazy.collection);
+    let row = next_lazy_match_row(rows, lazy)?;
     let out = if let Some(proj) = lazy.projector.as_mut() {
         proj.project(row)
     } else {
@@ -1285,8 +1312,8 @@ fn next_lazy_projected(
     store: &Store,
     lazy: &mut LazyCursor,
 ) -> Option<Result<ProjectedRow, Error>> {
-    let idx = next_lazy_match_idx(store, lazy)?;
-    let row = store.get_by_idx(&lazy.collection, idx)?;
+    let rows = store.collection(&lazy.collection);
+    let row = next_lazy_match_row(rows, lazy)?;
     let fields = Arc::clone(lazy.project.as_ref().expect("projected state checked"));
     let cells = match lazy.projector.as_mut() {
         Some(proj) => proj.project_cells(row),
@@ -1299,7 +1326,7 @@ fn next_lazy_projected(
 }
 
 #[inline]
-fn next_lazy_match_idx(store: &Store, lazy: &mut LazyCursor) -> Option<usize> {
+fn next_lazy_match_row<'s>(rows: &'s [Row], lazy: &mut LazyCursor) -> Option<&'s Row> {
     loop {
         if lazy.take_left == Some(0) {
             return None;
@@ -1322,7 +1349,7 @@ fn next_lazy_match_idx(store: &Store, lazy: &mut LazyCursor) -> Option<usize> {
                 i
             }
         };
-        let Some(row) = store.get_by_idx(&lazy.collection, idx) else {
+        let Some(row) = rows.get(idx) else {
             continue;
         };
         if lazy.need_filter
@@ -1338,7 +1365,7 @@ fn next_lazy_match_idx(store: &Store, lazy: &mut LazyCursor) -> Option<usize> {
         if let Some(t) = lazy.take_left.as_mut() {
             *t = t.saturating_sub(1);
         }
-        return Some(idx);
+        return Some(row);
     }
 }
 
@@ -1584,6 +1611,7 @@ fn next_lazy_join(store: &Store, join: &mut LazyJoinCursor) -> Option<Result<Row
 /// Pull next matching left row by reference without cloning or projecting prematurely.
 #[inline]
 fn next_lazy_raw_ref<'s>(store: &'s Store, lazy: &mut LazyCursor) -> Option<&'s Row> {
+    let rows = store.collection(&lazy.collection);
     loop {
         let idx = match &lazy.source {
             RowSource::Idxs(idxs) => {
@@ -1603,7 +1631,7 @@ fn next_lazy_raw_ref<'s>(store: &'s Store, lazy: &mut LazyCursor) -> Option<&'s 
                 i
             }
         };
-        let Some(row) = store.get_by_idx(&lazy.collection, idx) else {
+        let Some(row) = rows.get(idx) else {
             continue;
         };
         if lazy.need_filter
@@ -2229,117 +2257,269 @@ fn collect_seed_keys_arc(
     }
 }
 
+#[inline(always)]
+fn resolve_user_idx(
+    uid: &str,
+    users_id: &[Arc<str>],
+    unique_users: bool,
+    probe: &FxHashMap<Arc<str>, usize>,
+) -> Option<usize> {
+    if unique_users {
+        let b = uid.as_bytes();
+        if b.first() == Some(&b'u') {
+            let digits = if b.get(1) == Some(&b'-') {
+                &b[2..]
+            } else {
+                &b[1..]
+            };
+            if !digits.is_empty() && digits.len() <= 9 {
+                let mut val = 0usize;
+                let mut all_digits = true;
+                for &d in digits {
+                    let dig = d.wrapping_sub(b'0');
+                    if dig > 9 {
+                        all_digits = false;
+                        break;
+                    }
+                    val = val * 10 + dig as usize;
+                }
+                if all_digits {
+                    if let Some(id_at) = users_id.get(val)
+                        && id_at.as_ref() == uid
+                    {
+                        return Some(val);
+                    }
+                    if val > 0
+                        && let Some(id_prev) = users_id.get(val - 1)
+                        && id_prev.as_ref() == uid
+                    {
+                        return Some(val - 1);
+                    }
+                }
+            }
+        }
+    }
+    probe.get(uid).copied()
+}
+
+#[inline(always)]
+fn inline_cells3(c0: Cell, c1: Cell, c2: Cell) -> SmallVec<[Cell; 4]> {
+    let mut cells = SmallVec::<[Cell; 4]>::from_buf([c0, c1, c2, Cell::Null]);
+    cells.truncate(3);
+    cells
+}
+
 impl<'a> LazyJoinSoa<'a> {
-    #[inline]
-    fn next_matched(&mut self) -> Option<(&'a Arc<str>, Cell, Option<&'a Arc<str>>)> {
+    #[inline(never)]
+    fn refill_batch(&mut self) -> bool {
+        if self.take_left == Some(0) {
+            return false;
+        }
+        let max_emit = self
+            .take_left
+            .map_or(SOA_JOIN_BATCH, |t| t.min(SOA_JOIN_BATCH));
         let probe = self.probe.map();
         let n = self.orders_id.len();
+        let users_id = self.users_id;
+        let unique_users = self.unique_users;
+        let orders_uid = self.orders_uid;
+        let orders_total = self.orders_total;
+        debug_assert_eq!(n, orders_uid.len());
+        debug_assert_eq!(n, orders_total.len());
 
-        loop {
-            if self.take_left == Some(0) {
-                return None;
-            }
-            let idx = match &self.source {
-                RowSource::Idxs(idxs) => {
-                    if self.pos >= idxs.len() {
-                        return None;
+        let mut k = 0usize;
+
+        match (&self.source, self.skip_left == 0, self.left_join, self.total_gt) {
+            (RowSource::Scan { len }, true, false, None) => {
+                let end = (*len).min(n);
+                let mut pos = self.pos;
+                while pos < end && k < max_emit {
+                    // SAFETY: `pos < end <= n == orders_uid.len()`.
+                    let uid = unsafe { orders_uid.get_unchecked(pos).as_ref() };
+                    pos += 1;
+                    if let Some(ui) = resolve_user_idx(uid, users_id, unique_users, probe) {
+                        self.buf_idx[k] = (pos - 1) as u32;
+                        self.buf_ui[k] = ui as u32;
+                        k += 1;
                     }
-                    let i = idxs[self.pos];
-                    self.pos += 1;
-                    i
                 }
-                RowSource::Scan { len } => {
-                    if self.pos >= *len {
-                        return None;
+                self.pos = pos;
+            }
+            (RowSource::Scan { len }, true, false, Some(min)) => {
+                let end = (*len).min(n);
+                let mut pos = self.pos;
+                while pos < end && k < max_emit {
+                    // SAFETY: `pos < end <= n == orders_total.len() == orders_uid.len()`.
+                    let total = unsafe { *orders_total.get_unchecked(pos) };
+                    let idx = pos;
+                    pos += 1;
+                    if !(total > min) {
+                        continue;
                     }
-                    let i = self.pos;
-                    self.pos += 1;
-                    i
+                    let uid = unsafe { orders_uid.get_unchecked(idx).as_ref() };
+                    if let Some(ui) = resolve_user_idx(uid, users_id, unique_users, probe) {
+                        self.buf_idx[k] = idx as u32;
+                        self.buf_ui[k] = ui as u32;
+                        k += 1;
+                    }
                 }
-            };
-            if idx >= n {
-                continue;
+                self.pos = pos;
             }
-            debug_assert_eq!(self.orders_id.len(), self.orders_uid.len());
-            debug_assert_eq!(self.orders_id.len(), self.orders_total.len());
-            // SAFETY: `LazyJoinSoa` is constructed only after `orders_soa_ready()`;
-            // `idx < orders_id.len()` was checked above, and `'a` borrows the immutable `Store`.
-            let (order_id, uid, total) = unsafe {
-                (
-                    self.orders_id.get_unchecked(idx),
-                    self.orders_uid.get_unchecked(idx).as_ref(),
-                    *self.orders_total.get_unchecked(idx),
-                )
-            };
-            if let Some(min) = self.total_gt
-                && total.partial_cmp(&min) != Some(std::cmp::Ordering::Greater)
-            {
-                continue;
+            _ => {
+                loop {
+                    if k >= max_emit {
+                        break;
+                    }
+                    let idx = match &self.source {
+                        RowSource::Idxs(idxs) => {
+                            if self.pos >= idxs.len() {
+                                break;
+                            }
+                            let i = idxs[self.pos];
+                            self.pos += 1;
+                            i
+                        }
+                        RowSource::Scan { len } => {
+                            if self.pos >= *len {
+                                break;
+                            }
+                            let i = self.pos;
+                            self.pos += 1;
+                            i
+                        }
+                    };
+                    if idx >= n {
+                        continue;
+                    }
+                    // SAFETY: `idx < n == orders_uid.len() == orders_total.len()`.
+                    let (uid, total) = unsafe {
+                        (
+                            orders_uid.get_unchecked(idx).as_ref(),
+                            *orders_total.get_unchecked(idx),
+                        )
+                    };
+                    if let Some(min) = self.total_gt
+                        && !(total > min)
+                    {
+                        continue;
+                    }
+                    let right = resolve_user_idx(uid, users_id, unique_users, probe);
+                    if right.is_none() && !self.left_join {
+                        continue;
+                    }
+                    if self.skip_left > 0 {
+                        self.skip_left -= 1;
+                        continue;
+                    }
+                    self.buf_idx[k] = idx as u32;
+                    self.buf_ui[k] = match right {
+                        Some(ui) => ui as u32,
+                        None => UNMATCHED_USER_IDX,
+                    };
+                    k += 1;
+                }
             }
-            let right = probe.get(uid).copied();
-            if right.is_none() && !self.left_join {
-                continue;
-            }
-            if self.skip_left > 0 {
-                self.skip_left -= 1;
-                continue;
-            }
-            if let Some(t) = self.take_left.as_mut() {
-                *t = t.saturating_sub(1);
-            }
-            // SAFETY: probe indices point into aligned `users_email` after `users_soa_ready()`.
-            let email = right.map(|ui| {
-                debug_assert!(ui < self.users_email.len());
-                unsafe { self.users_email.get_unchecked(ui) }
-            });
-            let total = crate::exec::order_total_cell(
-                &mut self.total_slot,
-                self.orders_rows,
-                self.orders_total,
-                self.orders_total_tag,
-                idx,
-            );
-            return Some((order_id, total, email));
+        }
+
+        if k == 0 {
+            return false;
+        }
+        if let Some(t) = self.take_left.as_mut() {
+            *t = t.saturating_sub(k);
+        }
+        self.buf_pos = 0;
+        self.buf_len = k as u8;
+        true
+    }
+
+    #[inline(always)]
+    fn pop_pair(&mut self) -> Option<(usize, u32)> {
+        if self.buf_pos >= self.buf_len && !self.refill_batch() {
+            return None;
+        }
+        let p = self.buf_pos as usize;
+        self.buf_pos += 1;
+        // SAFETY: `p < self.buf_len <= SOA_JOIN_BATCH`.
+        unsafe {
+            Some((
+                *self.buf_idx.get_unchecked(p) as usize,
+                *self.buf_ui.get_unchecked(p),
+            ))
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn total_cell_fallback(&mut self, idx: usize) -> Cell {
+        crate::exec::order_total_cell(
+            &mut self.total_slot,
+            self.orders_rows,
+            self.orders_total,
+            self.orders_total_tag,
+            idx,
+        )
+    }
+
+    #[inline(always)]
+    fn total_cell_at(&mut self, idx: usize) -> Cell {
+        // SAFETY: `idx < self.orders_id.len() == self.orders_total.len()`.
+        let total = unsafe { *self.orders_total.get_unchecked(idx) };
+        match self.orders_total_tag.get(idx).copied() {
+            Some(1) => Cell::Float(total),
+            Some(0) => Cell::Int(total as i64),
+            _ => self.total_cell_fallback(idx),
         }
     }
 }
 
+#[inline]
 fn next_lazy_join_soa(join: &mut LazyJoinSoa<'_>) -> Option<Result<Row, Error>> {
-    let (order_id, total, email) = join.next_matched()?;
+    let (idx, ui) = join.pop_pair()?;
+    let total = join.total_cell_at(idx);
+    // SAFETY: `idx < orders_id.len()` and `ui < users_email.len()` (when `!= UNMATCHED_USER_IDX`)
+    // were validated when filling `buf_idx` / `buf_ui`.
+    let id_cell = cell_from_arc_inline(unsafe { join.orders_id.get_unchecked(idx) });
+    let email_cell = if ui == UNMATCHED_USER_IDX {
+        Cell::Null
+    } else {
+        debug_assert!((ui as usize) < join.users_email.len());
+        cell_from_arc_inline(unsafe { join.users_email.get_unchecked(ui as usize) })
+    };
     // Sorted key order: "id" < "total" < "users.email".
     let row = Row::from_parts(
-        Arc::clone(soa_join_shape()),
-        [
-            cell_from_arc_inline(order_id),
-            total,
-            match email {
-                Some(e) => cell_from_arc_inline(e),
-                None => Cell::Null,
-            },
-        ],
+        Arc::clone(&join.out_shape),
+        [id_cell, total, email_cell],
     );
     Some(Ok(row))
 }
 
 #[inline]
 fn next_lazy_join_soa_projected(join: &mut LazyJoinSoa<'_>) -> Option<Result<ProjectedRow, Error>> {
-    let (order_id, total, email) = join.next_matched()?;
-    let cells = smallvec![
-        cell_from_arc_inline(order_id),
-        match email {
-            Some(e) => cell_from_arc_inline(e),
-            None => Cell::Null,
-        },
-        total,
-    ];
+    let (idx, ui) = join.pop_pair()?;
+    let total = join.total_cell_at(idx);
+    // SAFETY: `idx < orders_id.len()` and `ui < users_email.len()` (when `!= UNMATCHED_USER_IDX`)
+    // were validated when filling `buf_idx` / `buf_ui`.
+    let id_cell = cell_from_arc_inline(unsafe { join.orders_id.get_unchecked(idx) });
+    let email_cell = if ui == UNMATCHED_USER_IDX {
+        Cell::Null
+    } else {
+        debug_assert!((ui as usize) < join.users_email.len());
+        cell_from_arc_inline(unsafe { join.users_email.get_unchecked(ui as usize) })
+    };
     Some(Ok(ProjectedRow {
-        fields: Arc::clone(soa_join_fields()),
-        cells,
+        fields: Arc::clone(&join.proj_fields),
+        cells: inline_cells3(id_cell, email_cell, total),
     }))
 }
 
-fn is_orders_users_id_email_total(fields: &[String]) -> bool {
-    fields.len() == 3 && fields[0] == "id" && fields[1] == "users.email" && fields[2] == "total"
+fn is_orders_users_id_email_total_fields(fields: &[Field]) -> bool {
+    fields.len() == 3
+        && fields[0].leaf() == Some("id")
+        && ((fields[1].parts.len() == 2
+            && fields[1].parts[0] == "users"
+            && fields[1].parts[1] == "email")
+            || fields[1].leaf() == Some("users.email"))
+        && fields[2].leaf() == Some("total")
 }
 
 fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoinSoa<'a>>, Error> {
@@ -2352,7 +2532,7 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
 
     let mut filter: Option<&Pred> = None;
     let mut join: Option<(bool, &str, &str)> = None;
-    let mut project: Option<Vec<String>> = None;
+    let mut project: Option<&[Field]> = None;
     let mut skip_n: usize = 0;
     let mut take_n: Option<Option<i64>> = None;
     let mut saw_take = false;
@@ -2378,7 +2558,7 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
                 if project.is_some() {
                     return Ok(None);
                 }
-                project = Some(field_names(f));
+                project = Some(f.as_slice());
             }
             Step::Skip { n } if saw_join => {
                 skip_n = skip_n.saturating_add((*n).max(0) as usize);
@@ -2403,10 +2583,10 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
     if right_col != "users" || on != "user_id" {
         return Ok(None);
     }
-    let Some(fields) = project.as_ref() else {
+    let Some(fields) = project else {
         return Ok(None);
     };
-    if !is_orders_users_id_email_total(fields) {
+    if !is_orders_users_id_email_total_fields(fields) {
         return Ok(None);
     }
 
@@ -2440,19 +2620,23 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
     let users_id = store.users_id();
     let users_email = store.users_email();
     let n = orders_id.len();
+    if n > u32::MAX as usize || users_email.len() >= UNMATCHED_USER_IDX as usize {
+        return Ok(None);
+    }
     let source = RowSource::Scan { len: n };
 
-    let probe = if let Some(by_id) = store.by_id.get("users")
+    let (probe, unique_users) = if let Some(by_id) = store.by_id.get("users")
         && by_id.len() == users_id.len()
     {
-        UserProbe::Borrowed(by_id)
+        (UserProbe::Borrowed(by_id), true)
     } else {
         let mut map: FxHashMap<Arc<str>, usize> = FxHashMap::default();
         map.reserve(users_id.len());
         for (i, id) in users_id.iter().enumerate() {
             map.insert(Arc::clone(id), i);
         }
-        UserProbe::Owned(map)
+        let uniq = map.len() == users_id.len();
+        (UserProbe::Owned(map), uniq)
     };
 
     Ok(Some(LazyJoinSoa {
@@ -2466,10 +2650,18 @@ fn try_lazy_join_soa<'a>(db: &CursorDb<'a>, q: &Query) -> Result<Option<LazyJoin
         orders_total_tag: store.orders_total_tag(),
         orders_rows: store.collection("orders"),
         total_slot: crate::store::row::FieldSlot::new("total"),
+        users_id,
         users_email,
+        unique_users,
         probe,
         skip_left: skip_n,
         take_left,
+        out_shape: Arc::clone(soa_join_shape()),
+        proj_fields: Arc::clone(soa_join_fields()),
+        buf_idx: [0; SOA_JOIN_BATCH],
+        buf_ui: [0; SOA_JOIN_BATCH],
+        buf_pos: 0,
+        buf_len: 0,
     }))
 }
 
@@ -2834,4 +3026,78 @@ fn collect_gpu_seed_keys(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod soa_batch_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_join_soa_64_batch_matches_run_across_boundaries() {
+        let mut db = Db::empty();
+        let mut u_stmt = String::from("insert users [");
+        for i in 0..40 {
+            if i > 0 {
+                u_stmt.push(',');
+            }
+            let uid = if i < 30 {
+                format!("u-{i}")
+            } else {
+                format!("custom_{i}")
+            };
+            u_stmt.push_str(&format!(r#"{{ id: "{uid}", email: "e{i}@x.dev" }}"#));
+        }
+        u_stmt.push(']');
+        db.run(&u_stmt).unwrap();
+
+        let mut o_stmt = String::from("insert orders [");
+        for i in 0..210 {
+            if i > 0 {
+                o_stmt.push(',');
+            }
+            let total = (i % 150) as f64 + 0.5;
+            if i % 17 == 0 {
+                o_stmt.push_str(&format!(r#"{{ id: "o-{i}", total: {total} }}"#));
+            } else {
+                let uid = if i % 5 == 0 {
+                    format!("custom_{}", 30 + (i % 10))
+                } else {
+                    format!("u-{}", i % 30)
+                };
+                o_stmt.push_str(&format!(
+                    r#"{{ id: "o-{i}", user_id: "{uid}", total: {total} }}"#
+                ));
+            }
+        }
+        o_stmt.push(']');
+        db.run(&o_stmt).unwrap();
+
+        let cases = [
+            r#"orders | join users on user_id | { id, users.email, total } | take all"#,
+            r#"orders | total > 75.0 | join users on user_id | { id, users.email, total } | take all"#,
+            r#"orders | join left users on user_id | { id, users.email, total } | take all"#,
+            r#"orders | join users on user_id | { id, users.email, total } | skip 70 | take 80"#,
+            r#"orders | join left users on user_id | { id, users.email, total } | skip 10 | take 5"#,
+        ];
+
+        for src in cases {
+            let want = db.run(src).unwrap().rows.clone();
+            let Stmt::Query(q) = crate::parse(src).unwrap() else {
+                unreachable!()
+            };
+            let cur = db.cursor(&q).unwrap();
+            assert!(matches!(cur.state, CursorState::LazyJoinSoa(_)), "{src}");
+            let got_rows: Vec<Row> = cur.map(|r| r.unwrap()).collect();
+            assert_eq!(got_rows, want, "row cursor mismatch for {src}");
+
+            let mut pcur = db.cursor(&q).unwrap();
+            let mut got_proj = Vec::new();
+            while let Some(pr) = pcur.next_projected() {
+                let pr = pr.unwrap();
+                assert_eq!(pr.fields(), &["id", "users.email", "total"]);
+                got_proj.push(pr.into_row());
+            }
+            assert_eq!(got_proj, want, "projected cursor mismatch for {src}");
+        }
+    }
 }

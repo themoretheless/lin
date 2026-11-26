@@ -756,90 +756,60 @@ impl Column {
         }
     }
 
+    #[inline]
     pub(crate) fn gather(&self, indices: &[u32]) -> Self {
+        self.gather_u32(indices)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn gather_u32(&self, indices: &[u32]) -> Column {
         let n = indices.len();
+        if n == 0 {
+            return match self {
+                Column::Nulls { .. } => Column::Nulls { n: 0, cap: 0 },
+                Column::Int { .. } => Column::Int {
+                    vals: Vec::new(),
+                    valid: Validity::all_valid(0),
+                },
+                Column::Time { .. } => Column::Time {
+                    vals: Vec::new(),
+                    valid: Validity::all_valid(0),
+                },
+                Column::Float { .. } => Column::Float {
+                    vals: Vec::new(),
+                    valid: Validity::all_valid(0),
+                },
+                Column::Bool { .. } => Column::Bool {
+                    vals: Vec::new(),
+                    valid: Validity::all_valid(0),
+                },
+                Column::Text { .. } => Column::new_text_with_capacity(0, 0),
+                Column::Dict { .. } => Column::Dict {
+                    values: Vec::new(),
+                    codes: Vec::new(),
+                    valid: Validity::all_valid(0),
+                },
+                Column::Cells(_) => Column::Cells(Vec::new()),
+            };
+        }
         match self {
             Column::Nulls { .. } => Column::Nulls { n, cap: n },
-            Column::Int { vals, valid } => {
-                if valid.null_count() == 0 {
-                    Column::Int {
-                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
-                        valid: Validity::all_valid(n),
-                    }
-                } else {
-                    let mut out_vals = Vec::with_capacity(n);
-                    let mut out_valid = Validity::default();
-                    for &i in indices {
-                        let idx = i as usize;
-                        out_vals.push(vals[idx]);
-                        out_valid.push(valid.is_valid(idx));
-                    }
-                    Column::Int {
-                        vals: out_vals,
-                        valid: out_valid,
-                    }
-                }
-            }
-            Column::Time { vals, valid } => {
-                if valid.null_count() == 0 {
-                    Column::Time {
-                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
-                        valid: Validity::all_valid(n),
-                    }
-                } else {
-                    let mut out_vals = Vec::with_capacity(n);
-                    let mut out_valid = Validity::default();
-                    for &i in indices {
-                        let idx = i as usize;
-                        out_vals.push(vals[idx]);
-                        out_valid.push(valid.is_valid(idx));
-                    }
-                    Column::Time {
-                        vals: out_vals,
-                        valid: out_valid,
-                    }
-                }
-            }
-            Column::Float { vals, valid } => {
-                if valid.null_count() == 0 {
-                    Column::Float {
-                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
-                        valid: Validity::all_valid(n),
-                    }
-                } else {
-                    let mut out_vals = Vec::with_capacity(n);
-                    let mut out_valid = Validity::default();
-                    for &i in indices {
-                        let idx = i as usize;
-                        out_vals.push(vals[idx]);
-                        out_valid.push(valid.is_valid(idx));
-                    }
-                    Column::Float {
-                        vals: out_vals,
-                        valid: out_valid,
-                    }
-                }
-            }
-            Column::Bool { vals, valid } => {
-                if valid.null_count() == 0 {
-                    Column::Bool {
-                        vals: indices.iter().map(|&i| vals[i as usize]).collect(),
-                        valid: Validity::all_valid(n),
-                    }
-                } else {
-                    let mut out_vals = Vec::with_capacity(n);
-                    let mut out_valid = Validity::default();
-                    for &i in indices {
-                        let idx = i as usize;
-                        out_vals.push(vals[idx]);
-                        out_valid.push(valid.is_valid(idx));
-                    }
-                    Column::Bool {
-                        vals: out_vals,
-                        valid: out_valid,
-                    }
-                }
-            }
+            Column::Int { vals, valid } => Column::Int {
+                vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                valid: gather_validity(valid, indices),
+            },
+            Column::Time { vals, valid } => Column::Time {
+                vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                valid: gather_validity(valid, indices),
+            },
+            Column::Float { vals, valid } => Column::Float {
+                vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                valid: gather_validity(valid, indices),
+            },
+            Column::Bool { vals, valid } => Column::Bool {
+                vals: indices.iter().map(|&i| vals[i as usize]).collect(),
+                valid: gather_validity(valid, indices),
+            },
             Column::Text {
                 offsets,
                 data,
@@ -853,6 +823,11 @@ impl Column {
                             (offsets[idx + 1] - offsets[idx]) as usize
                         })
                         .sum();
+                    if u32::try_from(total_bytes).is_err() {
+                        return Column::Cells(
+                            indices.iter().map(|&i| self.get(i as usize)).collect(),
+                        );
+                    }
                     let mut out_offsets = Vec::with_capacity(n + 1);
                     out_offsets.push(0);
                     let mut out_data = Vec::with_capacity(total_bytes);
@@ -869,33 +844,35 @@ impl Column {
                         valid: Validity::all_valid(n),
                     }
                 } else {
+                    let out_valid = gather_validity(valid, indices);
+                    let valid_words = &valid.words;
                     let total_bytes: usize = indices
                         .iter()
                         .map(|&i| {
                             let idx = i as usize;
-                            if valid.is_valid(idx) {
+                            if (valid_words[idx >> 6] >> (idx & 63)) & 1 != 0 {
                                 (offsets[idx + 1] - offsets[idx]) as usize
                             } else {
                                 0
                             }
                         })
                         .sum();
+                    if u32::try_from(total_bytes).is_err() {
+                        return Column::Cells(
+                            indices.iter().map(|&i| self.get(i as usize)).collect(),
+                        );
+                    }
                     let mut out_offsets = Vec::with_capacity(n + 1);
                     out_offsets.push(0);
                     let mut out_data = Vec::with_capacity(total_bytes);
-                    let mut out_valid = Validity::default();
                     for &i in indices {
                         let idx = i as usize;
-                        if valid.is_valid(idx) {
+                        if (valid_words[idx >> 6] >> (idx & 63)) & 1 != 0 {
                             let s = offsets[idx] as usize;
                             let e = offsets[idx + 1] as usize;
                             out_data.extend_from_slice(&data[s..e]);
-                            out_offsets.push(out_data.len() as u32);
-                            out_valid.push(true);
-                        } else {
-                            out_offsets.push(out_data.len() as u32);
-                            out_valid.push(false);
                         }
+                        out_offsets.push(out_data.len() as u32);
                     }
                     Column::Text {
                         offsets: out_offsets,
@@ -908,28 +885,11 @@ impl Column {
                 values,
                 codes,
                 valid,
-            } => {
-                if valid.null_count() == 0 {
-                    Column::Dict {
-                        values: values.clone(),
-                        codes: indices.iter().map(|&i| codes[i as usize]).collect(),
-                        valid: Validity::all_valid(n),
-                    }
-                } else {
-                    let mut out_codes = Vec::with_capacity(n);
-                    let mut out_valid = Validity::default();
-                    for &i in indices {
-                        let idx = i as usize;
-                        out_codes.push(codes[idx]);
-                        out_valid.push(valid.is_valid(idx));
-                    }
-                    Column::Dict {
-                        values: values.clone(),
-                        codes: out_codes,
-                        valid: out_valid,
-                    }
-                }
-            }
+            } => Column::Dict {
+                values: values.clone(),
+                codes: indices.iter().map(|&i| codes[i as usize]).collect(),
+                valid: gather_validity(valid, indices),
+            },
             Column::Cells(c) => Column::Cells(
                 indices
                     .iter()
@@ -958,30 +918,12 @@ impl Column {
                 values,
                 codes,
                 valid,
-            } => {
-                let n = indices.len();
-                if valid.null_count() == 0 {
-                    Column::Dict {
-                        values,
-                        codes: indices.iter().map(|&i| codes[i as usize]).collect(),
-                        valid: Validity::all_valid(n),
-                    }
-                } else {
-                    let mut out_codes = Vec::with_capacity(n);
-                    let mut out_valid = Validity::default();
-                    for &i in indices {
-                        let idx = i as usize;
-                        out_codes.push(codes[idx]);
-                        out_valid.push(valid.is_valid(idx));
-                    }
-                    Column::Dict {
-                        values,
-                        codes: out_codes,
-                        valid: out_valid,
-                    }
-                }
-            }
-            other => other.gather(indices),
+            } => Column::Dict {
+                values: if indices.is_empty() { Vec::new() } else { values },
+                codes: indices.iter().map(|&i| codes[i as usize]).collect(),
+                valid: gather_validity(&valid, indices),
+            },
+            other => other.gather_u32(indices),
         }
     }
 
@@ -1259,6 +1201,742 @@ fn prefilled<T: Clone>(n: usize, cap: usize, fill: T) -> Vec<T> {
     let mut v = Vec::with_capacity(cap.max(n));
     v.resize(n, fill);
     v
+}
+
+fn gather_validity(valid: &Validity, indices: &[u32]) -> Validity {
+    let n = indices.len();
+    if n == 0 || valid.null_count() == 0 {
+        return Validity::all_valid(n);
+    }
+    let valid_words = &valid.words;
+    let valid_len = valid.len;
+    let num_words = n.div_ceil(64);
+    let mut out_words: Vec<u64> = Vec::new();
+    let mut ones = 0usize;
+    for (w_idx, chunk) in indices.chunks(64).enumerate() {
+        let mut word = 0u64;
+        for (bit, &idx_u32) in chunk.iter().enumerate() {
+            let i = idx_u32 as usize;
+            debug_assert!(i < valid_len);
+            let is_v = (valid_words[i >> 6] >> (i & 63)) & 1;
+            word |= is_v << bit;
+        }
+        let full = if chunk.len() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << chunk.len()) - 1
+        };
+        ones += word.count_ones() as usize;
+        if out_words.is_empty() {
+            if word != full {
+                out_words.reserve_exact(num_words);
+                out_words.resize(w_idx, u64::MAX);
+                out_words.push(word);
+            }
+        } else {
+            out_words.push(word);
+        }
+    }
+    let nulls = n - ones;
+    if nulls == 0 {
+        Validity::all_valid(n)
+    } else {
+        Validity {
+            words: out_words,
+            len: n,
+            nulls,
+        }
+    }
+}
+
+#[inline(always)]
+fn collect_matching_u32<T: Copy>(slice: &[T], out: &mut Vec<u32>, mut pred: impl FnMut(T) -> bool) {
+    let n = slice.len();
+    out.clear();
+    if n == 0 {
+        return;
+    }
+    out.reserve(n);
+    // SAFETY: `out` is cleared and reserved for at least `n` elements. On step `i < n`,
+    // `count <= i < n <= out.capacity()`, so `dst.add(count)` is always valid for writes,
+    // and upon completion `0 <= count <= n` contiguous elements are initialized.
+    unsafe {
+        let dst = out.as_mut_ptr();
+        let mut count = 0usize;
+        for (i, &v) in slice.iter().enumerate() {
+            *dst.add(count) = i as u32;
+            count += usize::from(pred(v));
+        }
+        out.set_len(count);
+    }
+}
+
+#[inline]
+fn collect_matching_u32_nullable<T: Copy>(
+    slice: &[T],
+    valid: &Validity,
+    null_matches: bool,
+    out: &mut Vec<u32>,
+    mut pred: impl FnMut(T) -> bool,
+) {
+    if valid.null_count() == 0 {
+        collect_matching_u32(slice, out, pred);
+        return;
+    }
+    let n = slice.len();
+    out.clear();
+    if n == 0 {
+        return;
+    }
+    out.reserve(n);
+    let words = &valid.words;
+    // SAFETY: `out` has capacity >= `n`, and `count <= global_i < n` at every write.
+    unsafe {
+        let dst = out.as_mut_ptr();
+        let mut count = 0usize;
+        for (w_idx, chunk) in slice.chunks(64).enumerate() {
+            let mask = words[w_idx];
+            let base = w_idx * 64;
+            for (bit, &v) in chunk.iter().enumerate() {
+                *dst.add(count) = (base + bit) as u32;
+                let is_v = ((mask >> bit) & 1) != 0;
+                let matched = if is_v { pred(v) } else { null_matches };
+                count += usize::from(matched);
+            }
+        }
+        out.set_len(count);
+    }
+}
+
+fn collect_all_or_valid(n: usize, valid: &Validity, include_nulls: bool, out: &mut Vec<u32>) {
+    out.clear();
+    if include_nulls || valid.null_count() == 0 {
+        out.extend(0..n as u32);
+        return;
+    }
+    let keep_len = n - valid.null_count();
+    if keep_len == 0 {
+        return;
+    }
+    out.reserve(keep_len);
+    for (w_idx, &word) in valid.words.iter().enumerate() {
+        let mut w = word;
+        let base = (w_idx * 64) as u32;
+        while w != 0 {
+            let bit = w.trailing_zeros();
+            out.push(base + bit);
+            w &= w - 1;
+        }
+    }
+}
+
+fn eval_i64_slice_cmp(
+    vals: &[i64],
+    valid: &Validity,
+    op: crate::ast::CmpOp,
+    rv: i64,
+    out: &mut Vec<u32>,
+) {
+    use crate::ast::CmpOp;
+    match op {
+        CmpOp::Eq => collect_matching_u32_nullable(vals, valid, false, out, |v| v == rv),
+        CmpOp::Ne => collect_matching_u32_nullable(vals, valid, true, out, |v| v != rv),
+        CmpOp::Lt => collect_matching_u32_nullable(vals, valid, false, out, |v| v < rv),
+        CmpOp::Le => collect_matching_u32_nullable(vals, valid, false, out, |v| v <= rv),
+        CmpOp::Gt => collect_matching_u32_nullable(vals, valid, false, out, |v| v > rv),
+        CmpOp::Ge => collect_matching_u32_nullable(vals, valid, false, out, |v| v >= rv),
+    }
+}
+
+fn eval_f64_slice_cmp(
+    vals: &[f64],
+    valid: &Validity,
+    op: crate::ast::CmpOp,
+    rf: f64,
+    out: &mut Vec<u32>,
+) {
+    use crate::ast::CmpOp;
+    if rf.is_nan() {
+        out.clear();
+        if matches!(op, CmpOp::Ne) {
+            out.extend(0..vals.len() as u32);
+        }
+        return;
+    }
+    match op {
+        CmpOp::Eq => collect_matching_u32_nullable(vals, valid, false, out, |v| v == rf),
+        CmpOp::Ne => collect_matching_u32_nullable(vals, valid, true, out, |v| v != rf),
+        CmpOp::Lt => collect_matching_u32_nullable(vals, valid, false, out, |v| v < rf),
+        CmpOp::Le => collect_matching_u32_nullable(vals, valid, false, out, |v| v <= rf),
+        CmpOp::Gt => collect_matching_u32_nullable(vals, valid, false, out, |v| v > rf),
+        CmpOp::Ge => collect_matching_u32_nullable(vals, valid, false, out, |v| v >= rf),
+    }
+}
+
+fn eval_col_cmp_indices(
+    col: &Column,
+    op: crate::ast::CmpOp,
+    lit: &Cell,
+    out: &mut Vec<u32>,
+) -> bool {
+    use crate::ast::CmpOp;
+    match col {
+        Column::Nulls { n, .. } => {
+            out.clear();
+            if matches!(op, CmpOp::Ne) {
+                out.extend(0..*n as u32);
+            }
+            true
+        }
+        Column::Int { vals, valid } => match lit {
+            Cell::Int(rv) => {
+                eval_i64_slice_cmp(vals, valid, op, *rv, out);
+                true
+            }
+            Cell::Float(rf) => {
+                let rf = *rf;
+                let n = vals.len();
+                if rf.is_nan() {
+                    out.clear();
+                    if matches!(op, CmpOp::Ne) {
+                        out.extend(0..n as u32);
+                    }
+                    return true;
+                }
+                const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+                match op {
+                    CmpOp::Eq | CmpOp::Ne => {
+                        let exact_int = if rf.is_finite()
+                            && rf.fract() == 0.0
+                            && (-TWO_63..TWO_63).contains(&rf)
+                        {
+                            let fi = rf as i64;
+                            (fi as f64 == rf).then_some(fi)
+                        } else {
+                            None
+                        };
+                        match (op, exact_int) {
+                            (_, Some(fi)) => eval_i64_slice_cmp(vals, valid, op, fi, out),
+                            (CmpOp::Eq, None) => out.clear(),
+                            (CmpOp::Ne, None) => {
+                                out.clear();
+                                out.extend(0..n as u32);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                        if rf >= TWO_63 {
+                            if matches!(op, CmpOp::Lt | CmpOp::Le) {
+                                collect_all_or_valid(n, valid, false, out);
+                            } else {
+                                out.clear();
+                            }
+                        } else if rf < -TWO_63 {
+                            if matches!(op, CmpOp::Gt | CmpOp::Ge) {
+                                collect_all_or_valid(n, valid, false, out);
+                            } else {
+                                out.clear();
+                            }
+                        } else {
+                            let fi = rf as i64;
+                            let f_back = fi as f64;
+                            if f_back == rf {
+                                eval_i64_slice_cmp(vals, valid, op, fi, out);
+                            } else if rf > f_back {
+                                let eff_op = match op {
+                                    CmpOp::Lt | CmpOp::Le => CmpOp::Le,
+                                    CmpOp::Gt | CmpOp::Ge => CmpOp::Gt,
+                                    _ => unreachable!(),
+                                };
+                                eval_i64_slice_cmp(vals, valid, eff_op, fi, out);
+                            } else {
+                                let eff_op = match op {
+                                    CmpOp::Lt | CmpOp::Le => CmpOp::Lt,
+                                    CmpOp::Gt | CmpOp::Ge => CmpOp::Ge,
+                                    _ => unreachable!(),
+                                };
+                                eval_i64_slice_cmp(vals, valid, eff_op, fi, out);
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        },
+        Column::Time { vals, valid } => match lit {
+            Cell::Time(rt) => {
+                eval_i64_slice_cmp(vals, valid, op, *rt, out);
+                true
+            }
+            _ => false,
+        },
+        Column::Float { vals, valid } => match lit {
+            Cell::Float(rf) => {
+                eval_f64_slice_cmp(vals, valid, op, *rf, out);
+                true
+            }
+            Cell::Int(ri) => {
+                let ri = *ri;
+                const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+                let rf = ri as f64;
+                if rf < TWO_63 && (rf as i64 == ri) {
+                    eval_f64_slice_cmp(vals, valid, op, rf, out);
+                } else {
+                    match op {
+                        CmpOp::Eq => collect_matching_u32_nullable(vals, valid, false, out, |v| {
+                            crate::eval::int_eq_f64(ri, v)
+                        }),
+                        CmpOp::Ne => collect_matching_u32_nullable(vals, valid, true, out, |v| {
+                            !crate::eval::int_eq_f64(ri, v)
+                        }),
+                        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                            collect_matching_u32_nullable(vals, valid, false, out, |v| {
+                                match crate::eval::cmp_i64_f64(ri, v).map(|o| o.reverse()) {
+                                    Some(ord) => match op {
+                                        CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                                        CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                                        CmpOp::Ge => ord != std::cmp::Ordering::Less,
+                                        CmpOp::Le => ord != std::cmp::Ordering::Greater,
+                                        _ => false,
+                                    },
+                                    None => false,
+                                }
+                            });
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        },
+        Column::Bool { vals, valid } => match lit {
+            Cell::Bool(rb) => {
+                let rb = *rb;
+                match op {
+                    CmpOp::Eq => {
+                        collect_matching_u32_nullable(vals, valid, false, out, |v| v == rb)
+                    }
+                    CmpOp::Ne => collect_matching_u32_nullable(vals, valid, true, out, |v| v != rb),
+                    CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => out.clear(),
+                }
+                true
+            }
+            _ => false,
+        },
+        Column::Dict {
+            values,
+            codes,
+            valid,
+        } => {
+            let Some(target) = lit.text() else {
+                return false;
+            };
+            let n = codes.len();
+            match op {
+                CmpOp::Eq => {
+                    let Some(tc) = values
+                        .iter()
+                        .position(|v| v.as_ref() == target)
+                        .map(|p| p as u32)
+                    else {
+                        out.clear();
+                        return true;
+                    };
+                    collect_matching_u32_nullable(codes, valid, false, out, |c| c == tc);
+                }
+                CmpOp::Ne => {
+                    let Some(tc) = values
+                        .iter()
+                        .position(|v| v.as_ref() == target)
+                        .map(|p| p as u32)
+                    else {
+                        out.clear();
+                        out.extend(0..n as u32);
+                        return true;
+                    };
+                    collect_matching_u32_nullable(codes, valid, true, out, |c| c != tc);
+                }
+                CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                    if values.is_empty() {
+                        out.clear();
+                        return true;
+                    }
+                    let mut code_ok: smallvec::SmallVec<[bool; 64]> =
+                        smallvec::SmallVec::with_capacity(values.len());
+                    let mut any_ok = false;
+                    for v in values {
+                        let s = v.as_ref();
+                        let ok = match op {
+                            CmpOp::Lt => s < target,
+                            CmpOp::Le => s <= target,
+                            CmpOp::Gt => s > target,
+                            CmpOp::Ge => s >= target,
+                            _ => unreachable!(),
+                        };
+                        any_ok |= ok;
+                        code_ok.push(ok);
+                    }
+                    if !any_ok {
+                        out.clear();
+                        return true;
+                    }
+                    let ok_slice = code_ok.as_slice();
+                    collect_matching_u32_nullable(codes, valid, false, out, |c| {
+                        ok_slice[c as usize]
+                    });
+                }
+            }
+            true
+        }
+        Column::Text {
+            offsets,
+            data,
+            valid,
+        } => {
+            let Some(target) = lit.text() else {
+                return false;
+            };
+            let tb = target.as_bytes();
+            let tlen = tb.len() as u32;
+            let n = valid.len;
+            out.clear();
+            if n == 0 {
+                return true;
+            }
+            if valid.null_count() == 0 {
+                match op {
+                    CmpOp::Eq => {
+                        for i in 0..n {
+                            let s = offsets[i];
+                            let e = offsets[i + 1];
+                            if e - s == tlen && &data[s as usize..e as usize] == tb {
+                                out.push(i as u32);
+                            }
+                        }
+                    }
+                    CmpOp::Ne => {
+                        for i in 0..n {
+                            let s = offsets[i];
+                            let e = offsets[i + 1];
+                            if e - s != tlen || &data[s as usize..e as usize] != tb {
+                                out.push(i as u32);
+                            }
+                        }
+                    }
+                    CmpOp::Lt => {
+                        for i in 0..n {
+                            if &data[offsets[i] as usize..offsets[i + 1] as usize] < tb {
+                                out.push(i as u32);
+                            }
+                        }
+                    }
+                    CmpOp::Le => {
+                        for i in 0..n {
+                            if &data[offsets[i] as usize..offsets[i + 1] as usize] <= tb {
+                                out.push(i as u32);
+                            }
+                        }
+                    }
+                    CmpOp::Gt => {
+                        for i in 0..n {
+                            if &data[offsets[i] as usize..offsets[i + 1] as usize] > tb {
+                                out.push(i as u32);
+                            }
+                        }
+                    }
+                    CmpOp::Ge => {
+                        for i in 0..n {
+                            if &data[offsets[i] as usize..offsets[i + 1] as usize] >= tb {
+                                out.push(i as u32);
+                            }
+                        }
+                    }
+                }
+            } else {
+                let words = &valid.words;
+                for i in 0..n {
+                    let is_v = ((words[i >> 6] >> (i & 63)) & 1) != 0;
+                    if !is_v {
+                        if matches!(op, CmpOp::Ne) {
+                            out.push(i as u32);
+                        }
+                        continue;
+                    }
+                    let s = offsets[i];
+                    let e = offsets[i + 1];
+                    let matched = match op {
+                        CmpOp::Eq => e - s == tlen && &data[s as usize..e as usize] == tb,
+                        CmpOp::Ne => e - s != tlen || &data[s as usize..e as usize] != tb,
+                        CmpOp::Lt => &data[s as usize..e as usize] < tb,
+                        CmpOp::Le => &data[s as usize..e as usize] <= tb,
+                        CmpOp::Gt => &data[s as usize..e as usize] > tb,
+                        CmpOp::Ge => &data[s as usize..e as usize] >= tb,
+                    };
+                    if matched {
+                        out.push(i as u32);
+                    }
+                }
+            }
+            true
+        }
+        Column::Cells(_) => false,
+    }
+}
+
+#[inline(always)]
+fn float_sort_rank_u64(v: f64, is_valid: bool) -> u64 {
+    if !is_valid {
+        return 0;
+    }
+    if v.is_nan() {
+        return u64::MAX;
+    }
+    let norm = if v == 0.0 { 0.0f64 } else { v };
+    let bits = norm.to_bits();
+    if (bits >> 63) != 0 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
+    }
+}
+
+#[inline(always)]
+fn text_prefix8_be(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let take = bytes.len().min(8);
+    buf[..take].copy_from_slice(&bytes[..take]);
+    u64::from_be_bytes(buf)
+}
+
+fn select_and_sort_window<T>(
+    dec: &mut [T],
+    skip: usize,
+    end: usize,
+    mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    let n = dec.len();
+    if n > 32 && end < n {
+        dec.select_nth_unstable_by(end - 1, &mut cmp);
+        let head = &mut dec[..end];
+        if skip > 32 && end - skip < skip / 2 {
+            head.select_nth_unstable_by(skip, &mut cmp);
+            head[skip..].sort_unstable_by(&mut cmp);
+        } else {
+            head.sort_unstable_by(&mut cmp);
+        }
+    } else {
+        dec.sort_unstable_by(&mut cmp);
+    }
+}
+
+fn select_and_sort_window_ord<T: Ord>(dec: &mut [T], skip: usize, end: usize) {
+    let n = dec.len();
+    if n > 32 && end < n {
+        dec.select_nth_unstable(end - 1);
+        let head = &mut dec[..end];
+        if skip > 32 && end - skip < skip / 2 {
+            head.select_nth_unstable(skip);
+            head[skip..].sort_unstable();
+        } else {
+            head.sort_unstable();
+        }
+    } else {
+        dec.sort_unstable();
+    }
+}
+
+fn sorted_col_indices(col: &Column, desc: bool, skip: usize, end: usize) -> Vec<u32> {
+    let n = col.len();
+    debug_assert!(skip < end && end <= n);
+    match col {
+        Column::Nulls { .. } => (skip as u32..end as u32).collect(),
+        Column::Int { vals, valid } | Column::Time { vals, valid } => {
+            if valid.null_count() == 0 {
+                let mut dec: Vec<(u64, u32)> = vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        let k = (v as u64) ^ (1u64 << 63);
+                        (if desc { !k } else { k }, i as u32)
+                    })
+                    .collect();
+                select_and_sort_window_ord(&mut dec, skip, end);
+                dec[skip..end].iter().map(|&(_, idx)| idx).collect()
+            } else {
+                let words = &valid.words;
+                let mut dec: Vec<(u8, u64, u32)> = vals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        let is_v = ((words[i >> 6] >> (i & 63)) & 1) != 0;
+                        let (tag, key) = if is_v {
+                            let k = (v as u64) ^ (1u64 << 63);
+                            (if desc { 0u8 } else { 1u8 }, if desc { !k } else { k })
+                        } else {
+                            (if desc { 1u8 } else { 0u8 }, 0u64)
+                        };
+                        (tag, key, i as u32)
+                    })
+                    .collect();
+                select_and_sort_window_ord(&mut dec, skip, end);
+                dec[skip..end].iter().map(|&(_, _, idx)| idx).collect()
+            }
+        }
+        Column::Float { vals, valid } => {
+            let has_nulls = valid.null_count() > 0;
+            let words = &valid.words;
+            let mut dec: Vec<(u64, u32)> = vals
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let is_v = !has_nulls || (((words[i >> 6] >> (i & 63)) & 1) != 0);
+                    let rk = float_sort_rank_u64(v, is_v);
+                    (if desc { !rk } else { rk }, i as u32)
+                })
+                .collect();
+            select_and_sort_window_ord(&mut dec, skip, end);
+            dec[skip..end].iter().map(|&(_, idx)| idx).collect()
+        }
+        Column::Bool { vals, valid } => {
+            let has_nulls = valid.null_count() > 0;
+            let words = &valid.words;
+            let mut dec: Vec<u64> = vals
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let is_v = !has_nulls || (((words[i >> 6] >> (i & 63)) & 1) != 0);
+                    let rk: u32 = if !is_v { 0 } else if b { 2 } else { 1 };
+                    let eff = if desc { !rk } else { rk };
+                    ((eff as u64) << 32) | (i as u64)
+                })
+                .collect();
+            select_and_sort_window_ord(&mut dec, skip, end);
+            dec[skip..end].iter().map(|&p| p as u32).collect()
+        }
+        Column::Dict {
+            values,
+            codes,
+            valid,
+        } => {
+            let mut d_ord: Vec<u32> = (0..values.len() as u32).collect();
+            d_ord.sort_unstable_by(|&a, &b| values[a as usize].cmp(&values[b as usize]));
+            let mut rank = vec![0u32; values.len()];
+            if !d_ord.is_empty() {
+                let mut cur_rank = 1u32;
+                rank[d_ord[0] as usize] = cur_rank;
+                for idx_d in 1..d_ord.len() {
+                    if values[d_ord[idx_d - 1] as usize] != values[d_ord[idx_d] as usize] {
+                        cur_rank += 1;
+                    }
+                    rank[d_ord[idx_d] as usize] = cur_rank;
+                }
+            }
+            let has_nulls = valid.null_count() > 0;
+            let words = &valid.words;
+            let mut dec: Vec<u64> = codes
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    let rk = if has_nulls && (((words[i >> 6] >> (i & 63)) & 1) == 0) {
+                        0u32
+                    } else {
+                        rank[c as usize]
+                    };
+                    let eff = if desc { !rk } else { rk };
+                    ((eff as u64) << 32) | (i as u64)
+                })
+                .collect();
+            select_and_sort_window_ord(&mut dec, skip, end);
+            dec[skip..end].iter().map(|&p| p as u32).collect()
+        }
+        Column::Text {
+            offsets,
+            data,
+            valid,
+        } => {
+            if valid.null_count() == 0 {
+                let mut dec: Vec<(u64, u32)> = (0..n)
+                    .map(|i| {
+                        let s = offsets[i] as usize;
+                        let e = offsets[i + 1] as usize;
+                        let pref = text_prefix8_be(&data[s..e]);
+                        (if desc { !pref } else { pref }, i as u32)
+                    })
+                    .collect();
+                select_and_sort_window(&mut dec, skip, end, |a, b| {
+                    let p_ord = a.0.cmp(&b.0);
+                    if p_ord != std::cmp::Ordering::Equal {
+                        return p_ord;
+                    }
+                    let ia = a.1 as usize;
+                    let ib = b.1 as usize;
+                    let sa = &data[offsets[ia] as usize..offsets[ia + 1] as usize];
+                    let sb = &data[offsets[ib] as usize..offsets[ib + 1] as usize];
+                    let ord = if desc { sb.cmp(sa) } else { sa.cmp(sb) };
+                    ord.then_with(|| a.1.cmp(&b.1))
+                });
+                dec[skip..end].iter().map(|&(_, idx)| idx).collect()
+            } else {
+                let words = &valid.words;
+                let mut dec: Vec<(u8, u64, u32)> = (0..n)
+                    .map(|i| {
+                        let is_v = ((words[i >> 6] >> (i & 63)) & 1) != 0;
+                        if is_v {
+                            let s = offsets[i] as usize;
+                            let e = offsets[i + 1] as usize;
+                            let pref = text_prefix8_be(&data[s..e]);
+                            (
+                                if desc { 0u8 } else { 1u8 },
+                                if desc { !pref } else { pref },
+                                i as u32,
+                            )
+                        } else {
+                            (if desc { 1u8 } else { 0u8 }, 0u64, i as u32)
+                        }
+                    })
+                    .collect();
+                select_and_sort_window(&mut dec, skip, end, |a, b| {
+                    let t_ord = a.0.cmp(&b.0);
+                    if t_ord != std::cmp::Ordering::Equal {
+                        return t_ord;
+                    }
+                    let a_is_null = (!desc && a.0 == 0) || (desc && a.0 == 1);
+                    if a_is_null {
+                        return a.2.cmp(&b.2);
+                    }
+                    let p_ord = a.1.cmp(&b.1);
+                    if p_ord != std::cmp::Ordering::Equal {
+                        return p_ord;
+                    }
+                    let ia = a.2 as usize;
+                    let ib = b.2 as usize;
+                    let sa = &data[offsets[ia] as usize..offsets[ia + 1] as usize];
+                    let sb = &data[offsets[ib] as usize..offsets[ib + 1] as usize];
+                    let ord = if desc { sb.cmp(sa) } else { sa.cmp(sb) };
+                    ord.then_with(|| a.2.cmp(&b.2))
+                });
+                dec[skip..end].iter().map(|&(_, _, idx)| idx).collect()
+            }
+        }
+        Column::Cells(cells) => {
+            let mut dec: Vec<(&Cell, u32)> = cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c, i as u32))
+                .collect();
+            select_and_sort_window(&mut dec, skip, end, |a, b| {
+                let ord = match (a.0.text(), b.0.text()) {
+                    (Some(sa), Some(sb)) => sa.cmp(sb),
+                    _ => crate::eval::cmp_sort(a.0, b.0),
+                };
+                let ord = if desc { ord.reverse() } else { ord };
+                ord.then_with(|| a.1.cmp(&b.1))
+            });
+            dec[skip..end].iter().map(|&(_, idx)| idx).collect()
+        }
+    }
 }
 
 /// Columns are equal when they hold the same values, whatever their representation.
@@ -1857,6 +2535,142 @@ impl RecordBatch {
         for col in &mut self.cols {
             col.drain_prefix(n);
         }
+    }
+
+    /// Gather rows at `indices` across every column without materializing `Row` maps.
+    #[allow(dead_code)]
+    pub(crate) fn filter_indices(&self, indices: &[u32]) -> RecordBatch {
+        let cols = self.cols.iter().map(|c| c.gather_u32(indices)).collect();
+        RecordBatch {
+            names: Arc::clone(&self.names),
+            cols,
+        }
+    }
+
+    /// Owned counterpart of [`Self::filter_indices`] for unique `indices`, moving `Dict`
+    /// dictionaries and `Cells` values without extra clones.
+    #[allow(dead_code)]
+    pub(crate) fn into_filtered_indices(self, indices: &[u32]) -> RecordBatch {
+        let cols = self
+            .cols
+            .into_iter()
+            .map(|c| c.gather_unique_owned(indices))
+            .collect();
+        RecordBatch {
+            names: self.names,
+            cols,
+        }
+    }
+
+    /// Evaluate `col <op> lit` directly on columnar buffers, writing matching `0..n` row
+    /// indices into `out`. Returns `false` when the column/literal pair requires fallback to
+    /// generic row predicate evaluation (`eval_pred`).
+    #[allow(dead_code)]
+    pub(crate) fn eval_cmp_indices(
+        &self,
+        col_idx: usize,
+        op: crate::ast::CmpOp,
+        lit: &Cell,
+        out: &mut Vec<u32>,
+    ) -> bool {
+        let Some(col) = self.cols.get(col_idx) else {
+            return false;
+        };
+        let n = col.len();
+        if n > u32::MAX as usize {
+            return false;
+        }
+        if matches!(lit, Cell::Null | Cell::Vec(_)) {
+            return false;
+        }
+        eval_col_cmp_indices(col, op, lit, out)
+    }
+
+    /// Select and reorder columns by index in `O(#cols)`.
+    #[allow(dead_code)]
+    pub(crate) fn project_cols(&self, indices: &[usize], out_names: Arc<[String]>) -> RecordBatch {
+        debug_assert_eq!(indices.len(), out_names.len());
+        let cols = indices.iter().map(|&idx| self.cols[idx].clone()).collect();
+        RecordBatch {
+            names: out_names,
+            cols,
+        }
+    }
+
+    /// Owned counterpart of [`Self::project_cols`], moving unique columns in `O(1)` without
+    /// cloning column buffers and cloning only duplicated column indices.
+    #[allow(dead_code)]
+    pub(crate) fn into_projected_cols(
+        mut self,
+        indices: &[usize],
+        out_names: Arc<[String]>,
+    ) -> RecordBatch {
+        debug_assert_eq!(indices.len(), out_names.len());
+        let mut rem: smallvec::SmallVec<[usize; 16]> =
+            smallvec::SmallVec::from_elem(0, self.cols.len());
+        for &idx in indices {
+            rem[idx] += 1;
+        }
+        let mut cols = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            rem[idx] -= 1;
+            if rem[idx] == 0 {
+                cols.push(std::mem::take(&mut self.cols[idx]));
+            } else {
+                cols.push(self.cols[idx].clone());
+            }
+        }
+        RecordBatch {
+            names: out_names,
+            cols,
+        }
+    }
+
+    /// Drop named columns in `O(#cols)` without touching row buffers.
+    #[allow(dead_code)]
+    pub(crate) fn without_cols(self, drop_names: &[&str]) -> RecordBatch {
+        if drop_names.is_empty()
+            || !self.names.iter().any(|n| drop_names.contains(&n.as_str()))
+        {
+            return self;
+        }
+        let mut kept_names = Vec::with_capacity(self.names.len());
+        let mut kept_cols = Vec::with_capacity(self.cols.len());
+        for (name, col) in self.names.iter().zip(self.cols) {
+            if !drop_names.contains(&name.as_str()) {
+                kept_names.push(name.clone());
+                kept_cols.push(col);
+            }
+        }
+        RecordBatch {
+            names: kept_names.into(),
+            cols: kept_cols,
+        }
+    }
+
+    /// Sort the batch by `cols[col_idx]` (matching [`crate::eval::cmp_sort`] with ascending
+    /// row-index tie-breaking) and gather only the `skip` / `take` window.
+    #[allow(dead_code)]
+    pub(crate) fn sort_by_col(
+        &self,
+        col_idx: usize,
+        desc: bool,
+        skip: usize,
+        take: Option<usize>,
+    ) -> RecordBatch {
+        let n = self.n();
+        if n == 0 || skip >= n || take == Some(0) || col_idx >= self.cols.len() {
+            return self.filter_indices(&[]);
+        }
+        if n == 1 {
+            return self.clone();
+        }
+        let end = match take {
+            Some(t) => skip.saturating_add(t).min(n),
+            None => n,
+        };
+        let keep = sorted_col_indices(&self.cols[col_idx], desc, skip, end);
+        self.filter_indices(&keep)
     }
 
     /// Create a batch from columnar data with pre-allocated capacity
@@ -2552,5 +3366,196 @@ mod tests {
 
         // Truncated wire payload is rejected cleanly.
         assert!(RecordBatch::from_wire_bytes(&wire[..wire.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn vectorized_filter_cmp_project_without_and_sort_match_row_semantics() {
+        use crate::ast::{CmpOp, Field, Pred, Value};
+
+        let names: Arc<[String]> = vec![
+            "id".to_string(),
+            "ival".to_string(),
+            "fval".to_string(),
+            "bval".to_string(),
+            "tval".to_string(),
+            "txt".to_string(),
+            "dict".to_string(),
+            "mix".to_string(),
+        ]
+        .into();
+
+        let n = 150usize;
+        let mut c_id = Column::new_text_with_capacity(n, n * 12);
+        let mut c_int = Column::with_capacity(n);
+        let mut c_flt = Column::with_capacity(n);
+        let mut c_bool = Column::with_capacity(n);
+        let mut c_time = Column::with_capacity(n);
+        let mut c_txt = Column::new_text_with_capacity(n, n * 16);
+        let mut raw_dict = Column::with_capacity(n);
+        let mut c_mix = Column::Cells(Vec::with_capacity(n));
+
+        for i in 0..n {
+            c_id.push(Cell::from_text(format!("row-{i:04}")));
+            c_int.push(if i % 11 == 0 {
+                Cell::Null
+            } else if i == 3 {
+                Cell::Int((1i64 << 54) + 1)
+            } else {
+                Cell::Int(((i * 37) % 29) as i64 - 14)
+            });
+            c_flt.push(match i % 13 {
+                0 => Cell::Null,
+                1 => Cell::Float(f64::NAN),
+                2 => Cell::Float(-0.0),
+                3 => Cell::Float(0.0),
+                4 => Cell::Float(f64::INFINITY),
+                5 => Cell::Float(f64::NEG_INFINITY),
+                _ => Cell::Float(((i * 19) % 23) as f64 - 10.5),
+            });
+            c_bool.push(match i % 5 {
+                0 => Cell::Null,
+                1 | 2 => Cell::Bool(false),
+                _ => Cell::Bool(true),
+            });
+            c_time.push(if i % 17 == 0 {
+                Cell::Null
+            } else {
+                Cell::Time(1_700_000_000_000 + ((i * 7) % 19) as i64)
+            });
+            c_txt.push(if i % 7 == 0 {
+                Cell::Null
+            } else {
+                Cell::from_text(format!("prefix_shared_8bytes_{}", i % 9))
+            });
+            raw_dict.push(if i % 9 == 0 {
+                Cell::Null
+            } else {
+                Cell::from_text(["rag", "ops", "core", "edge"][i % 4])
+            });
+            c_mix.push(match i % 4 {
+                0 => Cell::Null,
+                1 => Cell::Int((i % 7) as i64),
+                2 => Cell::Float((i % 7) as f64),
+                _ => Cell::from_text(format!("m{}", i % 5)),
+            });
+        }
+        let c_dict = raw_dict.encode_dict().expect("dict encode");
+        assert!(matches!(c_dict, Column::Dict { .. }));
+        assert!(matches!(c_txt, Column::Text { .. }));
+
+        let batch = RecordBatch {
+            names: Arc::clone(&names),
+            cols: vec![c_id, c_int, c_flt, c_bool, c_time, c_txt, c_dict, c_mix],
+        };
+        let ref_rows = batch.to_rows();
+
+        let ops = [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+        ];
+        let mut idx_buf = Vec::new();
+
+        // 1. Exhaustive comparison checks against `eval_pred`.
+        let cases: &[(usize, &str, Value)] = &[
+            (1, "ival", Value::Int(0)),
+            (1, "ival", Value::Int(-5)),
+            (1, "ival", Value::Float(0.0)),
+            (1, "ival", Value::Float(2.5)),
+            (1, "ival", Value::Float(-2.5)),
+            (1, "ival", Value::Float(f64::NAN)),
+            (1, "ival", Value::Float(f64::INFINITY)),
+            (1, "ival", Value::Float(f64::NEG_INFINITY)),
+            (2, "fval", Value::Float(0.0)),
+            (2, "fval", Value::Float(-3.5)),
+            (2, "fval", Value::Float(f64::NAN)),
+            (2, "fval", Value::Int(0)),
+            (2, "fval", Value::Int(-3)),
+            (2, "fval", Value::Int((1i64 << 54) + 1)),
+            (3, "bval", Value::Bool(true)),
+            (3, "bval", Value::Bool(false)),
+            (4, "tval", Value::Timestamp(1_700_000_000_007)),
+            (5, "txt", Value::String(Arc::from("prefix_shared_8bytes_3"))),
+            (5, "txt", Value::String(Arc::from("prefix_shared_8bytes_z"))),
+            (6, "dict", Value::String(Arc::from("rag"))),
+            (6, "dict", Value::String(Arc::from("missing_code"))),
+        ];
+        for (col_idx, fname, val) in cases {
+            let lit = crate::eval::value_cell(val, 0);
+            for op in ops {
+                let handled = batch.eval_cmp_indices(*col_idx, op, &lit, &mut idx_buf);
+                assert!(handled, "expected vectorized handling for {fname} {op:?} {val:?}");
+                let pred = Pred::Cmp {
+                    field: Field::name(*fname),
+                    op,
+                    value: val.clone(),
+                };
+                let want: Vec<u32> = ref_rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| crate::eval::eval_pred(&pred, r, 0))
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                assert_eq!(idx_buf, want, "mismatch on {fname} {op:?} {val:?}");
+                let filtered = batch.filter_indices(&idx_buf);
+                let want_rows: Vec<Row> = want.iter().map(|&i| ref_rows[i as usize].clone()).collect();
+                assert_eq!(filtered.to_rows(), want_rows);
+            }
+        }
+        // `Column::Cells` and `Cell::Null` literal cleanly signal fallback (`false`).
+        assert!(!batch.eval_cmp_indices(7, CmpOp::Eq, &Cell::Int(1), &mut idx_buf));
+        assert!(!batch.eval_cmp_indices(1, CmpOp::Eq, &Cell::Null, &mut idx_buf));
+
+        // 2. `project_cols`, `into_projected_cols`, and `without_cols`.
+        let proj_names: Arc<[String]> =
+            vec!["dict".to_string(), "id".to_string(), "ival".to_string()].into();
+        let p1 = batch.project_cols(&[6, 0, 1], Arc::clone(&proj_names));
+        let p2 = batch.clone().into_projected_cols(&[6, 0, 1], Arc::clone(&proj_names));
+        assert_eq!(p1, p2);
+        assert_eq!(
+            p1.to_rows(),
+            crate::eval::project(
+                &ref_rows,
+                &[Field::name("dict"), Field::name("id"), Field::name("ival")]
+            )
+        );
+        let dropped = p1.without_cols(&["ival"]);
+        assert_eq!(dropped.names.as_ref(), &["dict".to_string(), "id".to_string()][..]);
+
+        // 3. `sort_by_col` across every column representation, both directions, small (`<= 32`)
+        // and large (`> 32`), and `skip` / `take` windows.
+        let small_batch = batch.filter_indices(&(0..24u32).collect::<Vec<_>>());
+        for src_batch in [&small_batch, &batch] {
+            let src_rows = src_batch.to_rows();
+            for (col_idx, fname) in names.iter().enumerate() {
+                let field = Field::name(fname.as_str());
+                for desc in [false, true] {
+                    for (skip, take) in [
+                        (0usize, None),
+                        (0, Some(0)),
+                        (0, Some(10)),
+                        (5, Some(15)),
+                        (45, Some(12)),
+                        (src_batch.n() + 3, Some(5)),
+                    ] {
+                        let got = src_batch.sort_by_col(col_idx, desc, skip, take).to_rows();
+                        let mut want = src_rows.clone();
+                        let top_k = take.map(|t| skip.saturating_add(t));
+                        crate::eval::sort_rows_top_k(&mut want, &field, desc, top_k);
+                        let s = skip.min(want.len());
+                        let e = take.map_or(want.len(), |t| s.saturating_add(t).min(want.len()));
+                        assert_eq!(
+                            got,
+                            &want[s..e],
+                            "sort mismatch col={fname} n={} desc={desc} skip={skip} take={take:?}",
+                            src_batch.n()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
