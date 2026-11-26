@@ -2760,7 +2760,7 @@ fn build_batch_shape_rows_into(
                 }
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<smallvec::SmallVec<[_; 12]>>();
     let width = slots.len();
     if width > 32 {
         for (slot_out, record) in out.iter_mut().zip(records) {

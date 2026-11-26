@@ -61,7 +61,7 @@ jobs:
       - name: Compare row construction with the previous worker
         if: steps.cpu.outputs.matched == 'true'
         run: |
-          git worktree add --detach "$RUNNER_TEMP/base" c226a2334
+          git worktree add --detach "$RUNNER_TEMP/base" d922ce2a8
           (cd "$RUNNER_TEMP/base" && cargo build --locked --release -p lin-peer-worker)
           python3 scripts/profile-build-workers.py "$RUNNER_TEMP/base/target/release/lin-peer-worker" target/release/lin-peer-worker > build-workers.json
       - uses: actions/upload-artifact@v4
