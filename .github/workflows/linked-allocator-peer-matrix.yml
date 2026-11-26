@@ -1,0 +1,50 @@
+name: Linked Linux x64 peer matrix
+on:
+  push:
+    branches: [codex/linked-allocator-peer-matrix]
+permissions:
+  contents: read
+jobs:
+  qualify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Build linked release binaries
+        run: |
+          sudo apt-get update -qq
+          (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+          dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+          LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" scripts/build-linux-release.sh
+          nm --defined-only target/release/lin-peer-worker > "$RUNNER_TEMP/symbols.txt"
+          grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/symbols.txt"
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Start database services
+        run: |
+          docker compose -f docker-compose.bench.yml up -d --wait
+          docker run -d --name lin-mongo --tmpfs /data/db -p 127.0.0.1:27027:27017 mongo:8
+          for trial in {1..30}; do
+            if docker exec lin-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -qx 1; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Measure validated reads and server-native insertion
+        run: |
+          mkdir "$RUNNER_TEMP/results"
+          lscpu > "$RUNNER_TEMP/results/cpu.txt"
+          for rows in 1000 10000 100000; do
+            args=(--lin-binary target/release/lin-peer-worker --rows "$rows" --samples 3 --repeats 3)
+            python3 scripts/bench-peers.py "${args[@]}" --engines lin sqlite duckdb pandas postgres mysql mongo --output "$RUNNER_TEMP/results/read-$rows"
+            python3 scripts/bench-peers.py "${args[@]}" --engines lin postgres mysql mongo --cases insert_native --output "$RUNNER_TEMP/results/insert-$rows"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-linked-peer-results
+          path: ${{ runner.temp }}/results
