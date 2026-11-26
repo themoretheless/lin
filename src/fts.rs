@@ -6,12 +6,16 @@
 //! them and only rebuilds missing / mismatched collections. WAL replay then
 //! updates postings incrementally.
 
-use rustc_hash::FxHashMap;
+use hashbrown::hash_map::{Entry, RawEntryMut};
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::hash::BuildHasher;
 use smallvec::{SmallVec, smallvec};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+type Postings = hashbrown::HashMap<Arc<str>, SmallVec<[usize; 2]>, FxBuildHasher>;
 
 use crate::error::Error;
 use crate::persist::io_err;
@@ -54,7 +58,7 @@ fn build_fts_slots(fields: &[String]) -> SmallVec<[OwnedFieldSlot; 4]> {
 pub struct FtsIndex {
     pub fields: Vec<String>,
     slots: SmallVec<[OwnedFieldSlot; 4]>,
-    postings: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: Postings,
     dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
     adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
 }
@@ -70,7 +74,7 @@ impl FtsIndex {
         Self {
             fields: fields.to_vec(),
             slots: build_fts_slots(fields),
-            postings: FxHashMap::default(),
+            postings: Postings::default(),
             dels: FxHashMap::default(),
             adds: FxHashMap::default(),
         }
@@ -616,7 +620,7 @@ impl FtsIndex {
         }
         let nterms = read_u32(bytes, &mut i)? as usize;
         let mut postings =
-            FxHashMap::with_capacity_and_hasher(nterms.min((bytes.len() - i) / 8), Default::default());
+            Postings::with_capacity_and_hasher(nterms.min((bytes.len() - i) / 8), Default::default());
         for _ in 0..nterms {
             let tok = read_arc_str(bytes, &mut i)?;
             let n = read_u32(bytes, &mut i)? as usize;
@@ -872,7 +876,7 @@ fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
 /// Insert into a sorted, unique pending list; merges rely on this invariant.
 fn push_pending(
     map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
-    postings: &FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &Postings,
     tok: &str,
     row_idx: usize,
 ) -> usize {
@@ -915,7 +919,7 @@ fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_id
 /// the token is new.
 
 fn append_uniform_postings(
-    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &mut Postings,
     start: usize,
     rows: &[Row],
     slot_mask: u64,
@@ -946,7 +950,7 @@ fn append_uniform_postings(
 }
 
 fn append_parallel_postings(
-    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &mut Postings,
     start: usize,
     rows: &[Row],
     slot_mask: u64,
@@ -960,11 +964,8 @@ fn append_parallel_postings(
     };
     let mid = rows.len().div_ceil(divisor);
     let (left, right) = rows.split_at(mid);
-    if postings.is_empty() && std::env::var_os("LIN_BENCH_FTS_RESERVE_HEAD").is_some() {
-        postings.reserve(rows.len());
-    }
     let build_tail = || {
-        let mut tail = FxHashMap::default();
+        let mut tail = Postings::default();
         tail.reserve(right.len());
         append_uniform_postings(&mut tail, start + mid, right, slot_mask, fused_ascii);
         tail
@@ -984,10 +985,10 @@ fn append_parallel_postings(
     }
     for (term, indexes) in tail {
         match postings.entry(term) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
                 entry.insert(indexes);
             }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
+            Entry::Occupied(mut entry) => {
                 let existing = entry.get_mut();
                 if existing.last().is_none_or(|last| *last < indexes[0]) {
                     existing.extend(indexes);
@@ -1004,25 +1005,34 @@ fn append_parallel_postings(
 }
 
 fn add_posting(
-    postings: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    postings: &mut Postings,
     tok: &str,
     row_idx: usize,
 ) {
-    if let Some(list) = postings.get_mut(tok) {
-        if let Some(&last) = list.last() {
-            if last == row_idx {
-                return;
-            }
-            if last < row_idx {
-                list.push(row_idx);
-                return;
-            }
+    // Arc<str> hashes its string contents, so the borrowed hash also indexes
+    // the owned key. Allocate the Arc only when the token is new.
+    let hash = postings.hasher().hash_one(tok);
+    let list = match postings
+        .raw_entry_mut()
+        .from_hash(hash, |key| key.as_ref() == tok)
+    {
+        RawEntryMut::Occupied(entry) => entry.into_mut(),
+        RawEntryMut::Vacant(entry) => {
+            entry.insert_hashed_nocheck(hash, Arc::from(tok), smallvec![row_idx]);
+            return;
         }
-        if let Err(pos) = list.binary_search(&row_idx) {
-            list.insert(pos, row_idx);
+    };
+    if let Some(&last) = list.last() {
+        if last == row_idx {
+            return;
         }
-    } else {
-        postings.insert(Arc::from(tok), smallvec![row_idx]);
+        if last < row_idx {
+            list.push(row_idx);
+            return;
+        }
+    }
+    if let Err(pos) = list.binary_search(&row_idx) {
+        list.insert(pos, row_idx);
     }
 }
 
@@ -1248,8 +1258,8 @@ mod tests {
         let rows: Vec<_> = (0..4097)
             .map(|i| Row::from([("title", Cell::text_arc(format!("Common {i} ΟΔΟΣ common")))]))
             .collect();
-        let mut serial = FxHashMap::default();
-        let mut parallel = FxHashMap::default();
+        let mut serial = Postings::default();
+        let mut parallel = Postings::default();
         for (start, rows) in [(30, &rows[..64]), (0, rows.as_slice())] {
             append_uniform_postings(&mut serial, start, rows, 1, true);
             append_parallel_postings(&mut parallel, start, rows, 1, true, true);

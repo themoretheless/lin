@@ -46,14 +46,11 @@ def measure_lin(worker, rows, allocator="lin"):
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
     env.pop("LIN_BENCH_FTS_RESERVE_HEAD", None)
-    env.pop("LIN_BENCH_FTS_RESERVE_TERMS", None)
     env.pop("LIN_BENCH_INSERT_BUILD_GRAIN", None)
     env.pop("LIN_BENCH_BULK_BUILD_CHUNKS", None)
-    if allocator == "reserve_head":
-        env["LIN_BENCH_FTS_RESERVE_HEAD"] = "1"
-    if allocator == "jemalloc":
+    if allocator == "jemalloc" or (allocator == "candidate" and platform.machine() == "aarch64"):
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_JEMALLOC"]
-    if allocator in ("tcmalloc", "reserve_head"):
+    if allocator == "tcmalloc" or (allocator == "candidate" and platform.machine() == "x86_64"):
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_TCMALLOC"]
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
@@ -62,11 +59,12 @@ def measure_lin(worker, rows, allocator="lin"):
     return result["samples_ns"][0], result["embedding_hash"]
 
 
-def main(worker, output):
-    roles = ("lin", "control", "jemalloc", "tcmalloc", "reserve_head", "duckdb")
+def main(worker, candidate_worker, output):
+    roles = ("lin", "control", "jemalloc", "tcmalloc", "candidate", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
+        candidate_worker_sha256=hashlib.sha256(candidate_worker.read_bytes()).hexdigest(),
         samples=[],
     )
     rng = random.Random(2929273)
@@ -75,7 +73,7 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         measure_lin(worker, rows)
-        measure_lin(worker, rows, "reserve_head")
+        measure_lin(candidate_worker, rows, "candidate")
         for block in range(1):
             seeds = rng.sample(list(itertools.permutations(roles[1:])), 5)
             cycles = [(roles[0], *seed) for seed in seeds]
@@ -88,7 +86,8 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role)
+                        binary = candidate_worker if role == "candidate" else worker
+                        timings[role], digest = measure_lin(binary, rows, role)
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -101,15 +100,16 @@ def main(worker, output):
         jemalloc_gain = median(1 - x["jemalloc"] / x["lin"] for x in pairs)
         tcmalloc_gain = median(1 - x["tcmalloc"] / x["jemalloc"] for x in pairs)
         tcmalloc_wins = sum(x["tcmalloc"] < x["duckdb"] for x in pairs)
-        reserve_gain = median(1 - x["reserve_head"] / x["tcmalloc"] for x in pairs)
-        reserve_wins = sum(x["reserve_head"] < x["duckdb"] for x in pairs)
+        candidate_control = "jemalloc" if platform.machine() == "aarch64" else "tcmalloc"
+        candidate_gain = median(1 - x["candidate"] / x[candidate_control] for x in pairs)
+        candidate_wins = sum(x["candidate"] < x["duckdb"] for x in pairs)
         jemalloc_wins = sum(x["jemalloc"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
               f"A/A {noise:.2%}, jemalloc gain {jemalloc_gain:.2%}, "
               f"jemalloc wins {jemalloc_wins}/{len(pairs)}, tcmalloc gain vs jemalloc "
               f"{tcmalloc_gain:.2%}, tcmalloc wins {tcmalloc_wins}/{len(pairs)}, "
-              f"reserve gain vs TCMalloc {reserve_gain:.2%}, reserve wins {reserve_wins}/{len(pairs)}",
-              flush=True)
+              f"candidate gain vs {candidate_control} {candidate_gain:.2%}, "
+              f"candidate wins {candidate_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":

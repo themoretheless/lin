@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Record CPU and select target hosts
         id: cpu
         run: |
@@ -38,6 +40,10 @@ jobs:
         if: steps.cpu.outputs.matched == 'true'
         run: |
           cargo build --locked --release -p lin-peer-worker
+          cp target/release/lin-peer-worker candidate-worker
+          git worktree add --detach "$RUNNER_TEMP/lin-fts-baseline" 89e68e183
+          (cd "$RUNNER_TEMP/lin-fts-baseline" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release -p lin-peer-worker)
+          cp target/release/lin-peer-worker baseline-worker
           python3 -m pip install -r scripts/bench-peers-requirements.lock
       - name: Locate Linux allocators for the comparison
         if: steps.cpu.outputs.matched == 'true'
@@ -60,9 +66,9 @@ jobs:
           uname -a >> duckdb-provenance.txt
           lscpu >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
-          sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
-          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
-          python3 scripts/profile-duckdb-insert-transaction.py target/release/lin-peer-worker duckdb-phases.json | tee duckdb-phases.txt
+          sha256sum baseline-worker candidate-worker >> duckdb-provenance.txt
+          python3 scripts/bench-duckdb-insert-paired.py baseline-worker candidate-worker duckdb-results.json | tee duckdb-summary.txt
+          python3 scripts/profile-duckdb-insert-transaction.py candidate-worker duckdb-phases.json | tee duckdb-phases.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
