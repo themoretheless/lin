@@ -45,13 +45,15 @@ def measure_lin(worker, rows, allocator="lin"):
     env.pop("LIN_BENCH_FTS_SMALLER_HEAD", None)
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
+    env.pop("LIN_BENCH_FTS_RESERVE_HEAD", None)
+    env.pop("LIN_BENCH_FTS_RESERVE_TERMS", None)
     env.pop("LIN_BENCH_INSERT_BUILD_GRAIN", None)
     env.pop("LIN_BENCH_BULK_BUILD_CHUNKS", None)
-    if allocator in ("grain128", "grain256"):
-        env["LIN_BENCH_INSERT_BUILD_GRAIN"] = allocator.removeprefix("grain")
+    if allocator == "reserve_head":
+        env["LIN_BENCH_FTS_RESERVE_HEAD"] = "1"
     if allocator == "jemalloc":
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_JEMALLOC"]
-    if allocator in ("tcmalloc", "grain128", "grain256"):
+    if allocator in ("tcmalloc", "reserve_head"):
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_TCMALLOC"]
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
@@ -61,7 +63,7 @@ def measure_lin(worker, rows, allocator="lin"):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "jemalloc", "tcmalloc", "grain128", "grain256", "duckdb")
+    roles = ("lin", "control", "jemalloc", "tcmalloc", "reserve_head", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
@@ -73,7 +75,7 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         measure_lin(worker, rows)
-        measure_lin(worker, rows, True)
+        measure_lin(worker, rows, "reserve_head")
         for block in range(1):
             seeds = rng.sample(list(itertools.permutations(roles[1:])), 5)
             cycles = [(roles[0], *seed) for seed in seeds]
@@ -99,23 +101,15 @@ def main(worker, output):
         jemalloc_gain = median(1 - x["jemalloc"] / x["lin"] for x in pairs)
         tcmalloc_gain = median(1 - x["tcmalloc"] / x["jemalloc"] for x in pairs)
         tcmalloc_wins = sum(x["tcmalloc"] < x["duckdb"] for x in pairs)
-        grain_results = {
-            role: (
-                median(1 - x[role] / x["tcmalloc"] for x in pairs),
-                sum(x[role] < x["duckdb"] for x in pairs),
-            )
-            for role in ("grain128", "grain256")
-        }
-        grain_summary = ", ".join(
-            f"{role} gain vs TCMalloc {gain:.2%}, wins {wins}/{len(pairs)}"
-            for role, (gain, wins) in grain_results.items()
-        )
+        reserve_gain = median(1 - x["reserve_head"] / x["tcmalloc"] for x in pairs)
+        reserve_wins = sum(x["reserve_head"] < x["duckdb"] for x in pairs)
         jemalloc_wins = sum(x["jemalloc"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
               f"A/A {noise:.2%}, jemalloc gain {jemalloc_gain:.2%}, "
               f"jemalloc wins {jemalloc_wins}/{len(pairs)}, tcmalloc gain vs jemalloc "
               f"{tcmalloc_gain:.2%}, tcmalloc wins {tcmalloc_wins}/{len(pairs)}, "
-              f"{grain_summary}", flush=True)
+              f"reserve gain vs TCMalloc {reserve_gain:.2%}, reserve wins {reserve_wins}/{len(pairs)}",
+              flush=True)
 
 
 if __name__ == "__main__":

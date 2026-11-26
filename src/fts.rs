@@ -960,6 +960,9 @@ fn append_parallel_postings(
     };
     let mid = rows.len().div_ceil(divisor);
     let (left, right) = rows.split_at(mid);
+    if postings.is_empty() && std::env::var_os("LIN_BENCH_FTS_RESERVE_HEAD").is_some() {
+        postings.reserve(rows.len());
+    }
     let build_tail = || {
         let mut tail = FxHashMap::default();
         tail.reserve(right.len());
