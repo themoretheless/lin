@@ -444,3 +444,13 @@ Median paired Lin minus DuckDB milliseconds, default / THP. Each cell summarizes
 | Neoverse-N2 | −13.31 / −15.50 | −18.66 / −18.40 | −121.78 / −145.28 | −160.61 / −160.38 |
 
 The default first 100k lost all 50 pairs across EPYC 7763 and 9V74. THP won 500/500 pairs. [First qualification and raw samples](https://github.com/themoretheless/lin/actions/runs/45843502735/attempts/1)
+
+In attempt 1, process peak RSS sampled immediately after the first 100k transaction and minor faults during that transaction decreased in all 40 same-host pairs. Peak RSS is a process high-water mark, including preparation. The table shows medians of candidate minus baseline for eight pairs on each host.
+
+| Host | Peak RSS change MiB | Minor fault change | Baseline first-insert minor faults |
+|---|---:|---:|---:|
+| AMD EPYC 9V45 96-Core Processor (amd-1) | -0.86 | -68.5 | 91292.0 |
+| AMD EPYC 9V45 96-Core Processor (amd-2) | -1.05 | -70.0 | 91292.0 |
+| AMD EPYC 7763 64-Core Processor (amd-3) | -1.10 | -66.0 | 91290.0 |
+| AMD EPYC 9V74 80-Core Processor (amd-4) | -0.96 | -69.5 | 91292.0 |
+| Neoverse-N2 (arm64) | -1.57 | -67.0 | 91281.5 |
