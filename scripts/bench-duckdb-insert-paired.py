@@ -47,7 +47,7 @@ def measure_lin(worker, rows, allocator="lin"):
     env.pop("MALLOC_CONF", None)
     if allocator == "jemalloc":
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_JEMALLOC"]
-    if allocator == "tcmalloc":
+    if allocator in ("tcmalloc", "native_tcmalloc"):
         env["LD_PRELOAD"] = os.environ["LIN_BENCH_TCMALLOC"]
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
@@ -56,11 +56,12 @@ def measure_lin(worker, rows, allocator="lin"):
     return result["samples_ns"][0], result["embedding_hash"]
 
 
-def main(worker, output):
-    roles = ("lin", "control", "jemalloc", "tcmalloc", "duckdb")
+def main(worker, native_worker, output):
+    roles = ("lin", "control", "jemalloc", "tcmalloc", "native_tcmalloc", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
+        native_worker_sha256=hashlib.sha256(native_worker.read_bytes()).hexdigest(),
         samples=[],
     )
     rng = random.Random(2929273)
@@ -82,7 +83,8 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role)
+                        binary = native_worker if role == "native_tcmalloc" else worker
+                        timings[role], digest = measure_lin(binary, rows, role)
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -95,11 +97,14 @@ def main(worker, output):
         jemalloc_gain = median(1 - x["jemalloc"] / x["lin"] for x in pairs)
         tcmalloc_gain = median(1 - x["tcmalloc"] / x["jemalloc"] for x in pairs)
         tcmalloc_wins = sum(x["tcmalloc"] < x["duckdb"] for x in pairs)
+        native_gain = median(1 - x["native_tcmalloc"] / x["tcmalloc"] for x in pairs)
+        native_wins = sum(x["native_tcmalloc"] < x["duckdb"] for x in pairs)
         jemalloc_wins = sum(x["jemalloc"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
               f"A/A {noise:.2%}, jemalloc gain {jemalloc_gain:.2%}, "
               f"jemalloc wins {jemalloc_wins}/{len(pairs)}, tcmalloc gain vs jemalloc "
-              f"{tcmalloc_gain:.2%}, tcmalloc wins {tcmalloc_wins}/{len(pairs)}", flush=True)
+              f"{tcmalloc_gain:.2%}, tcmalloc wins {tcmalloc_wins}/{len(pairs)}, "
+              f"native gain vs generic TCMalloc {native_gain:.2%}, native wins {native_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
