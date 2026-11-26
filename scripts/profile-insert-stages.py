@@ -14,7 +14,7 @@ for trial in range(8):
             env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
         run = subprocess.run([sys.argv[1]], text=True, input=request, env=env, capture_output=True, check=True)
         data = json.loads(run.stdout)
-        components = {"build": [], "reserve": []}
+        components = {"build": [], "reserve": [], "minor_faults": []}
         for line in run.stderr.splitlines():
             if line.startswith("insert_profile "):
                 _, component, ns = line.split()
@@ -25,5 +25,5 @@ for trial in range(8):
         assert len(ends) == 3 and all(len(sample) == 12 for sample in ends)
         durations = [[b-a for a,b in zip([0]+sample, sample)] for sample in ends]
         assert all(min(sample) >= 0 for sample in durations)
-        results.append(dict(trial=trial, mode=mode, stage_ns=durations, component_ns=components, total_ns=data["samples_ns"]))
+        results.append(dict(trial=trial, mode=mode, stage_ns=durations, minor_faults=components.pop("minor_faults"), component_ns=components, total_ns=data["samples_ns"]))
 print(json.dumps(results))

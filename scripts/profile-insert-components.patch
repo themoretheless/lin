@@ -2,14 +2,23 @@ diff --git a/src/exec/dml.rs b/src/exec/dml.rs
 index 284d194f9..2edd8c5be 100644
 --- a/src/exec/dml.rs
 +++ b/src/exec/dml.rs
-@@ -1205,8 +1205,10 @@ impl Db {
+@@ -1205,8 +1205,19 @@ impl Db {
          } else {
              None
          };
++        fn minor_faults() -> u64 {
++            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
++            let (_, fields) = stat.rsplit_once(')').unwrap();
++            fields.split_whitespace().nth(7).unwrap().parse().unwrap()
++        }
++        let faults_before = minor_faults();
 +        let started = std::time::Instant::now();
          let (built, all_uniform, all_embedded, lossless_cols) =
              build_insert_rows(records, now, needs_embed, hashing_dim);
-+        eprintln!("insert_profile build {}", started.elapsed().as_nanos());
++        let build_ns = started.elapsed().as_nanos();
++        let faults = minor_faults() - faults_before;
++        eprintln!("insert_profile build {build_ns}");
++        eprintln!("insert_profile minor_faults {faults}");
          // Any record without an explicit id gets a generated one, wherever it sits in the
          // batch (deciding from the first record left later id-less rows without an id).
          let needs_id = records.is_empty()
