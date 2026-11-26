@@ -186,3 +186,11 @@ Using the instrumented fault-profile run under default settings, subtract the su
 The residual includes every stage outside the row builder. These within-Lin first/repeat differences do not measure the duration of an individual stage or a Lin/DuckDB gap.
 
 [Per-process transaction and row-build intervals](https://github.com/themoretheless/lin/actions/runs/45803896427)
+
+## Reuse uniform source layout for ID presence
+
+Candidate `154c986e4` versus baseline `c226a2334`, eight alternating same-host pairs per size. First 10k improved in 28/32 pairs and first 100k in 22/32. At 100k the paired median improvement was 2.60 and 1.09 ms on the two EPYC 7763s, 1.27 ms on EPYC 9V74 and 1.50 ms on ARM N2. Repeat 100k was mixed, with changes of −1.26, +0.58, +0.32 and −0.60 ms respectively. Retained for further qualification on the experimental branch.
+
+Against DuckDB on standard pages, all three EPYC hosts still lost all 25 first-100k pairs each. The gaps between medians were 25.56, 28.04 and 24.28 ms. With THP enabled symmetrically, Lin won all 400 pairs across sizes and hosts.
+
+[DuckDB samples and same-host candidate comparisons](https://github.com/themoretheless/lin/actions/runs/45815495705)
