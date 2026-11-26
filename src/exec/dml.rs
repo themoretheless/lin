@@ -2573,12 +2573,15 @@ fn build_insert_rows(
             struct WaitBuildGuard<'a>(&'a BuildTask);
             impl Drop for WaitBuildGuard<'_> {
                 fn drop(&mut self) {
-                    if std::thread::panicking() {
-                        self.0
-                            .next_chunk
-                            .store(self.0.total_chunks, Ordering::Release);
-                    }
-                    while self.0.done_chunks.load(Ordering::Acquire) < self.0.total_chunks {
+                    let claimed = if std::thread::panicking() {
+                        // Stop new claims and wait only for chunks already handed out.
+                        self.0.next_chunk
+                            .fetch_max(self.0.total_chunks, Ordering::AcqRel)
+                            .min(self.0.total_chunks)
+                    } else {
+                        self.0.total_chunks
+                    };
+                    while self.0.done_chunks.load(Ordering::Acquire) < claimed {
                         if !self.0.finished.load(Ordering::Acquire) {
                             std::thread::park_timeout(std::time::Duration::from_micros(50));
                         }
