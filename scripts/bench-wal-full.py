@@ -2,6 +2,7 @@
 import argparse
 from itertools import permutations
 import json
+import os
 from pathlib import Path
 import random
 import sqlite3
@@ -22,9 +23,12 @@ def fixture(n):
              123456, f"body {i}") for i in range(n)]
 
 
-def run_lin(worker, directory, rows):
+def run_lin(worker, directory, rows, candidate=False):
+    env = dict(os.environ)
+    if candidate and env.get("LIN_X64_ALLOCATOR"):
+        env["LD_PRELOAD"] = env["LIN_X64_ALLOCATOR"]
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, durable_dir=directory)
-    result = json.loads(subprocess.check_output([worker], input=json.dumps(request) + "\n", text=True))
+    result = json.loads(subprocess.check_output([worker], input=json.dumps(request) + "\n", text=True, env=env))
     if not (len(result.get("reopen_ns", [])) == 1 and result["reopen_ns"][0] > 0
             and any(Path(directory).iterdir())):
         raise ValueError("Lin worker did not confirm a durable database reopen")
@@ -79,7 +83,7 @@ def main():
                 for role in order:
                     with tempfile.TemporaryDirectory() as directory:
                         elapsed = (run_sqlite(directory, rows) if role == "sqlite"
-                                   else run_lin(args.worker.resolve(), directory, rows))
+                                   else run_lin(args.worker.resolve(), directory, rows, candidate=role == "lin"))
                     if elapsed <= 0:
                         raise ValueError(f"Nonpositive measurement: {role}, {elapsed}")
                     samples[role] = elapsed
@@ -88,7 +92,7 @@ def main():
         pairs = [row["ns"] for row in report["samples"] if row["rows"] == n]
         print(n, {role: median(row[role] for row in pairs) / 1e6 for role in orders[0]},
               "Lin wins", sum(row["lin"] < row["sqlite"] for row in pairs), "/", len(pairs),
-              "median A/A %", median(abs(100 * (1 - row["lin_control"] / row["lin"])) for row in pairs))
+              "median absolute candidate/control %", median(abs(100 * (1 - row["lin_control"] / row["lin"])) for row in pairs))
 
 
 if __name__ == "__main__":

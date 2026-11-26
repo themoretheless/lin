@@ -1,7 +1,7 @@
 name: SQLite WAL FULL with verified Lin recovery
 on:
   push:
-    branches: [codex/wal-full-inline-fts]
+    branches: [codex/wal-full-x64-tcmalloc]
 permissions:
   contents: read
 jobs:
@@ -43,6 +43,13 @@ jobs:
           cargo build --locked --release -p lin-peer-worker
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y libtcmalloc-minimal4
+            export LIN_X64_ALLOCATOR=$(ldconfig -p | awk '/libtcmalloc_minimal\.so\.4 / {print $NF; exit}')
+            test -f "$LIN_X64_ALLOCATOR"
+            sha256sum "$LIN_X64_ALLOCATOR" >> provenance.txt
+          fi
           python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json | tee summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
