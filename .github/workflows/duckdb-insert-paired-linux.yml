@@ -38,6 +38,9 @@ jobs:
         if: steps.cpu.outputs.matched == 'true'
         run: |
           cargo build --locked --release -p lin-peer-worker
+          cp target/release/lin-peer-worker generic-worker
+          RUSTFLAGS="-C target-cpu=native" cargo build --locked --release -p lin-peer-worker
+          cp target/release/lin-peer-worker native-worker
           python3 -m pip install -r scripts/bench-peers-requirements.lock
       - name: Measure prepared INSERT and validate readback
         if: steps.cpu.outputs.matched == 'true'
@@ -47,9 +50,9 @@ jobs:
           uname -a >> duckdb-provenance.txt
           lscpu >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
-          sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
-          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
-          python3 scripts/profile-duckdb-insert-transaction.py target/release/lin-peer-worker duckdb-phases.json | tee duckdb-phases.txt
+          sha256sum generic-worker native-worker >> duckdb-provenance.txt
+          python3 scripts/bench-duckdb-insert-paired.py generic-worker native-worker duckdb-results.json | tee duckdb-summary.txt
+          python3 scripts/profile-duckdb-insert-transaction.py generic-worker duckdb-phases.json | tee duckdb-phases.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

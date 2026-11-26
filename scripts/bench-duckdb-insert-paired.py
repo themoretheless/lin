@@ -2,7 +2,6 @@
 import hashlib
 import itertools
 import json
-import os
 from pathlib import Path
 import platform
 import random
@@ -34,26 +33,21 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, direct_cells=False):
-    env = dict(os.environ)
-    env.pop("LIN_BENCH_SHARED_INSERT_SHAPE", None)
-    env.pop("LIN_BENCH_BULK_BUILD_CHUNKS", None)
-    env.pop("LIN_BENCH_DIRECT_INSERT_CELLS", None)
-    if direct_cells:
-        env["LIN_BENCH_DIRECT_INSERT_CELLS"] = "1"
+def measure_lin(worker, rows):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     result = json.loads(subprocess.check_output(
-        [worker], input=json.dumps(request) + "\n", text=True, env=env))
+        [worker], input=json.dumps(request) + "\n", text=True))
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin readback disagrees with fixture")
     return result["samples_ns"][0]
 
 
-def main(worker, output):
-    roles = ("lin", "control", "direct_cells", "duckdb")
+def main(worker, native_worker, output):
+    roles = ("lin", "control", "native_cpu", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
-        worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(), samples=[],
+        worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
+        native_sha256=hashlib.sha256(native_worker.read_bytes()).hexdigest(), samples=[],
     )
     rng = random.Random(2929273)
     for n in (10_000, 100_000):
@@ -61,7 +55,7 @@ def main(worker, output):
         frame = pd.DataFrame(rows, columns=FIELDS)
         measure_duckdb(frame, rows)
         measure_lin(worker, rows)
-        measure_lin(worker, rows, direct_cells=True)
+        measure_lin(native_worker, rows)
         for block in range(1):
             orders = list(itertools.permutations(roles))
             rng.shuffle(orders)
@@ -70,7 +64,7 @@ def main(worker, output):
                 for role in order:
                     timings[role] = (
                         measure_duckdb(frame, rows) if role == "duckdb"
-                        else measure_lin(worker, rows, direct_cells=role == "direct_cells")
+                        else measure_lin(native_worker if role == "native_cpu" else worker, rows)
                     )
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
                 output.write_text(json.dumps(report, indent=2) + "\n")
@@ -79,12 +73,12 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        direct_cells_gain = median(1 - x["direct_cells"] / x["lin"] for x in pairs)
-        direct_cells_wins = sum(x["direct_cells"] < x["duckdb"] for x in pairs)
+        native_cpu_gain = median(1 - x["native_cpu"] / x["lin"] for x in pairs)
+        native_cpu_wins = sum(x["native_cpu"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, direct_cells gain {direct_cells_gain:.2%}, "
-              f"direct_cells wins {direct_cells_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, native_cpu gain {native_cpu_gain:.2%}, "
+              f"native_cpu wins {native_cpu_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve(), Path(sys.argv[2]))
+    main(*(Path(arg).resolve() for arg in sys.argv[1:]))
