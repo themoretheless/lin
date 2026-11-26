@@ -156,3 +156,7 @@ Release timings below are Lin / DuckDB median milliseconds, with Lin wins in par
 | Neoverse-N2 (arm64) | thp | 7.58 / 23.03 (25/25) | 4.57 / 22.96 (25/25) | 74.05 / 217.16 (25/25) | 60.08 / 216.34 (25/25) | 34,317.5 | 39.78 |
 
 [Paired release measurements and instrumented profiles](https://github.com/themoretheless/lin/actions/runs/45803896427)
+
+## Coverage of the five-to-eight-cell candidate
+
+The Lin fixture in `tools/peer-worker/src/main.rs` supplies seven fields (id, uri, wing, title, body, layer, ts). Row construction adds hash and embedding, yielding nine slots. Candidate `f2f14bcf2` changes the storage path only for widths five through eight. Both builds already allocate the nine-slot row directly in its final vector. Consequently differences from this paired run cannot qualify that change for this workload. The candidate was withdrawn.
