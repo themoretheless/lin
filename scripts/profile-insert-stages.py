@@ -12,11 +12,18 @@ for trial in range(8):
         env.pop("GLIBC_TUNABLES", None)
         if mode == "thp":
             env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
-        data = json.loads(subprocess.check_output([sys.argv[1]], text=True, input=request, env=env))
+        run = subprocess.run([sys.argv[1]], text=True, input=request, env=env, capture_output=True, check=True)
+        data = json.loads(run.stdout)
+        components = {"build": [], "reserve": []}
+        for line in run.stderr.splitlines():
+            if line.startswith("insert_profile "):
+                _, component, ns = line.split()
+                components[component].append(int(ns))
+        assert all(len(values) == 30 for values in components.values())
         assert len(data["result"]) == 100000
         ends = data["stage_end_ns"]
         assert len(ends) == 3 and all(len(sample) == 12 for sample in ends)
         durations = [[b-a for a,b in zip([0]+sample, sample)] for sample in ends]
         assert all(min(sample) >= 0 for sample in durations)
-        results.append(dict(trial=trial, mode=mode, stage_ns=durations, total_ns=data["samples_ns"]))
+        results.append(dict(trial=trial, mode=mode, stage_ns=durations, component_ns=components, total_ns=data["samples_ns"]))
 print(json.dumps(results))
