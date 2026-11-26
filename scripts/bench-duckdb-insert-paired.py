@@ -34,13 +34,13 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, buffer_common=False):
+def measure_lin(worker, rows, reserve_terms=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     env = dict(os.environ)
     env["LIN_BENCH_FTS_FUSED_ASCII"] = "1"
-    env.pop("LIN_BENCH_FTS_BUFFER_COMMON", None)
-    if buffer_common:
-        env["LIN_BENCH_FTS_BUFFER_COMMON"] = "1"
+    env.pop("LIN_BENCH_FTS_RESERVE_TERMS", None)
+    if reserve_terms:
+        env["LIN_BENCH_FTS_RESERVE_TERMS"] = "1"
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
@@ -49,7 +49,7 @@ def measure_lin(worker, rows, buffer_common=False):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "buffer_common", "duckdb")
+    roles = ("lin", "control", "reserve_terms", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
@@ -72,7 +72,7 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role == "buffer_common")
+                        timings[role], digest = measure_lin(worker, rows, role == "reserve_terms")
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -82,11 +82,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        buffer_common_gain = median(1 - x["buffer_common"] / x["lin"] for x in pairs)
-        buffer_common_wins = sum(x["buffer_common"] < x["duckdb"] for x in pairs)
+        reserve_terms_gain = median(1 - x["reserve_terms"] / x["lin"] for x in pairs)
+        reserve_terms_wins = sum(x["reserve_terms"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, buffer_common gain {buffer_common_gain:.2%}, "
-              f"buffer_common wins {buffer_common_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, reserve_terms gain {reserve_terms_gain:.2%}, "
+              f"reserve_terms wins {reserve_terms_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
