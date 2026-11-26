@@ -3923,16 +3923,22 @@ impl Store {
             let docs_wing = &mut self.docs_wing;
 
             let has_fts = fts_opt.is_some();
+            let profile = std::env::var_os("LIN_BENCH_INSERT_PHASES").is_some();
             let ((), idx_res, ()) = crate::work_steal::steal3(
                 crate::work_steal::StealLane::MaintFts,
                 has_fts,
                 move || {
+                    let started = profile.then(std::time::Instant::now);
                     if let Some(fts) = fts_opt {
                         fts.append_slab(start, built);
+                    }
+                    if let Some(started) = started {
+                        eprintln!("INSERT_FTS {}", started.elapsed().as_nanos());
                     }
                 },
                 crate::work_steal::StealLane::MaintIdx,
                 move || -> Result<(), Error> {
+                    let started = profile.then(std::time::Instant::now);
                     for idx in indexes.values_mut() {
                         if idx.def.collection == collection
                             && let Err(e) = idx.insert_slab_batch_no_reverse(start, built)
@@ -3940,9 +3946,13 @@ impl Store {
                             return Err(Error::runtime(e));
                         }
                     }
+                    if let Some(started) = started {
+                        eprintln!("INSERT_INDEX {}", started.elapsed().as_nanos());
+                    }
                     Ok(())
                 },
                 move || {
+                    let started = profile.then(std::time::Instant::now);
                     if let Some(hnsw) = hnsw_opt {
                         for (i, row) in built.iter().enumerate() {
                             if let Some(Cell::Vec(v)) = row.get_str("embedding") {
@@ -4011,6 +4021,9 @@ impl Store {
                             docs_layer.push_cell(found[3]);
                             docs_wing.push_cell(found[4]);
                         }
+                    }
+                    if let Some(started) = started {
+                        eprintln!("INSERT_ROW_MAPS {}", started.elapsed().as_nanos());
                     }
                 },
             );

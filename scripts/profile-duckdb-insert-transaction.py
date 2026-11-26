@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 worker, output = (Path(arg).resolve() for arg in sys.argv[1:])
-phases = dict(BEGIN=1, BUILD=10, CHECK=10, MAINTAIN=10, CHUNK=10, COMMIT=1)
+phases = dict(BEGIN=1, BUILD=10, CHECK=10, MAINTAIN=10, FTS=10, INDEX=10, ROW_MAPS=10, CHUNK=10, COMMIT=1)
 request = json.dumps(dict(insert_rows=100_000, samples=1, timestamp_ms=123456))
 samples = []
 for _ in range(12):
@@ -24,7 +24,7 @@ for _ in range(12):
         sample[phase] = values
     samples.append(sample)
     output.write_text(json.dumps(samples, indent=2) + "\n")
-print("100k phase medians (ms)", {
+print("100k phase medians (ms, FTS/index/row maps overlap)", {
     key: round(median(x["total_ns"] if key == "total_ns" else sum(x[key])
                       for x in samples) / 1e6, 3)
     for key in ("total_ns", *phases)
