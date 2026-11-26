@@ -31,3 +31,20 @@ Engine candidate 154c986e4 ran the same balanced FULL-sync commit and recovery p
 Lin won 143 of 144 pairs. This comparison measures the candidate against SQLite. Earlier revision timings came from different runners and cannot establish the candidate's incremental speedup.
 
 [Paired samples and verified recovery run](https://github.com/themoretheless/lin/actions/runs/45817863320)
+
+## Same-host uniform ID candidate versus previous Lin and SQLite
+
+Balanced order, 24 pairs per host and size. Delta is the median paired candidate minus previous Lin in milliseconds. Negative values favor the candidate. All inserts were verified after recovery.
+
+| Host | Rows | Candidate ms | Previous ms | SQLite ms | Delta ms | Wins vs previous | Wins vs SQLite |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-2) | 1000 | 1.411 | 1.390 | 1.973 | 0.023 | 10/24 | 23/24 |
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-2) | 10000 | 13.321 | 13.079 | 20.841 | 0.273 | 6/24 | 22/24 |
+| AMD EPYC 9V74 80-Core Processor (wal-full-amd-3) | 1000 | 2.329 | 2.335 | 2.589 | -0.022 | 16/24 | 24/24 |
+| AMD EPYC 9V74 80-Core Processor (wal-full-amd-3) | 10000 | 27.138 | 27.642 | 29.979 | -0.597 | 14/24 | 23/24 |
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-4) | 1000 | 1.325 | 1.263 | 1.924 | 0.012 | 11/24 | 22/24 |
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-4) | 10000 | 11.957 | 12.115 | 20.446 | -0.349 | 13/24 | 24/24 |
+| Neoverse-N2 (wal-full-arm64) | 1000 | 2.165 | 2.108 | 2.412 | 0.052 | 8/24 | 18/24 |
+| Neoverse-N2 (wal-full-arm64) | 10000 | 20.243 | 20.221 | 27.042 | 0.110 | 12/24 | 24/24 |
+
+[Full-sync paired measurements](https://github.com/themoretheless/lin/actions/runs/45818768030)
