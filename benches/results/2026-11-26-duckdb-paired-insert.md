@@ -44,6 +44,6 @@ Heaptrack on EPYC 7763 attributed 308.8 MB across 100,000 allocations to embeddi
 
 ## Two-thread builder experiment
 
-Reject the Linux x64 two-thread cap from `69c4136f1`. At default allocator settings, the first 100k insert lost all eight same-host pairs on each of the first three reporting EPYC hosts. Median paired slowdowns were 12.05 ms on 9V45 and 28.43 / 30.96 ms on the two 9V74 hosts. The 100k repeat also slowed on all three. Minor faults on the first 100k insert changed by fewer than 13 per host. Lower kernel CPU consumption did not translate into lower wall time.
+Reject the Linux x64 two-thread cap from `69c4136f1`. At default allocator settings, the first 100k insert lost all eight same-host pairs on all four EPYC hosts (32 losses in 32 pairs). Median paired slowdowns were 12.05 ms on 9V45 and 28.43 / 29.25 / 30.96 ms on the three 9V74 hosts. The 100k repeat also slowed in all 32 pairs, by median differences of 5.12 to 9.66 ms. Minor faults on the first 100k insert changed by at most 13 per host. Lower kernel CPU consumption did not translate into lower wall time.
 
 [Experiment and paired sample data](https://github.com/themoretheless/lin/actions/runs/45789043619)
