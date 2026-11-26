@@ -89,3 +89,22 @@ Revision 2d408555d against SQLite 3.54.1, four balanced blocks with reopen and e
 |---|---:|---:|---:|---:|
 | 1000 | 1.454 | 1.420 | +0.057 | 7/24 |
 | 10000 | 6.952 | 15.148 | -8.145 | 24/24 |
+
+## Inline full-text keys on Linux
+
+Engine 0add1938e, workflow revision 78465b33e. Each pair uses fresh databases and verifies recovered rows. The control uses the same Lin binary. Times are milliseconds.
+
+| CPU and runner | Rows | Lin | SQLite | Median paired Lin minus SQLite | Lin wins |
+|---|---:|---:|---:|---:|---:|
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-1) | 1000 | 1.251 | 1.923 | -0.675 | 24/24 |
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-1) | 10000 | 11.791 | 20.147 | -8.366 | 22/24 |
+| AMD EPYC 7763 64-Core Processor (wal-full-amd-2) | 1000 | 2.998 | 3.384 | -0.407 | 23/24 |
+| AMD EPYC 7763 64-Core Processor (wal-full-amd-2) | 10000 | 28.209 | 34.979 | -6.848 | 24/24 |
+| AMD EPYC 7763 64-Core Processor (wal-full-amd-3) | 1000 | 2.885 | 3.486 | -0.604 | 24/24 |
+| AMD EPYC 7763 64-Core Processor (wal-full-amd-3) | 10000 | 27.409 | 35.826 | -8.503 | 24/24 |
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-4) | 1000 | 1.751 | 2.033 | -0.325 | 15/24 |
+| AMD EPYC 9V45 96-Core Processor (wal-full-amd-4) | 10000 | 13.492 | 20.783 | -7.656 | 22/24 |
+| Neoverse-N2 (wal-full-arm64) | 1000 | 2.251 | 2.516 | -0.271 | 23/24 |
+| Neoverse-N2 (wal-full-arm64) | 10000 | 16.294 | 25.029 | -8.774 | 24/24 |
+
+Lin won 225/240 comparisons. [Linux artifacts and hardware provenance](https://github.com/themoretheless/lin/actions/runs/45848667483)
