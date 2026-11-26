@@ -20,7 +20,50 @@ use crate::persist::io_err;
 use crate::store::row::OwnedFieldSlot;
 use crate::store::{Cell, Row};
 
-type Postings = hashbrown::HashMap<Arc<str>, SmallVec<[usize; 2]>, FxBuildHasher>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Term {
+    Inline(crate::store::InlineStr),
+    Shared(Arc<str>),
+}
+
+impl From<&str> for Term {
+    fn from(value: &str) -> Self {
+        match crate::store::InlineStr::try_new(value) {
+            Some(short) => Self::Inline(short),
+            None => Self::Shared(Arc::from(value)),
+        }
+    }
+}
+
+impl AsRef<str> for Term {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Inline(value) => value.as_str(),
+            Self::Shared(value) => value,
+        }
+    }
+}
+
+impl std::ops::Deref for Term {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+impl std::borrow::Borrow<str> for Term {
+    fn borrow(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+impl std::hash::Hash for Term {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+type Postings = hashbrown::HashMap<Term, SmallVec<[usize; 2]>, FxBuildHasher>;
 
 pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
@@ -59,8 +102,8 @@ pub struct FtsIndex {
     pub fields: Vec<String>,
     slots: SmallVec<[OwnedFieldSlot; 4]>,
     postings: Postings,
-    dels: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
-    adds: FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    dels: FxHashMap<Term, SmallVec<[usize; 2]>>,
+    adds: FxHashMap<Term, SmallVec<[usize; 2]>>,
 }
 
 impl Default for FtsIndex {
@@ -224,7 +267,7 @@ impl FtsIndex {
                 }
             }
             None => {
-                self.postings.insert(Arc::from(tok), smallvec![row_idx]);
+                self.postings.insert(Term::from(tok), smallvec![row_idx]);
                 return;
             }
         }
@@ -339,7 +382,7 @@ impl FtsIndex {
         }
         let Some((key, base)) = self.postings.remove_entry(tok) else {
             if !adds.is_empty() {
-                self.postings.insert(Arc::from(tok), adds);
+                self.postings.insert(Term::from(tok), adds);
             }
             return;
         };
@@ -351,7 +394,7 @@ impl FtsIndex {
 
     /// Fold every term; call before serializing so the file format stays base-only.
     pub fn fold_all(&mut self) {
-        let terms: Vec<Arc<str>> = self.dels.keys().chain(self.adds.keys()).cloned().collect();
+        let terms: Vec<Term> = self.dels.keys().chain(self.adds.keys()).cloned().collect();
         for tok in terms {
             self.fold_term(&tok);
         }
@@ -544,8 +587,8 @@ impl FtsIndex {
     }
 
     pub fn encode(&self, generation: u64, nrows: u64) -> Vec<u8> {
-        let mut terms: Vec<(&Arc<str>, &SmallVec<[usize; 2]>)> = self.postings.iter().collect();
-        terms.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut terms: Vec<(&Term, &SmallVec<[usize; 2]>)> = self.postings.iter().collect();
+        terms.sort_unstable_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
         let fields_bytes: usize = self.fields.iter().map(|f| 4 + f.len()).sum();
         let terms_bytes: usize = terms
             .iter()
@@ -613,7 +656,7 @@ impl FtsIndex {
         let mut postings =
             Postings::with_capacity_and_hasher(nterms.min((bytes.len() - i) / 8), Default::default());
         for _ in 0..nterms {
-            let tok = read_arc_str(bytes, &mut i)?;
+            let tok = read_term(bytes, &mut i)?;
             let n = read_u32(bytes, &mut i)? as usize;
             let mut list = SmallVec::with_capacity(n.min((bytes.len() - i) / 4));
             for _ in 0..n {
@@ -678,8 +721,8 @@ fn read_str(b: &[u8], i: &mut usize) -> Result<String, Error> {
     Ok(read_str_ref(b, i)?.to_string())
 }
 
-fn read_arc_str(b: &[u8], i: &mut usize) -> Result<Arc<str>, Error> {
-    Ok(Arc::from(read_str_ref(b, i)?))
+fn read_term(b: &[u8], i: &mut usize) -> Result<Term, Error> {
+    Ok(Term::from(read_str_ref(b, i)?))
 }
 
 #[allow(dead_code)]
@@ -866,7 +909,7 @@ fn union_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
 
 /// Insert into a sorted, unique pending list; merges rely on this invariant.
 fn push_pending(
-    map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>,
+    map: &mut FxHashMap<Term, SmallVec<[usize; 2]>>,
     postings: &Postings,
     tok: &str,
     row_idx: usize,
@@ -880,9 +923,9 @@ fn push_pending(
         list.len()
     } else {
         let key = if let Some((k, _)) = postings.get_key_value(tok) {
-            Arc::clone(k)
+            k.clone()
         } else {
-            Arc::from(tok)
+            Term::from(tok)
         };
         map.insert(key, smallvec![row_idx]);
         1
@@ -891,7 +934,7 @@ fn push_pending(
 
 /// Drop `row_idx` from a term's pending list, reporting whether it was there.
 /// A cancelled entry means the base list already holds the right answer.
-fn cancel(map: &mut FxHashMap<Arc<str>, SmallVec<[usize; 2]>>, tok: &str, row_idx: usize) -> bool {
+fn cancel(map: &mut FxHashMap<Term, SmallVec<[usize; 2]>>, tok: &str, row_idx: usize) -> bool {
     let Some(list) = map.get_mut(tok) else {
         return false;
     };
@@ -988,7 +1031,7 @@ fn add_posting(
     tok: &str,
     row_idx: usize,
 ) {
-    // Arc<str> hashes its string contents, so the borrowed hash also indexes
+    // Term hashes its string contents, so the borrowed hash also indexes
     // the owned key. Allocate the Arc only when the token is new.
     let hash = postings.hasher().hash_one(tok);
     let list = match postings
@@ -997,7 +1040,7 @@ fn add_posting(
     {
         RawEntryMut::Occupied(entry) => entry.into_mut(),
         RawEntryMut::Vacant(entry) => {
-            entry.insert_hashed_nocheck(hash, Arc::from(tok), smallvec![row_idx]);
+            entry.insert_hashed_nocheck(hash, Term::from(tok), smallvec![row_idx]);
             return;
         }
     };
@@ -1231,6 +1274,23 @@ pub fn fts_fields(catalog: &crate::catalog::Catalog, collection: &str) -> Vec<St
 mod tests {
     use super::*;
     use crate::store::{Cell, row_text};
+
+    #[test]
+    fn inline_and_shared_terms_survive_exact_prefix_and_snapshot_lookups() {
+        let prefix = "é".repeat(11);
+        let longer = format!("{prefix}x");
+        let rows = [
+            Row::from([("title", Cell::text_arc(prefix.as_str()))]),
+            Row::from([("title", Cell::text_arc(longer.as_str()))]),
+        ];
+        let index = FtsIndex::build(&rows, &["title".into()]);
+        let bytes = index.encode(1, 2);
+        let (_, _, restored) = FtsIndex::decode(&bytes).unwrap();
+        assert_eq!(restored.candidate_idxs(&prefix), vec![0]);
+        assert_eq!(restored.candidate_idxs(&longer), vec![1]);
+        assert_eq!(restored.candidate_idxs(&format!("{prefix}*")), vec![0, 1]);
+        assert_eq!(restored.encode(1, 2), bytes);
+    }
 
     #[test]
     fn parallel_postings_match_serial_with_overlapping_rows() {
