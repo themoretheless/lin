@@ -381,3 +381,18 @@ Medians in milliseconds from eight processes per host and mode. The validation i
 On the first default EPYC transaction, ID-map reservation accounted for 6.06–6.34 ms within maintenance. Identifying the remaining cost requires timings inside the maintenance routine.
 
 [Linux run and per-statement samples](https://github.com/themoretheless/lin/actions/runs/45837167074)
+
+## Maintenance critical path on 100k inserts
+
+All 1,920 measured statements entered the parallel maintenance branch. Setup precedes three concurrent operations. The table gives elapsed milliseconds per 100k transaction at default settings, as first / repeat. Operation medians overlap in time. Each mode had eight processes per host.
+
+| Host | Maintenance total | Setup | Secondary index | Full-text index | Row maps and HNSW branch |
+|---|---:|---:|---:|---:|---:|
+| EPYC 7763 amd-2 | 46.14 / 40.85 | 9.97 / 8.51 | 11.34 / 10.77 | 35.14 / 31.62 | 20.64 / 19.77 |
+| EPYC 9V74 | 47.62 / 42.47 | 9.31 / 7.86 | 8.99 / 8.51 | 37.79 / 34.11 | 21.94 / 18.86 |
+| EPYC 7763 amd-4 | 51.14 / 45.10 | 10.47 / 9.46 | 11.51 / 11.36 | 39.76 / 34.89 | 23.22 / 21.59 |
+| Neoverse-N2 | 27.17 / 24.48 | 6.48 / 5.31 | 8.74 / 8.54 | 19.90 / 18.74 | 12.50 / 10.22 |
+
+The full-text index had the longest aggregate lane time on every host, for first and repeat inserts and with both page settings. With THP the first full-text pass still took 34.31–36.65 ms on EPYC and 17.24 ms on ARM64.
+
+[Linux run and per-statement samples](https://github.com/themoretheless/lin/actions/runs/45838227208)
