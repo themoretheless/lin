@@ -80,3 +80,20 @@ Eight fresh processes per host and mode. Each transaction runs ten prepared stat
 Statement six had the highest median on every host in both modes. The profile measures elapsed time for each whole statement.
 
 [Raw statement profiles](https://github.com/themoretheless/lin/actions/runs/45796253951)
+
+## Cold 100k insertion by component
+
+Median milliseconds across eight fresh processes in each mode. The separate profiling build times row construction and ID-map reservation. Each component is summed across ten statements before taking its median.
+
+| CPU | Mode | Transaction | Build rows | Reserve ID map | Sixth statement | Sixth ID reserve |
+|---|---|---:|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor | default | 163.98 | 101.21 | 6.04 | 23.52 | 3.93 |
+| AMD EPYC 9V74 80-Core Processor | thp | 110.54 | 56.25 | 5.24 | 16.07 | 3.11 |
+| AMD EPYC 7763 64-Core Processor | default | 197.44 | 126.21 | 6.43 | 26.82 | 4.21 |
+| AMD EPYC 7763 64-Core Processor | thp | 137.98 | 77.80 | 6.01 | 18.81 | 3.91 |
+| AMD EPYC 9V45 96-Core Processor | default | 76.79 | 42.06 | 3.53 | 11.76 | 2.29 |
+| AMD EPYC 9V45 96-Core Processor | thp | 68.27 | 33.00 | 3.65 | 10.68 | 2.34 |
+| Neoverse-N2 | default | 102.89 | 62.88 | 4.88 | 16.10 | 3.40 |
+| Neoverse-N2 | thp | 72.92 | 40.55 | 3.82 | 11.34 | 2.48 |
+
+[Raw component profiles and separate uninstrumented DuckDB comparisons](https://github.com/themoretheless/lin/actions/runs/45798842879)
