@@ -1,0 +1,1012 @@
+{
+  "rows": 1000,
+  "repeats": 3,
+  "samples": 5,
+  "host": "macOS-27.3-arm64-arm-64bit-Mach-O",
+  "engines": [
+    "lin",
+    "duckdb",
+    "sqlite",
+    "pandas"
+  ],
+  "cases": [
+    "point_get",
+    "filter_eq",
+    "text_substr",
+    "materialize",
+    "join_inner",
+    "join_filter"
+  ],
+  "observations": [
+    {
+      "case": "point_get/lin",
+      "repetition": 0,
+      "iterations": 10000,
+      "samples_ns": [
+        35.5875,
+        41.225,
+        44.7167,
+        50.8083,
+        38.4709
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/lin",
+      "repetition": 0,
+      "iterations": 10000,
+      "samples_ns": [
+        395.8083,
+        351.0625,
+        358.9708,
+        350.9459,
+        381.3625
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/lin",
+      "repetition": 0,
+      "iterations": 2105,
+      "samples_ns": [
+        3003.5035629453682,
+        2507.799049881235,
+        3201.0688836104514,
+        3405.740617577197,
+        3172.941567695962
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/lin",
+      "repetition": 0,
+      "iterations": 335,
+      "samples_ns": [
+        17796.516417910447,
+        15210.573134328359,
+        9870.522388059702,
+        9815.797014925372,
+        9567.910447761195
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/lin",
+      "repetition": 0,
+      "iterations": 80,
+      "samples_ns": [
+        93476.0375,
+        74246.35,
+        79939.575,
+        71420.8375,
+        65204.1625
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/lin",
+      "repetition": 0,
+      "iterations": 67,
+      "samples_ns": [
+        45713.31343283582,
+        54789.17910447761,
+        45537.94029850746,
+        33731.9552238806,
+        84065.29850746269
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/duckdb",
+      "repetition": 0,
+      "iterations": 23,
+      "samples_ns": [
+        688503.6086956522,
+        442610.47826086957,
+        548139.4782608695,
+        385927.52173913043,
+        451916.652173913
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/duckdb",
+      "repetition": 0,
+      "iterations": 14,
+      "samples_ns": [
+        999687.5,
+        386410.71428571426,
+        491755.9285714286,
+        1230175.5714285714,
+        828872.0
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/duckdb",
+      "repetition": 0,
+      "iterations": 23,
+      "samples_ns": [
+        964625.0,
+        799630.4347826086,
+        751264.5217391305,
+        899063.3913043478,
+        781088.7826086957
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/duckdb",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        5898667.0,
+        3165042.0,
+        6491375.0,
+        1327458.0,
+        1090708.0
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/duckdb",
+      "repetition": 0,
+      "iterations": 2,
+      "samples_ns": [
+        1491250.0,
+        2295521.0,
+        1874145.5,
+        3690917.0,
+        2021958.5
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/duckdb",
+      "repetition": 0,
+      "iterations": 5,
+      "samples_ns": [
+        564058.4,
+        1918416.6,
+        1365058.4,
+        2781300.0,
+        3237983.4
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/sqlite",
+      "repetition": 0,
+      "iterations": 400,
+      "samples_ns": [
+        1533.02,
+        3815.3125,
+        2198.3325,
+        2212.5,
+        2229.1675
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/sqlite",
+      "repetition": 0,
+      "iterations": 241,
+      "samples_ns": [
+        22314.659751037343,
+        11766.078838174273,
+        11425.655601659751,
+        16929.116182572616,
+        26853.215767634854
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/sqlite",
+      "repetition": 0,
+      "iterations": 55,
+      "samples_ns": [
+        93737.10909090909,
+        133844.69090909092,
+        66373.4909090909,
+        50009.09090909091,
+        49651.527272727275
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/sqlite",
+      "repetition": 0,
+      "iterations": 19,
+      "samples_ns": [
+        279929.7894736842,
+        313052.63157894736,
+        248875.0,
+        336453.94736842107,
+        380344.3157894737
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/sqlite",
+      "repetition": 0,
+      "iterations": 5,
+      "samples_ns": [
+        657016.6,
+        577866.6,
+        755858.4,
+        596233.4,
+        625933.2
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/sqlite",
+      "repetition": 0,
+      "iterations": 14,
+      "samples_ns": [
+        336809.5,
+        642309.5,
+        527253.0,
+        527925.5714285715,
+        536083.2857142857
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/pandas",
+      "repetition": 0,
+      "iterations": 396,
+      "samples_ns": [
+        6662.878787878788,
+        14400.88383838384,
+        10919.507575757576,
+        21377.315656565657,
+        15089.118686868687
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/pandas",
+      "repetition": 0,
+      "iterations": 41,
+      "samples_ns": [
+        152673.78048780488,
+        90771.34146341463,
+        113940.0487804878,
+        136977.63414634147,
+        143758.1463414634
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/pandas",
+      "repetition": 0,
+      "iterations": 15,
+      "samples_ns": [
+        158377.8,
+        118666.66666666667,
+        135577.8,
+        178266.66666666666,
+        145977.73333333334
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/pandas",
+      "repetition": 0,
+      "iterations": 1,
+      "samples_ns": [
+        961875.0,
+        690667.0,
+        590375.0,
+        573625.0,
+        578958.0
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/pandas",
+      "repetition": 0,
+      "iterations": 4,
+      "samples_ns": [
+        1420656.25,
+        1596916.75,
+        1283239.75,
+        1367697.75,
+        1175489.5
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/pandas",
+      "repetition": 0,
+      "iterations": 5,
+      "samples_ns": [
+        949558.4,
+        951708.2,
+        949491.6,
+        941358.4,
+        948066.6
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/duckdb",
+      "repetition": 1,
+      "iterations": 16,
+      "samples_ns": [
+        1183947.875,
+        689075.5625,
+        822737.0,
+        1026619.75,
+        478052.0625
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/duckdb",
+      "repetition": 1,
+      "iterations": 8,
+      "samples_ns": [
+        695078.125,
+        1145104.25,
+        1351020.875,
+        920604.125,
+        253479.125
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/duckdb",
+      "repetition": 1,
+      "iterations": 10,
+      "samples_ns": [
+        1623516.7,
+        599295.8,
+        157354.2,
+        410725.0,
+        435279.2
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/duckdb",
+      "repetition": 1,
+      "iterations": 4,
+      "samples_ns": [
+        2478552.0,
+        1595531.25,
+        1991520.75,
+        2471791.75,
+        1112791.75
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/duckdb",
+      "repetition": 1,
+      "iterations": 6,
+      "samples_ns": [
+        815111.1666666666,
+        2285055.6666666665,
+        5581694.5,
+        1824680.5,
+        2133451.3333333335
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/duckdb",
+      "repetition": 1,
+      "iterations": 2,
+      "samples_ns": [
+        4132666.5,
+        3848750.0,
+        1377750.0,
+        3006666.5,
+        1923896.0
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/sqlite",
+      "repetition": 1,
+      "iterations": 1428,
+      "samples_ns": [
+        2317.518207282913,
+        4569.502801120449,
+        3694.61974789916,
+        2431.810224089636,
+        4035.014005602241
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/sqlite",
+      "repetition": 1,
+      "iterations": 236,
+      "samples_ns": [
+        17836.6906779661,
+        11230.57627118644,
+        11216.101694915254,
+        11216.101694915254,
+        33944.91525423729
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/sqlite",
+      "repetition": 1,
+      "iterations": 41,
+      "samples_ns": [
+        113452.24390243902,
+        105114.82926829268,
+        100164.63414634146,
+        108576.21951219512,
+        102932.9268292683
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/sqlite",
+      "repetition": 1,
+      "iterations": 10,
+      "samples_ns": [
+        659487.5,
+        723095.8,
+        441637.5,
+        567337.5,
+        285800.0
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/sqlite",
+      "repetition": 1,
+      "iterations": 8,
+      "samples_ns": [
+        593166.625,
+        648557.25,
+        646250.0,
+        592994.75,
+        581885.375
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/sqlite",
+      "repetition": 1,
+      "iterations": 16,
+      "samples_ns": [
+        299739.5625,
+        299864.5625,
+        414151.0625,
+        980015.625,
+        677625.0
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/pandas",
+      "repetition": 1,
+      "iterations": 366,
+      "samples_ns": [
+        6939.890710382514,
+        14225.98087431694,
+        23049.63387978142,
+        19190.117486338797,
+        14356.101092896175
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/pandas",
+      "repetition": 1,
+      "iterations": 29,
+      "samples_ns": [
+        180625.0,
+        270106.3103448276,
+        189495.6896551724,
+        313317.5172413793,
+        259040.24137931035
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/pandas",
+      "repetition": 1,
+      "iterations": 34,
+      "samples_ns": [
+        181473.0294117647,
+        299600.5,
+        213291.67647058822,
+        117920.35294117648,
+        221528.17647058822
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/pandas",
+      "repetition": 1,
+      "iterations": 3,
+      "samples_ns": [
+        1275277.6666666667,
+        1452847.3333333333,
+        1164208.3333333333,
+        1951694.6666666667,
+        609639.0
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/pandas",
+      "repetition": 1,
+      "iterations": 1,
+      "samples_ns": [
+        2562041.0,
+        2172208.0,
+        1967583.0,
+        3744792.0,
+        2383833.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/pandas",
+      "repetition": 1,
+      "iterations": 1,
+      "samples_ns": [
+        1356458.0,
+        3680291.0,
+        2917000.0,
+        2415125.0,
+        2465542.0
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/lin",
+      "repetition": 1,
+      "iterations": 10000,
+      "samples_ns": [
+        132.2208,
+        58.0625,
+        61.2334,
+        35.2,
+        38.0458
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/lin",
+      "repetition": 1,
+      "iterations": 10000,
+      "samples_ns": [
+        567.25,
+        541.3084,
+        487.3166,
+        408.2917,
+        710.2084
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/lin",
+      "repetition": 1,
+      "iterations": 2105,
+      "samples_ns": [
+        3544.2004750593824,
+        4390.083135391924,
+        2310.9657957244654,
+        2297.3871733966744,
+        6030.324940617577
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/lin",
+      "repetition": 1,
+      "iterations": 68,
+      "samples_ns": [
+        41585.779411764706,
+        14774.5,
+        15035.54411764706,
+        15931.367647058823,
+        18810.04411764706
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/lin",
+      "repetition": 1,
+      "iterations": 55,
+      "samples_ns": [
+        112109.85454545454,
+        92740.14545454546,
+        84128.78181818181,
+        128307.58181818182,
+        97535.6
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/lin",
+      "repetition": 1,
+      "iterations": 113,
+      "samples_ns": [
+        70882.38053097345,
+        62570.79646017699,
+        60796.823008849555,
+        47202.80530973451,
+        60333.70796460177
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/sqlite",
+      "repetition": 2,
+      "iterations": 1714,
+      "samples_ns": [
+        2952.4014002333724,
+        4125.875145857643,
+        2498.71178529755,
+        3127.2368728121355,
+        2837.441656942824
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/sqlite",
+      "repetition": 2,
+      "iterations": 235,
+      "samples_ns": [
+        22649.468085106382,
+        29409.042553191488,
+        11255.672340425532,
+        11230.851063829787,
+        11237.944680851064
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/sqlite",
+      "repetition": 2,
+      "iterations": 103,
+      "samples_ns": [
+        61941.74757281553,
+        96743.52427184465,
+        66854.36893203884,
+        96021.43689320388,
+        100562.30097087378
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/sqlite",
+      "repetition": 2,
+      "iterations": 6,
+      "samples_ns": [
+        412791.6666666667,
+        416500.0,
+        515409.6666666667,
+        451166.6666666667,
+        450923.5
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/sqlite",
+      "repetition": 2,
+      "iterations": 7,
+      "samples_ns": [
+        943339.2857142857,
+        1184946.4285714286,
+        1087178.5714285714,
+        587041.7142857143,
+        585363.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/sqlite",
+      "repetition": 2,
+      "iterations": 16,
+      "samples_ns": [
+        297330.75,
+        297408.875,
+        794929.6875,
+        755809.875,
+        511346.375
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/pandas",
+      "repetition": 2,
+      "iterations": 380,
+      "samples_ns": [
+        12111.073684210527,
+        18166.007894736842,
+        48353.836842105266,
+        23804.276315789473,
+        23405.263157894737
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/pandas",
+      "repetition": 2,
+      "iterations": 34,
+      "samples_ns": [
+        449609.0588235294,
+        344893.3823529412,
+        172536.76470588235,
+        473500.0,
+        278998.79411764705
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/pandas",
+      "repetition": 2,
+      "iterations": 36,
+      "samples_ns": [
+        118886.58333333333,
+        155520.83333333334,
+        218571.77777777778,
+        381787.02777777775,
+        384752.30555555556
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/pandas",
+      "repetition": 2,
+      "iterations": 1,
+      "samples_ns": [
+        1183708.0,
+        1056125.0,
+        4272709.0,
+        1030583.0,
+        678667.0
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/pandas",
+      "repetition": 2,
+      "iterations": 2,
+      "samples_ns": [
+        4275166.5,
+        1544437.5,
+        1137021.0,
+        1107958.5,
+        1120375.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/pandas",
+      "repetition": 2,
+      "iterations": 1,
+      "samples_ns": [
+        2540625.0,
+        3129125.0,
+        2181625.0,
+        7150875.0,
+        1900709.0
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/lin",
+      "repetition": 2,
+      "iterations": 10000,
+      "samples_ns": [
+        34.575,
+        36.6833,
+        22.975,
+        22.85,
+        21.8083
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/lin",
+      "repetition": 2,
+      "iterations": 10000,
+      "samples_ns": [
+        380.2,
+        290.4667,
+        228.7334,
+        753.0542,
+        602.95
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/lin",
+      "repetition": 2,
+      "iterations": 2069,
+      "samples_ns": [
+        3513.8554857419044,
+        3694.5988400193332,
+        2919.586756887385,
+        2912.719671338811,
+        3196.7336877718703
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/lin",
+      "repetition": 2,
+      "iterations": 335,
+      "samples_ns": [
+        52116.66567164179,
+        18022.388059701494,
+        15843.531343283583,
+        17750.746268656716,
+        17048.13432835821
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/lin",
+      "repetition": 2,
+      "iterations": 48,
+      "samples_ns": [
+        130692.70833333333,
+        83452.25,
+        170739.58333333334,
+        123509.5625,
+        95069.4375
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/lin",
+      "repetition": 2,
+      "iterations": 75,
+      "samples_ns": [
+        72095.56,
+        47205.0,
+        93373.33333333333,
+        58936.12,
+        47951.666666666664
+      ],
+      "validated_rows": 495
+    },
+    {
+      "case": "point_get/duckdb",
+      "repetition": 2,
+      "iterations": 33,
+      "samples_ns": [
+        327458.3333333333,
+        929946.9696969697,
+        790931.8181818182,
+        560739.8787878788,
+        454871.2121212121
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "filter_eq/duckdb",
+      "repetition": 2,
+      "iterations": 2,
+      "samples_ns": [
+        1961916.5,
+        1104479.0,
+        622479.0,
+        3662333.0,
+        3229729.0
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "text_substr/duckdb",
+      "repetition": 2,
+      "iterations": 13,
+      "samples_ns": [
+        851676.3076923077,
+        826605.7692307692,
+        387746.8461538461,
+        1076916.6923076923,
+        863294.8461538461
+      ],
+      "validated_rows": 1
+    },
+    {
+      "case": "materialize/duckdb",
+      "repetition": 2,
+      "iterations": 4,
+      "samples_ns": [
+        1120552.0,
+        2199020.75,
+        3392937.5,
+        1043239.5,
+        993666.75
+      ],
+      "validated_rows": 500
+    },
+    {
+      "case": "join_inner/duckdb",
+      "repetition": 2,
+      "iterations": 1,
+      "samples_ns": [
+        1610042.0,
+        2202125.0,
+        3262250.0,
+        1805417.0,
+        2201292.0
+      ],
+      "validated_rows": 1000
+    },
+    {
+      "case": "join_filter/duckdb",
+      "repetition": 2,
+      "iterations": 1,
+      "samples_ns": [
+        1395708.0,
+        1200167.0,
+        3073417.0,
+        1099750.0,
+        701125.0
+      ],
+      "validated_rows": 495
+    }
+  ],
+  "errors": [],
+  "versions": {
+    "lin": "0.7.1",
+    "duckdb": "2.0.0",
+    "sqlite": "3.54.1",
+    "pandas": "3.0.6"
+  },
+  "medians_ns": {
+    "point_get/lin": 41.225,
+    "point_get/duckdb": 560739.8787878788,
+    "point_get/sqlite": 2952.4014002333724,
+    "point_get/pandas": 14400.88383838384,
+    "filter_eq/lin": 380.2,
+    "filter_eq/duckdb": 920604.125,
+    "filter_eq/sqlite": 11255.672340425532,
+    "filter_eq/pandas": 259040.24137931035,
+    "text_substr/lin": 3196.7336877718703,
+    "text_substr/duckdb": 799630.4347826086,
+    "text_substr/sqlite": 96021.43689320388,
+    "text_substr/pandas": 213291.67647058822,
+    "materialize/lin": 15931.367647058823,
+    "materialize/duckdb": 1991520.75,
+    "materialize/sqlite": 450923.5,
+    "materialize/pandas": 1056125.0,
+    "join_inner/lin": 97535.6,
+    "join_inner/duckdb": 2133451.3333333335,
+    "join_inner/sqlite": 625933.2,
+    "join_inner/pandas": 1367697.75,
+    "join_filter/lin": 58936.12,
+    "join_filter/duckdb": 1918416.6,
+    "join_filter/sqlite": 511346.375,
+    "join_filter/pandas": 2465542.0
+  },
+  "python": "3.14.10 (main, Oct 25 2026, 17:12:00) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "clients": {
+    "pandas": "3.0.6",
+    "duckdb": "2.0.0",
+    "pymongo": "4.18.2",
+    "psycopg": "3.3.6",
+    "PyMySQL": "1.2.3",
+    "python-tds": "1.17.1"
+  },
+  "lin_binary_info": {
+    "path": "target/release/lin-peer-worker",
+    "size_bytes": 9056560,
+    "mtime": 1795707218.7874897,
+    "sha256": "00aac191c77f7ce76ce6d196f714b23c2e0795a4d62f746d93242dc6d2446071"
+  },
+  "git_commit": "05bf56857182ecfe5d442797caf112c085e6307e",
+  "git_status_before": "",
+  "native_contracts": {},
+  "status": "complete",
+  "git_status_after": "",
+  "source_drift": false
+}
