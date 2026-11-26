@@ -115,11 +115,14 @@ fn log_codecs(dir: &Path) -> Vec<u8> {
 
 #[test]
 fn dictionary_codec_is_written_only_when_enabled_and_read_everywhere() {
-    assert!(!lin::persist::wal_dictionary_writer(), "the writer must be off by default");
+    assert_eq!(
+        lin::persist::wal_dictionary_writer(),
+        cfg!(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))
+    );
 
-    // Reference: the default codecs.
+    // Reference: the legacy codecs with dictionary writes explicitly disabled.
     let reference_dir = tmp();
-    let mut reference = Db::open(&reference_dir).unwrap();
+    let mut reference = Db::open(&reference_dir).unwrap().with_wal_dictionary(false);
     for stmt in statements() {
         reference.run(&stmt).unwrap();
     }
@@ -129,8 +132,8 @@ fn dictionary_codec_is_written_only_when_enabled_and_read_everywhere() {
     assert!(!default_codecs.contains(&5), "default writer produced codec 5: {default_codecs:?}");
     let default_log_len = fs::metadata(reference_dir.join(lin::persist::LOG_NAME)).unwrap().len();
 
-    // Same statements with the dictionary writer on.
-    assert!(!lin::persist::set_wal_dictionary_writer(true));
+    // Explicit process enablement must still select the dictionary codec for this fixture.
+    lin::persist::set_wal_dictionary_writer(true);
     let dir = tmp();
     let mut db = Db::open(&dir).unwrap();
     for stmt in statements() {

@@ -176,7 +176,7 @@ mod wal_integrity_tests {
         .unwrap();
         assert_eq!(fallback, expected);
         with_log(|file| {
-            let bytes = frame(file, vector_pack(rows));
+            let bytes = with_dictionary_writer(false, || frame(file, vector_pack(rows)));
             assert_eq!(bytes[8], 3);
             assert!(bytes[9..bytes.len() - 4].ends_with(&expected[3..]));
             let decoded = decode_column_record(&bytes[9..bytes.len() - 4], true).unwrap();
@@ -474,7 +474,7 @@ mod wal_integrity_tests {
             }),
         ];
         with_log(|file| {
-            let bytes = frame(file, vector_pack(expected.clone()));
+            let bytes = with_dictionary_writer(false, || frame(file, vector_pack(expected.clone())));
             assert_eq!(bytes[8], 3);
             for_each_wal_frame(&bytes, |record| {
                 let Pack::InsertCols { cols, .. } = record.pack else {
@@ -1341,6 +1341,14 @@ mod dictionary_wal_tests {
                 panic!("rows were not eligible for the direct encoder");
             };
             assert_eq!(magic[3], if dictionary { 5 } else { 3 }, "dictionary={dictionary}");
+            let prepared = with_dictionary_writer(dictionary, || {
+                prepare_insert_columns(1, 2, "docs", &rows, Vec::new())
+            });
+            let PreparedEncoding::Ready(encoded) = prepared.encoding else {
+                panic!("expected an in-place prepared frame");
+            };
+            assert!(encoded.framed_ok);
+            assert_eq!(encoded.bytes[8], magic[3]);
             let rec = decode_frame(&magic, &buf).unwrap();
             let Pack::InsertCols { fields, cols, .. } = rec.pack else {
                 panic!("insert cols")
@@ -1355,6 +1363,18 @@ mod dictionary_wal_tests {
                 .collect();
             assert_eq!(got, bits_of(&vectors), "dictionary={dictionary}");
         }
+
+        // The same dictionary-friendly rows must use the legacy sparse codec in snapshots.
+        let snapshot = |dictionary| {
+            let mut buf = Vec::new();
+            assert!(with_dictionary_writer(dictionary, || {
+                encode_insert_rows_lcol(&rows, &mut buf)
+            }));
+            assert_eq!(&buf[..4], b"LCOL");
+            assert_eq!(buf[7], 3);
+            buf
+        };
+        assert_eq!(snapshot(true), snapshot(false));
     }
 
     #[test]
@@ -1379,7 +1399,10 @@ mod dictionary_wal_tests {
                 edges: vec![],
             },
         };
-        append_record(&mut f, &rec, &mut Vec::new(), SyncMode::Normal, &mut 0).unwrap();
+        with_dictionary_writer(false, || {
+            append_record(&mut f, &rec, &mut Vec::new(), SyncMode::Normal, &mut 0)
+        })
+        .unwrap();
         f.seek(SeekFrom::Start(0)).unwrap();
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).unwrap();
@@ -2187,25 +2210,27 @@ mod pure_column_encoder_tests {
         )
     }
     fn compare(fields: &[String], cols: &[ColData], n: u32, edges: &[Edge]) {
-        let old = framed(true, fields, cols, n, edges);
-        let new = framed(false, fields, cols, n, edges);
-        assert_eq!(old, new);
-        if edges.is_empty() && fields.len() == cols.len() {
-            let mut buf = vec![4, 5, 6];
-            let pure = encode_insert_cols_v2(9, 42, "docs", fields, cols, n, &mut buf);
-            match (&old.0, pure) {
-                (Ok(frame), Ok(magic)) => {
-                    assert_eq!(frame[8], magic[3]);
-                    assert_eq!(&frame[9..frame.len() - 4], buf);
+        with_dictionary_writer(false, || {
+            let old = framed(true, fields, cols, n, edges);
+            let new = framed(false, fields, cols, n, edges);
+            assert_eq!(old, new);
+            if edges.is_empty() && fields.len() == cols.len() {
+                let mut buf = vec![4, 5, 6];
+                let pure = encode_insert_cols_v2(9, 42, "docs", fields, cols, n, &mut buf);
+                match (&old.0, pure) {
+                    (Ok(frame), Ok(magic)) => {
+                        assert_eq!(frame[8], magic[3]);
+                        assert_eq!(&frame[9..frame.len() - 4], buf);
+                    }
+                    (Err(a), Err(b)) => {
+                        assert_eq!(*a, b.to_string());
+                        assert!(old.2.is_empty());
+                        assert_eq!(old.1, 0);
+                    }
+                    _ => panic!("pure/writer result mismatch"),
                 }
-                (Err(a), Err(b)) => {
-                    assert_eq!(*a, b.to_string());
-                    assert!(old.2.is_empty());
-                    assert_eq!(old.1, 0);
-                }
-                _ => panic!("pure/writer result mismatch"),
             }
-        }
+        });
     }
     #[test]
     fn pure_payload_matches_original_frames_and_fallbacks() {
