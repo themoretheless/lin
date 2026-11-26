@@ -246,3 +246,22 @@ Each fresh process samples the eighth row in every group of 16, giving 6,250 row
 | Neoverse-N2 arm64 | thp | 1.620 | 1.198 | 0.223 | 0.263 |
 
 [Raw stage timings and CPU identities](https://github.com/themoretheless/lin/actions/runs/45825381818)
+
+## Hashing features versus allocating and copying the output vector
+
+Matched sampling within each transaction. Columns show median per-process mean microseconds per sampled row (6,250 samples per transaction, eight fresh processes per mode). Fill is the ASCII fixture feature-hashing call. Copy is the Arc allocation and slice copy combined. Repeat pools two later transactions. Neither component measures the entire transaction.
+
+| Host | Mode | First fill | Repeat fill | First allocation + copy | Repeat allocation + copy |
+|---|---|---:|---:|---:|---:|
+| AMD EPYC 7763 64-Core Processor amd-1 | default | 0.292 | 0.286 | 5.014 | 1.845 |
+| AMD EPYC 7763 64-Core Processor amd-1 | thp | 0.272 | 0.281 | 2.637 | 1.912 |
+| AMD EPYC 9V45 96-Core Processor amd-2 | default | 0.180 | 0.174 | 1.526 | 0.749 |
+| AMD EPYC 9V45 96-Core Processor amd-2 | thp | 0.177 | 0.175 | 1.063 | 0.748 |
+| AMD EPYC 9V74 80-Core Processor amd-3 | default | 0.216 | 0.208 | 4.012 | 1.593 |
+| AMD EPYC 9V74 80-Core Processor amd-3 | thp | 0.201 | 0.204 | 1.673 | 1.304 |
+| AMD EPYC 7763 64-Core Processor amd-4 | default | 0.289 | 0.283 | 4.982 | 1.642 |
+| AMD EPYC 7763 64-Core Processor amd-4 | thp | 0.273 | 0.278 | 2.512 | 1.883 |
+| Neoverse-N2 arm64 | default | 0.161 | 0.160 | 2.164 | 0.850 |
+| Neoverse-N2 arm64 | thp | 0.160 | 0.160 | 1.341 | 0.924 |
+
+[Raw sampled intervals and host identities](https://github.com/themoretheless/lin/actions/runs/45826400045)
