@@ -69,3 +69,12 @@ Four alternating mode blocks, six permutations of Lin, Lin control and SQLite pe
 | Neoverse-N2 | wal-full-arm64 | 10000 | 15.375 / 24.840 | 24/24 | 13.168 / 24.646 | 24/24 |
 
 [Raw samples and runner provenance](https://github.com/themoretheless/lin/actions/runs/45820416806)
+
+## Bulk buffer transfer candidate on Apple M4 Max
+
+Revision 8950abf0a, macOS ARM64, SQLite 3.54.1. Four blocks cover all six process orders per size. Both engines reopen the durable database and validate every fixture row. The two Lin roles use the same binary.
+
+| Rows | Lin median ms | SQLite median ms | Median paired Lin minus SQLite ms | Lin wins |
+|---:|---:|---:|---:|---:|
+| 1000 | 1.365 | 1.636 | -0.256 | 20/24 |
+| 10000 | 6.915 | 15.434 | -8.649 | 24/24 |
