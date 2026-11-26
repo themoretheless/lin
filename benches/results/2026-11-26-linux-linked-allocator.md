@@ -42,3 +42,15 @@ On a separate Linux x64 runner, the linked worker won 54/54 read comparisons per
 ## Native SQL Server qualification
 
 The linked x64 worker completed six read queries and native INSERT at 1k, 10k and 100k against SQL Server on Linux. All workloads preserved the sentinel and removed their temporary tables. The source and binary hashes remained stable. Comparative timings are in the encrypted artifact. [CI and qualification evidence](https://github.com/themoretheless/lin/actions/runs/45872370569)
+
+## Linux x64 versus Azure observations from separate runs
+
+Lin ran on the native Linux x64 peer-matrix runner. The Azure client ran on the M4 Max in the live Kusto qualification, including network transfer and visibility polling for ingestion. The benchmark adapter was identical at both commits. These sample ranges cover different hosts and times.
+
+| Rows | Read cases with disjoint ranges | Smallest read separation | Lin INSERT ms | Kusto ingestion ms | Smallest insert separation |
+|---:|---:|---:|---:|---:|---:|
+| 1000 | 6/6 | 2974.24× | 0.301 | 913.238 | 844.21× |
+| 10000 | 6/6 | 938.69× | 3.892 | 1760.421 | 133.37× |
+| 100000 | 6/6 | 1402.96× | 48.712 | 26204.949 | 60.24× |
+
+Separation divides the shortest Kusto sample by the longest Lin sample for the same size and operation. INSERT times are medians of three process medians. [Linux x64 samples](https://github.com/themoretheless/lin/actions/runs/45870700571) and [Azure samples](2026-11-26-inline-fts-kusto/samples.json).
