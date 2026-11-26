@@ -39,7 +39,12 @@ jobs:
         run: |
           cargo build --locked --release -p lin-peer-worker
           cp target/release/lin-peer-worker generic-worker
-          RUSTFLAGS="-C target-cpu=native" cargo build --locked --release -p lin-peer-worker
+          native_flags="-C target-cpu=native"
+          if [[ "$(uname -m)" == aarch64 ]]; then
+            native_flags+=" -C target-feature=-dotprod"
+          fi
+          RUSTFLAGS="$native_flags" cargo build --locked --release -p lin-peer-worker
+          printf '%s\n' "$native_flags" > native-rustflags.txt
           cp target/release/lin-peer-worker native-worker
           python3 -m pip install -r scripts/bench-peers-requirements.lock
       - name: Measure prepared INSERT and validate readback
@@ -59,6 +64,7 @@ jobs:
           name: paired-duckdb-insert-${{ matrix.replica }}
           path: |
             runner-cpu.txt
+            native-rustflags.txt
             duckdb-results.json
             duckdb-summary.txt
             duckdb-phases.json
