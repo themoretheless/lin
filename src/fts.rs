@@ -971,6 +971,9 @@ fn append_parallel_postings(
             worker.join().expect("FTS append worker panicked")
         })
     };
+    if std::env::var_os("LIN_BENCH_FTS_RESERVE_MERGE").is_some() {
+        postings.reserve(tail.len());
+    }
     for (term, indexes) in tail {
         match postings.entry(term) {
             std::collections::hash_map::Entry::Vacant(entry) => {
