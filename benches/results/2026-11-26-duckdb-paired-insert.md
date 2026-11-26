@@ -231,3 +231,18 @@ Eight fresh processes per mode. Each process inserts 100k rows three times. Shap
 | Neoverse-N2 arm64 | thp | 2.36 | 2.53 | 41.10 | 33.48 |
 
 [Per-process stage samples and CPU provenance](https://github.com/themoretheless/lin/actions/runs/45824512626)
+
+## Sampled vector and cell construction on the first 100k INSERT
+
+Each fresh process samples the eighth row in every group of 16, giving 6,250 rows per transaction. The columns are median per-process mean microseconds per sampled row across eight processes per mode. Repeat pools the two repeat transactions within each process. Vector includes input selection and embedding output construction. Cells includes field evaluation and populating the output row. Worker intervals overlap. The two phases do not cover the entire transaction.
+
+| Host | Mode | First vector | Repeat vector | First cells | Repeat cells |
+|---|---|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor amd-2 | default | 4.694 | 2.152 | 0.243 | 0.272 |
+| AMD EPYC 9V74 80-Core Processor amd-2 | thp | 2.559 | 2.045 | 0.228 | 0.255 |
+| AMD EPYC 7763 64-Core Processor amd-3 | default | 5.471 | 2.315 | 0.323 | 0.327 |
+| AMD EPYC 7763 64-Core Processor amd-3 | thp | 3.265 | 2.366 | 0.284 | 0.319 |
+| Neoverse-N2 arm64 | default | 2.542 | 1.109 | 0.227 | 0.263 |
+| Neoverse-N2 arm64 | thp | 1.620 | 1.198 | 0.223 | 0.263 |
+
+[Raw stage timings and CPU identities](https://github.com/themoretheless/lin/actions/runs/45825381818)
