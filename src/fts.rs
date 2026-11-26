@@ -953,7 +953,12 @@ fn append_parallel_postings(
     fused_ascii: bool,
     pooled: bool,
 ) {
-    let mid = rows.len().div_ceil(2);
+    let divisor = if std::env::var_os("LIN_BENCH_FTS_SMALLER_HEAD").is_some() {
+        3
+    } else {
+        2
+    };
+    let mid = rows.len().div_ceil(divisor);
     let (left, right) = rows.split_at(mid);
     let build_tail = || {
         let mut tail = FxHashMap::default();

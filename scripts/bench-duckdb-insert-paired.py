@@ -34,7 +34,7 @@ def measure_duckdb(frame, rows):
         return elapsed
 
 
-def measure_lin(worker, rows, uniform_id=False):
+def measure_lin(worker, rows, smaller_head=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456)
     env = dict(os.environ)
     env["LIN_BENCH_FTS_FUSED_ASCII"] = "1"
@@ -42,8 +42,9 @@ def measure_lin(worker, rows, uniform_id=False):
     env.pop("LIN_BENCH_FTS_POOLED_TAIL", None)
     env.pop("LIN_BENCH_FTS_RESERVE_MERGE", None)
     env.pop("LIN_BENCH_INSERT_UNIFORM_ID", None)
-    if uniform_id:
-        env["LIN_BENCH_INSERT_UNIFORM_ID"] = "1"
+    env.pop("LIN_BENCH_FTS_SMALLER_HEAD", None)
+    if smaller_head:
+        env["LIN_BENCH_FTS_SMALLER_HEAD"] = "1"
     result = json.loads(subprocess.check_output(
         [worker], input=json.dumps(request) + "\n", text=True, env=env))
     if [tuple(row) for row in result["result"]] != rows:
@@ -52,7 +53,7 @@ def measure_lin(worker, rows, uniform_id=False):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "uniform_id", "duckdb")
+    roles = ("lin", "control", "smaller_head", "duckdb")
     report = dict(
         duckdb=duckdb.__version__, pandas=pd.__version__, host=platform.platform(),
         worker_sha256=hashlib.sha256(worker.read_bytes()).hexdigest(),
@@ -75,7 +76,7 @@ def main(worker, output):
                     if role == "duckdb":
                         timings[role] = measure_duckdb(frame, rows)
                     else:
-                        timings[role], digest = measure_lin(worker, rows, role == "uniform_id")
+                        timings[role], digest = measure_lin(worker, rows, role == "smaller_head")
                         hashes.add(digest)
                 assert len(hashes) == 1, "Lin computed fields differ between INSERT APIs"
                 report["samples"].append(dict(rows=n, block=block, order=order, ns=timings))
@@ -85,11 +86,11 @@ def main(worker, output):
         wins = sum(x["lin"] < x["duckdb"] for x in pairs)
         noise = median(abs(1 - x["control"] / x["lin"]) for x in pairs)
         gain = median(1 - x["lin"] / x["duckdb"] for x in pairs)
-        uniform_id_gain = median(1 - x["uniform_id"] / x["lin"] for x in pairs)
-        uniform_id_wins = sum(x["uniform_id"] < x["duckdb"] for x in pairs)
+        smaller_head_gain = median(1 - x["smaller_head"] / x["lin"] for x in pairs)
+        smaller_head_wins = sum(x["smaller_head"] < x["duckdb"] for x in pairs)
         print(f"{n} rows {timings}, Lin wins {wins}/{len(pairs)}, paired gain {gain:.2%}, "
-              f"A/A {noise:.2%}, uniform_id gain {uniform_id_gain:.2%}, "
-              f"uniform_id wins {uniform_id_wins}/{len(pairs)}", flush=True)
+              f"A/A {noise:.2%}, smaller_head gain {smaller_head_gain:.2%}, "
+              f"smaller_head wins {smaller_head_wins}/{len(pairs)}", flush=True)
 
 
 if __name__ == "__main__":
