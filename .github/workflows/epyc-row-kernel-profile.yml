@@ -1,0 +1,45 @@
+name: Sample kernel CPU during cold row construction
+on:
+  push:
+    branches: [codex/epyc-row-kernel-profile]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3, 4]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - id: cpu
+        run: |
+          lscpu > cpu.txt
+          if grep -Eq 'AMD EPYC (7763|9V74|9V45)' cpu.txt; then echo 'matched=true' >> "$GITHUB_OUTPUT"; fi
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.cpu.outputs.matched == 'true'
+        with:
+          toolchain: '1.96.0'
+      - if: steps.cpu.outputs.matched == 'true'
+        run: |
+          cargo build --locked --release -p lin-peer-worker
+          sudo apt-get update -qq
+          sudo apt-get install -y linux-tools-generic
+          perfbin=$(find /usr/lib/linux-tools -name perf -type f | sort -V | tail -1)
+          sudo sysctl -w kernel.kptr_restrict=0
+          for trial in 1 2 3 4; do
+            echo '{"insert_rows":100000,"samples":1,"timestamp_ms":123456}' | sudo "$perfbin" record --clockid mono -e cpu-clock:k -F 997 -o perf.data -- target/release/lin-peer-worker > result.json 2> "intervals-$trial.txt"
+            jq -e '.result | length == 100000' result.json >/dev/null
+            test "$(grep -c '^row_build 10000 ' "intervals-$trial.txt")" = 10
+            sudo "$perfbin" script --ns -i perf.data -F time,sym > "symbols-$trial.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-profile-${{ matrix.replica }}
+          path: |
+            cpu.txt
+            intervals-*.txt
+            symbols-*.txt

@@ -1205,8 +1205,18 @@ impl Db {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let monotonic_ns = || {
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) }, 0);
+            t.tv_sec as i64 * 1_000_000_000 + t.tv_nsec as i64
+        };
+        #[cfg(target_os = "linux")]
+        let begin = monotonic_ns();
         let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        #[cfg(target_os = "linux")]
+        eprintln!("row_build {} {} {}", records.len(), begin, monotonic_ns());
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
