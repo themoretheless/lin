@@ -66,6 +66,17 @@ fn seed(n: usize) -> Result<Db, lin::Error> {
     Ok(db)
 }
 
+#[cfg(target_os = "linux")]
+fn process_usage() -> Result<libc::rusage, std::io::Error> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // getrusage initializes the output record on success.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+        Ok(unsafe { usage.assume_init() })
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn measure_insert(
     n: usize,
     samples: usize,
@@ -105,6 +116,10 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
+    #[allow(unused_mut)]
+    let mut usage = Vec::<Value>::new();
+    #[cfg(target_os = "linux")]
+    let profile_usage = std::env::var_os("LIN_BENCH_INSERT_RUSAGE").is_some();
     for _ in 0..samples {
         let mut db = Db::empty();
         db.run("index docs [wing, ts]")?;
@@ -112,6 +127,8 @@ fn measure_insert(
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(target_os = "linux")]
+        let before = profile_usage.then(process_usage).transpose()?;
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
@@ -125,6 +142,21 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        #[cfg(target_os = "linux")]
+        if let Some(before) = before {
+            let after = process_usage()?;
+            let micros = |t: libc::timeval| t.tv_sec * 1_000_000 + t.tv_usec;
+            usage.push(json!({
+                "minor_faults": after.ru_minflt - before.ru_minflt,
+                "major_faults": after.ru_majflt - before.ru_majflt,
+                "user_us": micros(after.ru_utime) - micros(before.ru_utime),
+                "system_us": micros(after.ru_stime) - micros(before.ru_stime),
+                "voluntary_switches": after.ru_nvcsw - before.ru_nvcsw,
+                "involuntary_switches": after.ru_nivcsw - before.ru_nivcsw,
+                "peak_rss_kib": after.ru_maxrss,
+            }));
+        }
+
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
@@ -141,7 +173,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result, "insert_usage": usage,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
