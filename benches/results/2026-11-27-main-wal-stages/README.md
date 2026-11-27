@@ -391,3 +391,15 @@ Lin 3b967b4c5 с TCMalloc. Клиент и серверы на одном Intel 
 | Neoverse-N2 / wal-full-arm64 | 10000 | 14.821 | 14.788 | 24.569 | 0.004 | -9.715 | 24 / 24 |
 
 [Парные замеры](https://github.com/themoretheless/lin/actions/runs/46045193044) · [Трасса системных вызовов](https://github.com/themoretheless/lin/actions/runs/46045289408)
+
+### Подтверждённая запись по TCP: Lin и PostgreSQL
+
+AMD EPYC 7763 64-Core Processor. Оба клиента по loopback, одна машина с файловым хранилищем, кодирование для передачи внутри таймера. Lin FULL, PostgreSQL 16.16 с fsync, synchronous_commit и full_page_writes. 12 чередующихся пар на размер. Общие исходные поля проверены после записи. На 100k обе стороны выполняют 10 последовательных транзакций по 10k. Lin передаёт RecordBatch на Rust, PostgreSQL — CSV через Psycopg. Клиент Lin и его сервер в одном процессе, сервер PostgreSQL в контейнере.
+
+| Строк | Lin, мс | PostgreSQL, мс | Побед Lin |
+|---|---:|---:|---:|
+| 1000 | 5.272 | 8.753 | 11/12 |
+| 10000 | 29.613 | 69.997 | 12/12 |
+| 100000 | 264.427 | 764.246 | 12/12 |
+
+[Исходные пары](https://github.com/themoretheless/lin/actions/runs/46046370895)
