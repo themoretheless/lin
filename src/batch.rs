@@ -701,28 +701,36 @@ impl Column {
         })
     }
 
-    /// Sum of the numeric values, skipping nulls; `None` for non-numeric columns.
+    /// Sum of the numeric values, skipping nulls (`i128`-exact for `Int` and Neumaier-compensated for `Float`); `None` for non-numeric columns.
     pub fn sum_f64(&self) -> Option<f64> {
         match self {
             Column::Nulls { .. } => Some(0.0),
-            Column::Float { vals, valid } => Some(if valid.null_count() == 0 {
-                vals.iter().sum()
-            } else {
-                vals.iter()
-                    .enumerate()
-                    .filter(|(i, _)| valid.is_valid(*i))
-                    .map(|(_, v)| *v)
-                    .sum()
-            }),
-            Column::Int { vals, valid } => Some(if valid.null_count() == 0 {
-                vals.iter().map(|v| *v as f64).sum()
-            } else {
-                vals.iter()
-                    .enumerate()
-                    .filter(|(i, _)| valid.is_valid(*i))
-                    .map(|(_, v)| *v as f64)
-                    .sum()
-            }),
+            Column::Float { vals, valid } => {
+                let mut acc = crate::exact_sum::ExactSum::default();
+                if valid.null_count() == 0 {
+                    acc.add_f64_slice(vals);
+                } else {
+                    for (i, &v) in vals.iter().enumerate() {
+                        if valid.is_valid(i) {
+                            acc.add_f64(v);
+                        }
+                    }
+                }
+                Some(acc.value())
+            }
+            Column::Int { vals, valid } => {
+                let mut acc = crate::exact_sum::ExactSum::default();
+                if valid.null_count() == 0 {
+                    acc.add_i64_slice(vals);
+                } else {
+                    for (i, &v) in vals.iter().enumerate() {
+                        if valid.is_valid(i) {
+                            acc.add_i64(v);
+                        }
+                    }
+                }
+                Some(acc.value())
+            }
             _ => None,
         }
     }

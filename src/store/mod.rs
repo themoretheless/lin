@@ -181,10 +181,20 @@ impl std::fmt::Debug for DiskColLazy {
 }
 
 pub(crate) struct StoreDiskTier {
-    pub engine: Arc<std::sync::RwLock<crate::disk::DiskEngine>>,
+    pub engine: Arc<crate::disk::DiskEngine>,
     pub tables: BTreeMap<String, DiskColLazy>,
     pub native_disk: bool,
     pub writer_lock: Option<Arc<std::fs::File>>,
+}
+
+impl StoreDiskTier {
+    #[inline]
+    pub(crate) fn engine_mut(&mut self) -> &mut crate::disk::DiskEngine {
+        if Arc::strong_count(&self.engine) != 1 {
+            self.engine = Arc::new(self.engine.snapshot_view());
+        }
+        Arc::get_mut(&mut self.engine).expect("unique DiskEngine Arc")
+    }
 }
 
 impl std::fmt::Debug for StoreDiskTier {
@@ -893,19 +903,19 @@ impl Store {
             }
         }
         {
-            let mut eng = d
-                .engine
-                .write()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            let eng = d.engine_mut();
             for op in ops {
                 eng.apply_mem_overlay_op(op);
             }
-            for t in &touched {
-                let nrows = eng.count_table(t);
-                if let Some(lazy) = d.tables.get_mut(t) {
+            let counts: smallvec::SmallVec<[(String, usize); 4]> = touched
+                .iter()
+                .map(|t| (t.clone(), eng.count_table(t)))
+                .collect();
+            for (t, nrows) in counts {
+                if let Some(lazy) = d.tables.get_mut(&t) {
                     lazy.row_count = nrows;
                 }
-                self.col_counts.insert(t.clone(), nrows);
+                self.col_counts.insert(t, nrows);
             }
         }
         Ok(())
@@ -922,20 +932,16 @@ impl Store {
         if self.overlay_savepoint_edges.is_none() {
             self.overlay_savepoint_edges = Some(self.edges.len());
         }
-        if let Some(d) = self.disk.as_ref()
-            && let Ok(mut eng) = d.engine.write()
-        {
-            eng.begin_mem_savepoint();
+        if let Some(d) = self.disk.as_mut() {
+            d.engine_mut().begin_mem_savepoint();
         }
     }
 
     pub(crate) fn commit_disk_overlay_savepoint(&mut self) {
         self.overlay_savepoint_fts = None;
         self.overlay_savepoint_edges = None;
-        if let Some(d) = self.disk.as_ref()
-            && let Ok(mut eng) = d.engine.write()
-        {
-            eng.discard_mem_savepoint();
+        if let Some(d) = self.disk.as_mut() {
+            d.engine_mut().discard_mem_savepoint();
         }
     }
 
@@ -958,14 +964,13 @@ impl Store {
         let Some(d) = self.disk.as_mut() else {
             return;
         };
-        if let Ok(mut eng) = d.engine.write() {
-            eng.rollback_savepoint();
-            for (t, lazy) in d.tables.iter_mut() {
-                lazy.materialized = OnceLock::new();
-                let nrows = eng.count_table(t);
-                lazy.row_count = nrows;
-                self.col_counts.insert(t.clone(), nrows);
-            }
+        d.engine_mut().rollback_savepoint();
+        let eng_ref = &*d.engine;
+        for (t, lazy) in d.tables.iter_mut() {
+            lazy.materialized = OnceLock::new();
+            let nrows = eng_ref.count_table(t);
+            lazy.row_count = nrows;
+            self.col_counts.insert(t.clone(), nrows);
         }
     }
 
@@ -977,10 +982,8 @@ impl Store {
     }
 
     #[inline]
-    pub(crate) fn disk_engine_read(
-        &self,
-    ) -> Option<std::sync::RwLockReadGuard<'_, crate::disk::DiskEngine>> {
-        self.disk.as_ref().and_then(|d| d.engine.read().ok())
+    pub(crate) fn disk_engine_read(&self) -> Option<&crate::disk::DiskEngine> {
+        self.disk.as_ref().map(|d| &*d.engine)
     }
 
     /// Declare (or clear) the column that the disk tier keeps `collection` ordered by.
@@ -991,13 +994,10 @@ impl Store {
                 "cluster key: {collection} is not in the disk tier"
             )));
         }
-        let Some(d) = self.disk.as_ref() else {
+        let Some(d) = self.disk.as_mut() else {
             return Err(Error::runtime("cluster key needs a disk tier (open with cold: true)"));
         };
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+        let eng = d.engine_mut();
         if eng.is_read_only() {
             // Cold tier: the attached engine is a read-only view. Record the key in memory
             // (so compaction-free readers see it) and let the next checkpoint persist it.
@@ -1035,12 +1035,10 @@ impl Store {
                 return Some((rc, lazy_rows.rows));
             }
             let mut out = Vec::with_capacity(rc);
-            if let Ok(eng) = d.engine.read() {
-                let _ = eng.scan_projected(name, None, |r| {
-                    out.push(r.clone());
-                    Ok(true)
-                });
-            }
+            let _ = d.engine.scan_projected(name, None, |r| {
+                out.push(r.clone());
+                Ok(true)
+            });
             Some((rc, out))
         })() else {
             return;
@@ -1089,9 +1087,12 @@ impl Store {
     pub fn clone_mem(&mut self) -> Self {
         self.flush_fts_deferred_docs();
         self.ensure_facts_rows();
-        let disk_snap = self.disk.as_ref().and_then(|d| {
-            let eng = d.engine.read().ok()?;
-            let view = eng.snapshot_view();
+        let disk_snap = self.disk.as_ref().map(|d| {
+            let eng_snap = if !d.native_disk && d.engine.can_share_snapshot_arc() {
+                Arc::clone(&d.engine)
+            } else {
+                Arc::new(d.engine.snapshot_view())
+            };
             let mut tables = BTreeMap::new();
             for (k, v) in &d.tables {
                 tables.insert(
@@ -1102,12 +1103,12 @@ impl Store {
                     },
                 );
             }
-            Some(StoreDiskTier {
-                engine: Arc::new(std::sync::RwLock::new(view)),
+            StoreDiskTier {
+                engine: eng_snap,
                 tables,
                 native_disk: d.native_disk,
                 writer_lock: None,
-            })
+            }
         });
         let docs_title_packed = OnceLock::new();
         if let Some(val) = self.docs_title_packed.get() {
@@ -1215,18 +1216,19 @@ impl Store {
             return;
         };
         let use_wal = write_disk_wal && d.native_disk && d.writer_lock.is_some() && !has_savepoint;
-        if let Ok(mut eng) = d.engine.write() {
+        let nrows = {
+            let eng = d.engine_mut();
             if use_wal && !eng.is_read_only() {
                 let _ = eng.upsert_rows_mem_and_wal(collection, rows);
             } else {
                 let _ = eng.upsert_rows_mem_only(collection, rows);
             }
-            let nrows = eng.count_table(collection);
-            if let Some(lazy) = d.tables.get_mut(collection) {
-                lazy.row_count = nrows;
-            }
-            self.col_counts.insert(collection.to_string(), nrows);
+            eng.count_table(collection)
+        };
+        if let Some(lazy) = d.tables.get_mut(collection) {
+            lazy.row_count = nrows;
         }
+        self.col_counts.insert(collection.to_string(), nrows);
     }
 
     fn apply_disk_delete_rows(
@@ -1251,14 +1253,15 @@ impl Store {
             let Some(d) = self.disk.as_mut() else {
                 return;
             };
-            if let Ok(mut eng) = d.engine.write() {
+            let nrows = {
+                let eng = d.engine_mut();
                 let _ = eng.delete_id_mem_only(collection, id);
-                let nrows = eng.count_table(collection);
-                if let Some(lazy) = d.tables.get_mut(collection) {
-                    lazy.row_count = nrows;
-                }
-                self.col_counts.insert(collection.to_string(), nrows);
+                eng.count_table(collection)
+            };
+            if let Some(lazy) = d.tables.get_mut(collection) {
+                lazy.row_count = nrows;
             }
+            self.col_counts.insert(collection.to_string(), nrows);
             return;
         }
         let ids: Vec<String> = rows
@@ -1272,25 +1275,25 @@ impl Store {
         let Some(d) = self.disk.as_mut() else {
             return;
         };
-        if let Ok(mut eng) = d.engine.write() {
+        let nrows = {
+            let eng = d.engine_mut();
             if use_wal && !eng.is_read_only() {
                 let _ = eng.delete_by_ids_mem_and_wal(collection, &ids);
             } else {
                 let _ = eng.delete_by_ids_mem_only(collection, &ids);
             }
-            let nrows = eng.count_table(collection);
-            if let Some(lazy) = d.tables.get_mut(collection) {
-                lazy.row_count = nrows;
-            }
-            self.col_counts.insert(collection.to_string(), nrows);
+            eng.count_table(collection)
+        };
+        if let Some(lazy) = d.tables.get_mut(collection) {
+            lazy.row_count = nrows;
         }
+        self.col_counts.insert(collection.to_string(), nrows);
     }
 
     pub fn apply_pack(&mut self, pack: &Pack) {
         self.apply_pack_inner(pack, true);
     }
 
-    #[allow(dead_code)]
     pub fn apply_pack_mem_only(&mut self, pack: &Pack) {
         self.apply_pack_inner(pack, false);
     }
@@ -1665,17 +1668,16 @@ impl Store {
             self.rollback_disk_overlay_savepoint();
             if let Some(d) = self.disk.as_mut() {
                 d.tables.clear();
-                if let Ok(eng) = d.engine.read() {
-                    for name in &b.disk_tables {
-                        let nrows = eng.count_table(name);
-                        d.tables.insert(
-                            name.clone(),
-                            DiskColLazy {
-                                row_count: nrows,
-                                materialized: OnceLock::new(),
-                            },
-                        );
-                    }
+                let eng = &*d.engine;
+                for name in &b.disk_tables {
+                    let nrows = eng.count_table(name);
+                    d.tables.insert(
+                        name.clone(),
+                        DiskColLazy {
+                            row_count: nrows,
+                            materialized: OnceLock::new(),
+                        },
+                    );
                 }
             }
             if b.restore_overlay_fts {
@@ -2279,12 +2281,10 @@ impl Store {
     fn lazy_rows<'a>(d: &'a StoreDiskTier, lazy: &'a DiskColLazy, name: &str) -> &'a LazyRows {
         lazy.materialized.get_or_init(|| {
             let mut rows = Vec::with_capacity(lazy.row_count);
-            if let Ok(eng) = d.engine.read() {
-                let _ = eng.scan_projected(name, None, |r| {
-                    rows.push(r.clone());
-                    Ok(true)
-                });
-            }
+            let _ = d.engine.scan_projected(name, None, |r| {
+                rows.push(r.clone());
+                Ok(true)
+            });
             LazyRows {
                 rows,
                 by_id: OnceLock::new(),
@@ -2461,7 +2461,7 @@ impl Store {
         if let Some(d) = &self.disk
             && d.tables.contains_key(collection)
         {
-            let eng = d.engine.read().ok()?;
+            let eng = &*d.engine;
             return match field {
                 "id" => match fields {
                     Some(fs) if !fs.is_empty() => {
@@ -2531,8 +2531,8 @@ impl Store {
         if let Some(d) = &self.disk
             && d.tables.contains_key("docs")
         {
-            let eng = d.engine.read().ok()?;
-            return eng
+            return d
+                .engine
                 .get_projected_by_id("docs", id, &["id", "title"])
                 .ok()
                 .flatten();
@@ -4375,12 +4375,11 @@ impl Store {
             let eng = self.disk_engine_read();
             for (name, nrows) in &cold_entries {
                 if let Some(cold) = self.cold_fts_disk.get(name) {
-                    let idx = cold.get_or_init(eng.as_deref(), name);
+                    let idx = cold.get_or_init(eng, name);
                     crate::fts::write_fts_readonly(dir, name, &idx, generation, *nrows, false)?;
                     keep.push(name.clone());
                 }
             }
-            drop(eng);
             for (name, nrows) in cold_entries {
                 if let Some(cold) = self.cold_fts_disk.get_mut(&name) {
                     cold.dir = dir.to_path_buf();
@@ -5059,11 +5058,11 @@ mod borrowed_delete_tests {
                 assert_eq!(store.facts_p, expected.facts_p);
                 assert_eq!(store.facts_o, expected.facts_o);
                 for (label, index) in &store.indexes {
-                    let mut actual = index.forward.clone();
+                    let mut actual = (*index.forward).clone();
                     for positions in actual.values_mut() {
                         positions.sort_unstable();
                     }
-                    assert_eq!(actual, expected.indexes[label].forward);
+                    assert_eq!(actual, *expected.indexes[label].forward);
                     assert_eq!(index.reverse, expected.indexes[label].reverse);
                 }
                 for query in std::iter::once("shared".to_string())

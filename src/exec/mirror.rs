@@ -925,6 +925,157 @@ impl ColMirror {
         Some(entries)
     }
 
+    /// Zero-allocation ungrouped exact sum + non-null numeric count over a mirrored column,
+    /// matching `agg_sum_filtered` / `agg_avg_filtered` bit-for-bit (`i128` integers, Neumaier
+    /// compensated floats, `NaN` propagation, and `PAR_AGG_CHUNK_ROWS` chunking at `>= 65_536` rows).
+    pub(crate) fn sum_and_count(
+        &self,
+        val: &str,
+        pred: Option<&Pred>,
+        now: i64,
+    ) -> Option<(crate::exact_sum::ExactSum, usize)> {
+        let vfm = self.fields.get(val)?;
+        if self.len == 0 {
+            return Some((crate::exact_sum::ExactSum::default(), 0));
+        }
+        let bits_opt = match pred {
+            Some(p) => Some(self.eval(p, now)?),
+            None => None,
+        };
+        let n = self.len;
+        let chunked = n >= super::agg::PAR_AGG_MIN_ROWS;
+        let fold_range = |lo: usize, hi: usize| -> Option<(crate::exact_sum::ExactSum, usize)> {
+            let mut sum = crate::exact_sum::ExactSum::default();
+            let mut count = 0usize;
+            match &vfm.storage {
+                MirrorStorage::AllNull
+                | MirrorStorage::DenseBool { .. }
+                | MirrorStorage::DenseTime { .. }
+                | MirrorStorage::DenseText(_) => {}
+                MirrorStorage::DenseInt { vals, valid } => match &bits_opt {
+                    None => {
+                        if valid.null_count() == 0 {
+                            sum.add_i64_slice(&vals[lo..hi]);
+                            count = hi - lo;
+                        } else {
+                            for (i, &v) in vals[lo..hi].iter().enumerate() {
+                                if valid.is_valid(lo + i) {
+                                    sum.add_i64(v);
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                    Some(bits) => {
+                        for (w_idx, &word_raw) in bits[lo / 64..(hi + 63) / 64].iter().enumerate() {
+                            let base = (lo / 64 + w_idx) * 64;
+                            let mut word = word_raw;
+                            while word != 0 {
+                                let b = word.trailing_zeros() as usize;
+                                let idx = base + b;
+                                if idx >= lo && idx < hi && valid.is_valid(idx) {
+                                    sum.add_i64(vals[idx]);
+                                    count += 1;
+                                }
+                                word &= word - 1;
+                            }
+                        }
+                    }
+                },
+                MirrorStorage::DenseFloat { vals, valid } => match &bits_opt {
+                    None => {
+                        if valid.null_count() == 0 {
+                            sum.add_f64_slice(&vals[lo..hi]);
+                            count = hi - lo;
+                        } else {
+                            for (i, &v) in vals[lo..hi].iter().enumerate() {
+                                if valid.is_valid(lo + i) {
+                                    sum.add_f64(v);
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                    Some(bits) => {
+                        for (w_idx, &word_raw) in bits[lo / 64..(hi + 63) / 64].iter().enumerate() {
+                            let base = (lo / 64 + w_idx) * 64;
+                            let mut word = word_raw;
+                            while word != 0 {
+                                let b = word.trailing_zeros() as usize;
+                                let idx = base + b;
+                                if idx >= lo && idx < hi && valid.is_valid(idx) {
+                                    sum.add_f64(vals[idx]);
+                                    count += 1;
+                                }
+                                word &= word - 1;
+                            }
+                        }
+                    }
+                },
+                MirrorStorage::Dict { codes, dict, .. } => match &bits_opt {
+                    None => {
+                        for &c in &codes[lo..hi] {
+                            if sum.add_numeric(Some(&dict[c as usize])) {
+                                count += 1;
+                            }
+                        }
+                    }
+                    Some(bits) => {
+                        for (w_idx, &word_raw) in bits[lo / 64..(hi + 63) / 64].iter().enumerate() {
+                            let base = (lo / 64 + w_idx) * 64;
+                            let mut word = word_raw;
+                            while word != 0 {
+                                let b = word.trailing_zeros() as usize;
+                                let idx = base + b;
+                                if idx >= lo
+                                    && idx < hi
+                                    && sum.add_numeric(Some(&dict[codes[idx] as usize]))
+                                {
+                                    count += 1;
+                                }
+                                word &= word - 1;
+                            }
+                        }
+                    }
+                },
+            }
+            Some((sum, count))
+        };
+
+        if !chunked {
+            return fold_range(0, n);
+        }
+        let chunk_sz = super::agg::PAR_AGG_CHUNK_ROWS;
+        let num_chunks = n.div_ceil(chunk_sz);
+        #[cfg(feature = "parallel")]
+        let partials: Vec<(crate::exact_sum::ExactSum, usize)> = {
+            use rayon::prelude::*;
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let lo = ci * chunk_sz;
+                    let hi = (lo + chunk_sz).min(n);
+                    fold_range(lo, hi).unwrap_or_default()
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let partials: Vec<(crate::exact_sum::ExactSum, usize)> = (0..num_chunks)
+            .map(|ci| {
+                let lo = ci * chunk_sz;
+                let hi = (lo + chunk_sz).min(n);
+                fold_range(lo, hi).unwrap_or_default()
+            })
+            .collect();
+        let mut total = crate::exact_sum::ExactSum::default();
+        let mut total_cnt = 0usize;
+        for (p_sum, p_cnt) in partials {
+            total.merge(p_sum);
+            total_cnt += p_cnt;
+        }
+        Some((total, total_cnt))
+    }
+
     /// Projects `names` directly from mirrored columns into a dense [`crate::batch::RecordBatch`]
     /// (emitting `Column::Dict` for low-cardinality text, `Column::Text` for high-cardinality text,
     /// and `Column::Int`/`Float`/`Bool`/`Time` in `O(1)` buffer clones/gathers for scalars) without

@@ -1773,7 +1773,7 @@ impl Db {
                             Vec::with_capacity(live_idx.forward.len());
                         let mut state_bytes = 0usize;
                         let mut ok_quota = true;
-                        for (key, list) in &live_idx.forward {
+                        for (key, list) in live_idx.forward.iter() {
                             let c = list.len() as i64;
                             if c == 0 {
                                 continue;
@@ -1852,7 +1852,7 @@ impl Db {
                                 let single_col = live_idx.def.fields.len() == 1;
                                 let mut entries: Vec<(Cell, f64)> =
                                     Vec::with_capacity(live_idx.forward.len());
-                                for (key, list) in &live_idx.forward {
+                                for (key, list) in live_idx.forward.iter() {
                                     let uid_cell = match key.0.first() {
                                         Some(crate::index::IndexPart::Text(s)) => {
                                             Cell::Text(Arc::clone(s))
@@ -2081,76 +2081,19 @@ impl Db {
                     }
                 }
                 AggKind::Sum { field, by: None } | AggKind::Avg { field, by: None } => {
-                    if let Some(val_leaf) = field.leaf() {
-                        let idxs_opt = match &plan.filter {
-                            Some(p) => mirror.select(p, now),
-                            None => None,
+                    if let Some(val_leaf) = field.leaf()
+                        && let Some((sum, cnt)) =
+                            mirror.sum_and_count(val_leaf, plan.filter.as_ref(), now)
+                    {
+                        let fk = field.as_str();
+                        let out = if matches!(plan.kind, AggKind::Sum { .. }) {
+                            sum.value()
+                        } else if cnt == 0 {
+                            0.0
+                        } else {
+                            sum.value() / (cnt as f64)
                         };
-                        if (plan.filter.is_none() || idxs_opt.is_some())
-                            && let Some(batch) = mirror.project_batch(
-                                std::slice::from_ref(&val_leaf.to_string()),
-                                idxs_opt.as_deref(),
-                            )
-                            && let Some(vcol) = batch.cols.first()
-                        {
-                            let fk = field.as_str();
-                            if matches!(plan.kind, AggKind::Sum { .. }) {
-                                if let Some(s) = vcol.sum_f64() {
-                                    return Ok(vec![single_cell_row(&fk, Cell::Float(s))]);
-                                }
-                            } else {
-                                let mut sum = crate::exact_sum::ExactSum::default();
-                                let mut cnt = 0usize;
-                                match vcol {
-                                    crate::batch::Column::Int { vals, valid } => {
-                                        if valid.null_count() == 0 {
-                                            for &v in vals {
-                                                sum.add_i64(v);
-                                            }
-                                            cnt = vals.len();
-                                        } else {
-                                            for (i, &v) in vals.iter().enumerate() {
-                                                if valid.is_valid(i) {
-                                                    sum.add_i64(v);
-                                                    cnt += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    crate::batch::Column::Float { vals, valid } => {
-                                        if valid.null_count() == 0 {
-                                            for &v in vals {
-                                                if !v.is_nan() {
-                                                    sum.add_f64(v);
-                                                    cnt += 1;
-                                                }
-                                            }
-                                        } else {
-                                            for (i, &v) in vals.iter().enumerate() {
-                                                if valid.is_valid(i) && !v.is_nan() {
-                                                    sum.add_f64(v);
-                                                    cnt += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        for i in 0..vcol.len() {
-                                            let c = vcol.get(i);
-                                            if sum.add_numeric(Some(&c)) {
-                                                cnt += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                                let avg = if cnt == 0 {
-                                    0.0
-                                } else {
-                                    sum.value() / (cnt as f64)
-                                };
-                                return Ok(vec![single_cell_row(&fk, Cell::Float(avg))]);
-                            }
-                        }
+                        return Ok(vec![single_cell_row(&fk, Cell::Float(out))]);
                     }
                 }
                 AggKind::Sum {
@@ -4724,11 +4667,7 @@ pub(crate) fn eval_partial_summarize_on_reader(
             .disk
             .as_ref()
             .ok_or_else(|| Error::runtime("missing disk tier on disk-backed collection"))?;
-        let eng = tier
-            .engine
-            .read()
-            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
-        fold_summarize_disk(&eng, collection, filter, now, specs, by, &sum_flags, max_bytes)?
+        fold_summarize_disk(&tier.engine, collection, filter, now, specs, by, &sum_flags, max_bytes)?
     } else {
         let rows = store.collection(collection);
         fold_summarize_rows(&rows, filter, now, specs, by, &sum_flags, max_bytes)?

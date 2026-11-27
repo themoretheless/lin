@@ -266,8 +266,23 @@ fn filtered_hnsw_benchmark() {
             seeded_vector(text, self.dim())
         }
     }
-    let mut exact = Db::empty().with_embedder(Arc::new(WideSeeded));
-    let mut adaptive = Db::empty().with_embedder(Arc::new(WideSeeded));
+    // Optional pre-tokenized text corpus. Reserve the last 200 passages for queries.
+    let corpus = std::env::var_os("LIN_HNSW_TEXT_CORPUS").map(|path| {
+        let text = std::fs::read_to_string(path).unwrap();
+        let passages: Vec<String> = text.lines().map(|line| {
+            line.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty())
+                .collect::<Vec<_>>().join(" ")
+        }).filter(|line| !line.is_empty()).collect();
+        assert!(passages.len() >= 12200);
+        passages
+    });
+    let embedder: Arc<dyn Embedder> = if corpus.is_some() {
+        Arc::new(lin::HashingEmbedder::new("hash/384", 384))
+    } else {
+        Arc::new(WideSeeded)
+    };
+    let mut exact = Db::empty().with_embedder(embedder.clone());
+    let mut adaptive = Db::empty().with_embedder(embedder);
     for i in 0..12000 {
         let tag = match i % 100 {
             0 => "one ten fifty",
@@ -275,8 +290,9 @@ fn filtered_hnsw_benchmark() {
             10..=49 => "fifty",
             _ => "rest",
         };
+        let title = corpus.as_ref().map_or_else(|| format!("item {i}"), |docs| docs[i].clone());
         let insert = format!(
-            r#"insert docs {{ uri: "raw://bench/{i}", title: "item {i}", layer: "raw", body: "{tag}" }}"#
+            r#"insert docs {{ uri: "raw://bench/{i}", title: "{title}", layer: "raw", body: "{tag}" }}"#
         );
         exact.run(&insert).unwrap();
         adaptive.run(&insert).unwrap();
@@ -286,10 +302,10 @@ fn filtered_hnsw_benchmark() {
         .map(|tag| {
             (0..200)
                 .map(|i| {
-                    format!(
-                        r#"docs | body has "{tag}" | search vec "item {}" | take 10"#,
-                        i * 23,
-                    )
+                    let query = corpus.as_ref().map_or_else(|| format!("item {}", i * 23), |docs| {
+                        docs[12000 + i].split_whitespace().take(8).collect::<Vec<_>>().join(" ")
+                    });
+                    format!(r#"docs | body has "{tag}" | search vec "{query}" | take 10"#)
                 })
                 .collect::<Vec<_>>()
         })

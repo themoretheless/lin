@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -141,7 +141,7 @@ pub(crate) fn populate_store_from_native_engine(
         .max(1);
 
     store.disk = Some(StoreDiskTier {
-        engine: Arc::new(RwLock::new(eng)),
+        engine: Arc::new(eng),
         tables,
         native_disk: true,
         writer_lock,
@@ -179,7 +179,7 @@ fn attach_cold_disk_engine(
     }
     if !tables.is_empty() {
         store.disk = Some(StoreDiskTier {
-            engine: Arc::new(RwLock::new(eng)),
+            engine: Arc::new(eng),
             tables,
             native_disk: false,
             writer_lock: None,
@@ -1023,11 +1023,10 @@ impl Store {
             }
 
             // Drain any cold overlay mutations (new/updated memtable rows + tombstones) before releasing `ro`.
-            let (mut dirty_mem_rows, dirty_tombstones) = if let Some(d) = self.disk.as_ref()
-                && let Ok(mut eng) = d.engine.write()
-                && eng.has_dirty_overlay()
+            let (mut dirty_mem_rows, dirty_tombstones) = if let Some(d) = self.disk.as_mut()
+                && d.engine.has_dirty_overlay()
             {
-                let (mr, ts) = eng.drain_dirty_overlays();
+                let (mr, ts) = d.engine_mut().drain_dirty_overlays();
                 (mr, Some(ts))
             } else {
                 (BTreeMap::new(), None)
@@ -1214,7 +1213,7 @@ impl Store {
                         );
                     }
                     self.disk = Some(StoreDiskTier {
-                        engine: Arc::new(RwLock::new(ro)),
+                        engine: Arc::new(ro),
                         tables,
                         native_disk: false,
                         writer_lock: None,
@@ -1268,7 +1267,7 @@ impl Store {
     }
 
     pub(super) fn apply_record(&mut self, rec: &LogRecord) {
-        self.apply_pack(&rec.pack);
+        self.apply_pack_mem_only(&rec.pack);
         self.next_id = rec.next_id;
         self.r#gen = rec.r#gen;
     }
@@ -1306,14 +1305,11 @@ impl Store {
                     .insert(tbl.clone(), fts_idx.fields.clone());
             }
         }
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
-        eng.commit_ops(ops)?;
+        d.engine_mut().commit_ops(ops)?;
         let table_names: Vec<String> = d.tables.keys().cloned().collect();
+        let eng_ref = &*d.engine;
         for tname in table_names {
-            let nrows = eng.count_table(&tname);
+            let nrows = eng_ref.count_table(&tname);
             if let Some(lazy) = d.tables.get_mut(&tname) {
                 lazy.row_count = nrows;
             }
@@ -1337,10 +1333,7 @@ impl Store {
             lazy.materialized = OnceLock::new();
         }
         let nrows = {
-            let mut eng = d
-                .engine
-                .write()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            let eng = d.engine_mut();
             if eng.wal_bytes > 0 {
                 eng.checkpoint()?;
             }
@@ -1390,7 +1383,7 @@ impl Store {
                 DiskEngine::open(dir, false)?
             };
             self.disk = Some(StoreDiskTier {
-                engine: Arc::new(RwLock::new(eng)),
+                engine: Arc::new(eng),
                 tables: BTreeMap::new(),
                 native_disk: false,
                 writer_lock: None,
@@ -1398,10 +1391,7 @@ impl Store {
         }
         let d = self.disk.as_mut().expect("disk tier initialized");
         let nrows = {
-            let mut eng = d
-                .engine
-                .write()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            let eng = d.engine_mut();
             eng.attach_registered_segment(table, schema, meta)?;
             eng.count_table(table)
         };
@@ -1439,7 +1429,7 @@ impl Store {
                 e
             };
             self.disk = Some(StoreDiskTier {
-                engine: Arc::new(RwLock::new(eng)),
+                engine: Arc::new(eng),
                 tables: BTreeMap::new(),
                 native_disk: false,
                 writer_lock: None,
@@ -1447,11 +1437,7 @@ impl Store {
         }
         let (schema, meta) = {
             let d = self.disk.as_ref().expect("disk tier initialized");
-            let eng = d
-                .engine
-                .read()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
-            eng.prepare_bulk_segment_batch(
+            d.engine.prepare_bulk_segment_batch(
                 table,
                 batch,
                 persist.sync == persist::SyncMode::Full,
@@ -1466,10 +1452,7 @@ impl Store {
         persist.has_segment_packs = true;
         let nrows = {
             let d = self.disk.as_mut().expect("disk tier initialized");
-            let mut eng = d
-                .engine
-                .write()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+            let eng = d.engine_mut();
             eng.attach_registered_segment(table, schema, meta)?;
             // Persist `manifest.json` soft-atomically so readers see the new segment without a
             // second barrier fsync (the segment + `persist.log` are already crash-durable).

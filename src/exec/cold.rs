@@ -46,11 +46,8 @@ impl Db {
             let _ = self.checkpoint();
         }
         let snap_bytes = self.capture_snapshot_wire_bytes()?;
-        if let Some(eng_lock) = self.cold_disk_engine_lock() {
-            let mut eng = eng_lock
-                .write()
-                .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-            return eng.push_to_object_store_with_snapshot(
+        if let Some(d) = self.store.disk.as_mut() {
+            return d.engine_mut().push_to_object_store_with_snapshot(
                 store,
                 prefix,
                 prune_remote_orphans,
@@ -152,10 +149,7 @@ impl Db {
         let Some(disk) = self.store.disk.as_ref() else {
             return Ok(None);
         };
-        let engine = disk
-            .engine
-            .read()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
+        let engine = &*disk.engine;
         let Some(segments) = engine.remote_pruned_segments(table, pred) else {
             return Ok(None);
         };
@@ -174,13 +168,12 @@ impl Db {
         }
         let staging = Staging(staging);
         let view = engine.remote_filtered_view(table, segments, &staging.0)?;
-        drop(engine);
         let mut store = self.store.clone_mem();
         let disk = store
             .disk
             .as_mut()
             .expect("disk backing copied into read snapshot");
-        disk.engine = Arc::new(std::sync::RwLock::new(view));
+        disk.engine = Arc::new(view);
         let mut scan = Self::bare(self.catalog.clone(), store);
         scan.quotas = self.quotas.clone();
         #[cfg(feature = "gpu")]
@@ -200,12 +193,6 @@ impl Db {
         self.cold_local_cache_bytes_inner()
     }
 
-    pub(crate) fn cold_disk_engine_lock(
-        &self,
-    ) -> Option<&Arc<std::sync::RwLock<DiskEngine>>> {
-        self.store.disk.as_ref().map(|d| &d.engine)
-    }
-
     pub(crate) fn capture_snapshot_wire_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut cold_names: Vec<String> = self
             .store
@@ -213,10 +200,8 @@ impl Db {
             .as_ref()
             .map(|d| d.tables.keys().cloned().collect())
             .unwrap_or_default();
-        if let Some(d) = self.store.disk.as_ref()
-            && let Ok(eng) = d.engine.read()
-        {
-            for name in eng.manifest.tables.keys() {
+        if let Some(d) = self.store.disk.as_ref() {
+            for name in d.engine.manifest.tables.keys() {
                 if !cold_names.contains(name) {
                     cold_names.push(name.clone());
                 }
@@ -299,25 +284,13 @@ impl Db {
     }
 
     pub(crate) fn hydrate_cold_collection_inner(&mut self, table: &str) -> Result<usize, Error> {
-        let Some(d) = self.store.disk.as_ref() else {
+        let Some(d) = self.store.disk.as_mut() else {
             return Ok(0);
         };
-        let needs = {
-            let eng = d
-                .engine
-                .read()
-                .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-            eng.remote_tier.is_some() && !eng.is_table_hydrated(table)
-        };
-        if !needs {
+        if d.engine.remote_tier.is_none() || d.engine.is_table_hydrated(table) {
             return Ok(0);
         }
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-        let n = eng.hydrate_table(table)?;
-        drop(eng);
+        let n = d.engine_mut().hydrate_table(table)?;
         if n > 0 {
             self.reader_cache = None;
             self.query_cache.clear();
@@ -326,40 +299,29 @@ impl Db {
     }
 
     pub(crate) fn hydrate_query_cold_tables(&mut self, query: &Query) -> Result<bool, Error> {
-        let Some(d) = self.store.disk.as_ref() else {
+        if self.store.disk.is_none() {
             return Ok(false);
-        };
+        }
         let mut cols = Vec::new();
         collect_query_collections(query, &mut cols);
         cols.retain(|c| self.store.is_disk_backed(c));
         if cols.is_empty() {
             return Ok(false);
         }
-        let needs_hydrate = {
-            let eng = d
-                .engine
-                .read()
-                .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-            eng.remote_tier.is_some() && cols.iter().any(|col| !eng.is_table_hydrated(col))
+        let Some(d) = self.store.disk.as_mut() else {
+            return Ok(false);
         };
-        if !needs_hydrate {
+        if d.engine.remote_tier.is_none() || cols.iter().all(|col| d.engine.is_table_hydrated(col)) {
             return Ok(false);
         }
         let mut hydrated_any = false;
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-        if eng.remote_tier.is_none() {
-            return Ok(false);
-        }
+        let eng = d.engine_mut();
         for col in cols {
             if !eng.is_table_hydrated(&col) {
                 eng.hydrate_table(&col)?;
                 hydrated_any = true;
             }
         }
-        drop(eng);
         if hydrated_any {
             self.reader_cache = None;
             self.query_cache.clear();
@@ -368,38 +330,27 @@ impl Db {
     }
 
     pub(crate) fn has_unhydrated_cold_tables(&self) -> bool {
-        let Some(d) = self.store.disk.as_ref() else {
-            return false;
-        };
-        d.engine
-            .read()
-            .map(|eng| eng.has_unhydrated_tables())
-            .unwrap_or(false)
+        self.store
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.engine.has_unhydrated_tables())
     }
 
     pub(crate) fn evict_cold_cache_inner(&mut self, max_bytes: u64) -> Result<u64, Error> {
-        let Some(d) = self.store.disk.as_ref() else {
+        let Some(d) = self.store.disk.as_mut() else {
             return Ok(0);
         };
-        let mut eng = d
-            .engine
-            .write()
-            .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-        let remaining = eng.evict_local_cache_to(max_bytes)?;
-        drop(eng);
+        let remaining = d.engine_mut().evict_local_cache_to(max_bytes)?;
         self.reader_cache = None;
         self.query_cache.clear();
         Ok(remaining)
     }
 
     pub(crate) fn cold_local_cache_bytes_inner(&self) -> u64 {
-        let Some(d) = self.store.disk.as_ref() else {
-            return 0;
-        };
-        d.engine
-            .read()
-            .map(|eng| eng.local_cache_bytes())
-            .unwrap_or(0)
+        self.store
+            .disk
+            .as_ref()
+            .map_or(0, |d| d.engine.local_cache_bytes())
     }
 
     pub(crate) fn capture_bootstrap_bundle(
@@ -416,11 +367,7 @@ impl Db {
         let cur_gen = self.store.r#gen;
         let snap_bytes = self.capture_snapshot_wire_bytes()?;
         let (manifest_json, tombstones_raw, segs) = if let Some(d) = self.store.disk.as_ref() {
-            let eng = d
-                .engine
-                .read()
-                .map_err(|_| Error::runtime("cold disk engine lock poisoned"))?;
-            eng.export_cold_bootstrap_parts()?
+            d.engine.export_cold_bootstrap_parts()?
         } else if let Some(p) = self
             .persist
             .as_ref()

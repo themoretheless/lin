@@ -173,19 +173,19 @@ impl Hash for IndexPart {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexKey(pub smallvec::SmallVec<[IndexPart; 2]>);
 
-/// Live secondary index: BTree over composite keys → row indices in the collection vec.
+/// Live secondary index: Copy-on-Write BTree over composite keys → row indices in the collection vec.
 #[derive(Debug, Clone)]
 pub struct LiveIndex {
     pub def: IndexDef,
     slots: smallvec::SmallVec<[crate::store::row::OwnedFieldSlot; 2]>,
-    /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns)
-    pub forward: BTreeMap<IndexKey, PostingList>,
+    /// Either Vec<usize> (standard) or BitSet (for low-cardinality columns), CoW-shared across ReadDb snapshots.
+    pub forward: Arc<BTreeMap<IndexKey, PostingList>>,
     pub reverse: FxHashMap<usize, IndexKey>,
     pub use_reverse: bool,
 
     /// Bloom filter for fast negative lookups during seek operations
     #[cfg(feature = "parallel")]
-    bloom_filter: Option<BloomFilter>,
+    bloom_filter: Option<Arc<BloomFilter>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -520,7 +520,7 @@ impl LiveIndex {
         Self {
             def,
             slots,
-            forward: BTreeMap::new(),
+            forward: Arc::new(BTreeMap::new()),
             reverse: FxHashMap::default(),
             use_reverse: true,
             #[cfg(feature = "parallel")]
@@ -528,16 +528,16 @@ impl LiveIndex {
         }
     }
 
-    /// Read-only snapshot clone: elides the write-only reverse map.
+    /// Read-only snapshot clone: O(1) CoW share of the forward B-Tree and bloom filter, eliding the reverse map.
     pub fn clone_for_read(&self) -> Self {
         Self {
             def: self.def.clone(),
             slots: self.slots.clone(),
-            forward: self.forward.clone(),
+            forward: Arc::clone(&self.forward),
             reverse: FxHashMap::default(),
             use_reverse: false,
             #[cfg(feature = "parallel")]
-            bloom_filter: self.bloom_filter.clone(),
+            bloom_filter: self.bloom_filter.as_ref().map(Arc::clone),
         }
     }
 
@@ -553,7 +553,7 @@ impl LiveIndex {
         for key in self.forward.keys() {
             bf.add(key);
         }
-        self.bloom_filter = Some(bf);
+        self.bloom_filter = Some(Arc::new(bf));
     }
 
     #[inline]
@@ -566,11 +566,11 @@ impl LiveIndex {
         use_push: bool,
     ) -> Result<(), String> {
         use std::collections::btree_map::Entry;
-        match self.forward.entry(key) {
+        match Arc::make_mut(&mut self.forward).entry(key) {
             Entry::Vacant(v) => {
                 #[cfg(feature = "parallel")]
                 if let Some(ref mut bf) = self.bloom_filter {
-                    bf.add(v.key());
+                    Arc::make_mut(bf).add(v.key());
                 }
                 if self.use_reverse {
                     self.reverse.insert(idx, v.key().clone());
@@ -1114,11 +1114,12 @@ impl LiveIndex {
                 };
 
                 entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                self.forward = BTreeMap::from_iter(entries);
+                self.forward = Arc::new(BTreeMap::from_iter(entries));
                 #[cfg(feature = "parallel")]
                 if let Some(ref mut bf) = self.bloom_filter {
+                    let bf_mut = Arc::make_mut(bf);
                     for k in self.forward.keys() {
-                        bf.add(k);
+                        bf_mut.add(k);
                     }
                 }
                 return Ok(());
@@ -1191,11 +1192,12 @@ impl LiveIndex {
                 };
                 entries.push((key, posting));
             }
-            self.forward = BTreeMap::from_iter(entries);
+            self.forward = Arc::new(BTreeMap::from_iter(entries));
             #[cfg(feature = "parallel")]
             if let Some(ref mut bf) = self.bloom_filter {
+                let bf_mut = Arc::make_mut(bf);
                 for k in self.forward.keys() {
-                    bf.add(k);
+                    bf_mut.add(k);
                 }
             }
             return Ok(());
@@ -1271,7 +1273,7 @@ impl LiveIndex {
         }
 
         if rows.len() >= 256 && self.forward.len().saturating_mul(16) <= start + rows.len() {
-            for list in self.forward.values_mut() {
+            for list in Arc::make_mut(&mut self.forward).values_mut() {
                 list.maybe_promote_batch();
             }
         }
@@ -1298,7 +1300,8 @@ impl LiveIndex {
 
         if self.use_reverse
             && let Some(old) = self.reverse.remove(&idx)
-            && let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(old)
+            && let std::collections::btree_map::Entry::Occupied(mut entry) =
+                Arc::make_mut(&mut self.forward).entry(old)
         {
             entry.get_mut().remove(idx);
             if entry.get().is_empty() {
@@ -1350,14 +1353,15 @@ impl LiveIndex {
             return Err(format!("unique index {}: duplicate key", self.def.label()));
         }
         if let Some(ref ok) = old_key {
-            let empty = if let Some(list) = self.forward.get_mut(ok) {
+            let fwd = Arc::make_mut(&mut self.forward);
+            let empty = if let Some(list) = fwd.get_mut(ok) {
                 list.remove(idx);
                 list.is_empty()
             } else {
                 false
             };
             if empty {
-                self.forward.remove(ok);
+                fwd.remove(ok);
             }
         }
         if let Some(nk) = new_key {
@@ -1384,14 +1388,15 @@ impl LiveIndex {
             }
         }
         let kd = self.key_of(doomed);
-        let empty = if let Some(list) = self.forward.get_mut(&kd) {
+        let fwd = Arc::make_mut(&mut self.forward);
+        let empty = if let Some(list) = fwd.get_mut(&kd) {
             list.remove(idx);
             list.is_empty()
         } else {
             false
         };
         if empty {
-            self.forward.remove(&kd);
+            fwd.remove(&kd);
         }
     }
 
@@ -1400,28 +1405,29 @@ impl LiveIndex {
             self.swap_remove_at(p, last);
             return;
         }
+        let fwd = Arc::make_mut(&mut self.forward);
         if kd == kt {
-            let empty = if let Some(list) = self.forward.get_mut(kt) {
+            let empty = if let Some(list) = fwd.get_mut(kt) {
                 list.remove(last);
                 list.is_empty()
             } else {
                 false
             };
             if empty {
-                self.forward.remove(kt);
+                fwd.remove(kt);
             }
         } else {
-            if let Some(list) = self.forward.get_mut(kt) {
+            if let Some(list) = fwd.get_mut(kt) {
                 list.replace(last, p);
             }
-            let empty = if let Some(list) = self.forward.get_mut(kd) {
+            let empty = if let Some(list) = fwd.get_mut(kd) {
                 list.remove(p);
                 list.is_empty()
             } else {
                 false
             };
             if empty {
-                self.forward.remove(kd);
+                fwd.remove(kd);
             }
         }
     }
@@ -1448,14 +1454,14 @@ impl LiveIndex {
             }
             (false, true) => {
                 let kt = self.key_of(tail);
-                if let Some(list) = self.forward.get_mut(&kt) {
+                if let Some(list) = Arc::make_mut(&mut self.forward).get_mut(&kt) {
                     list.replace(last, p);
                 }
             }
             (true, false) => {
                 let kd = self.key_of(doomed);
                 if let std::collections::btree_map::Entry::Occupied(mut entry) =
-                    self.forward.entry(kd)
+                    Arc::make_mut(&mut self.forward).entry(kd)
                 {
                     entry.get_mut().remove(p);
                     if entry.get().is_empty() {
@@ -1469,7 +1475,9 @@ impl LiveIndex {
 
     pub fn remove_at(&mut self, idx: usize) {
         if let Some(key) = self.reverse.remove(&idx) {
-            if let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(key) {
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                Arc::make_mut(&mut self.forward).entry(key)
+            {
                 entry.get_mut().remove(idx);
                 if entry.get().is_empty() {
                     entry.remove_entry();
@@ -1480,7 +1488,7 @@ impl LiveIndex {
 
     pub fn move_at(&mut self, from: usize, to: usize) {
         if let Some(key) = self.reverse.remove(&from) {
-            if let Some(vec) = self.forward.get_mut(&key) {
+            if let Some(vec) = Arc::make_mut(&mut self.forward).get_mut(&key) {
                 vec.replace(from, to);
             }
             self.reverse.insert(to, key);
@@ -1490,24 +1498,21 @@ impl LiveIndex {
     pub fn swap_remove_at(&mut self, p: usize, last: usize) {
         let key_tail = self.reverse.remove(&last);
         if let Some(kt) = key_tail {
+            let fwd = Arc::make_mut(&mut self.forward);
             if let Some(kd_slot) = self.reverse.get_mut(&p) {
                 if *kd_slot == kt {
-                    if let std::collections::btree_map::Entry::Occupied(mut entry) =
-                        self.forward.entry(kt)
-                    {
+                    if let std::collections::btree_map::Entry::Occupied(mut entry) = fwd.entry(kt) {
                         entry.get_mut().remove(last);
                         if entry.get().is_empty() {
                             entry.remove_entry();
                         }
                     }
                 } else {
-                    if let Some(list) = self.forward.get_mut(&kt) {
+                    if let Some(list) = fwd.get_mut(&kt) {
                         list.replace(last, p);
                     }
                     let kd = std::mem::replace(kd_slot, kt);
-                    if let std::collections::btree_map::Entry::Occupied(mut entry) =
-                        self.forward.entry(kd)
-                    {
+                    if let std::collections::btree_map::Entry::Occupied(mut entry) = fwd.entry(kd) {
                         entry.get_mut().remove(p);
                         if entry.get().is_empty() {
                             entry.remove_entry();
@@ -1515,13 +1520,14 @@ impl LiveIndex {
                     }
                 }
             } else {
-                if let Some(list) = self.forward.get_mut(&kt) {
+                if let Some(list) = fwd.get_mut(&kt) {
                     list.replace(last, p);
                 }
                 self.reverse.insert(p, kt);
             }
         } else if let Some(kd) = self.reverse.remove(&p)
-            && let std::collections::btree_map::Entry::Occupied(mut entry) = self.forward.entry(kd)
+            && let std::collections::btree_map::Entry::Occupied(mut entry) =
+                Arc::make_mut(&mut self.forward).entry(kd)
         {
             entry.get_mut().remove(p);
             if entry.get().is_empty() {
@@ -2152,12 +2158,18 @@ pub fn pick_index_with_coverage(
     if !cat.has_indexes_on(collection) {
         return None;
     }
-    let indexes = cat.indexes_on(collection);
+    pick_from_indexes(&cat.indexes_on(collection), pred)
+}
+
+pub(crate) fn pick_from_indexes(
+    indexes: &[&IndexDef],
+    pred: &Pred,
+) -> Option<(Vec<IndexUse>, bool)> {
     let top_conjuncts = flatten_and(pred);
     let mut indexable = Vec::with_capacity(top_conjuncts.len());
     let mut has_unindexed = false;
     for c in top_conjuncts {
-        if pred_mentions_indexed_field(c, &indexes) {
+        if pred_mentions_indexed_field(c, indexes) {
             indexable.push(c);
         } else {
             has_unindexed = true;
@@ -2176,7 +2188,7 @@ pub fn pick_index_with_coverage(
     let mut uses: Vec<IndexUse> = Vec::with_capacity(branches.len());
     let mut all_covered = !has_unindexed;
     for branch in &branches {
-        let u = pick_conjunct_atoms(&indexes, branch)?;
+        let u = pick_conjunct_atoms(indexes, branch)?;
         if all_covered && !index_covers_atoms(branch, &u) {
             all_covered = false;
         }
@@ -2849,7 +2861,7 @@ impl LiveIndex {
             // If bitmap_card_field is set, estimate cardinality from sample
             let is_bitmap = self.should_use_bitmap(*orig_idx, row, rows);
 
-            match self.forward.entry(key) {
+            match Arc::make_mut(&mut self.forward).entry(key) {
                 Entry::Vacant(v) => {
                     self.reverse.insert(*orig_idx, v.key().clone());
                     let mut posting = PostingList::new(is_bitmap, 64);

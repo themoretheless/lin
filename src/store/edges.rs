@@ -402,6 +402,75 @@ impl Store {
         (rows, changed)
     }
 
+    pub(crate) fn append_facts_spo_bulk_owned(
+        &mut self,
+        mut s: Vec<Arc<str>>,
+        mut p: Vec<Arc<str>>,
+        mut o: Vec<Arc<str>>,
+    ) {
+        let n = s.len().min(p.len()).min(o.len());
+        if n == 0 {
+            return;
+        }
+        s.truncate(n);
+        p.truncate(n);
+        o.truncate(n);
+        if self.facts_s.is_empty() && !self.facts_rows_stale {
+            self.facts_by_spo.reserve(n);
+            let shape = facts_ops_shape();
+            let mut write = 0usize;
+            for i in 0..n {
+                if spo_contains(&self.facts_by_spo, &s[i], &p[i], &o[i]).is_some() {
+                    continue;
+                }
+                self.facts_by_spo.insert(
+                    (Arc::clone(&s[i]), Arc::clone(&p[i]), Arc::clone(&o[i])),
+                    write,
+                );
+                if write != i {
+                    s[write] = Arc::clone(&s[i]);
+                    p[write] = Arc::clone(&p[i]);
+                    o[write] = Arc::clone(&o[i]);
+                }
+                write += 1;
+            }
+            s.truncate(write);
+            p.truncate(write);
+            o.truncate(write);
+            if write > 0 {
+                self.update_col_count("facts", write as isize);
+                if self.is_disk_backed("facts") {
+                    self.facts_rows_stale = true;
+                } else if self.collections.get("facts").map_or(0, Vec::len) == 0 {
+                    let mut facts_vec = Vec::with_capacity(write);
+                    for idx in 0..write {
+                        facts_vec.push(Row::from_parts(
+                            Arc::clone(shape),
+                            [
+                                Cell::Text(Arc::clone(&o[idx])),
+                                Cell::Text(Arc::clone(&p[idx])),
+                                Cell::Text(Arc::clone(&s[idx])),
+                            ],
+                        ));
+                    }
+                    self.collections.insert("facts".into(), facts_vec);
+                } else {
+                    self.facts_s = s;
+                    self.facts_p = p;
+                    self.facts_o = o;
+                    self.facts_rows_stale = true;
+                    self.ensure_facts_rows();
+                    return;
+                }
+                self.facts_s = s;
+                self.facts_p = p;
+                self.facts_o = o;
+            }
+            return;
+        }
+        let _ = self.append_facts_spo_bulk(&s, &p, &o, false);
+    }
+
     pub(crate) fn append_prepared_facts(
         &mut self,
         s: &[Arc<str>],

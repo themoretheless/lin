@@ -90,3 +90,24 @@ fn descending_prefix_top_k_preserves_ties_and_residuals() {
         }
     }
 }
+
+#[test]
+fn multikey_top_k_with_offset_matches_stable_sorts() {
+    let mut plain = Db::empty();
+    let mut indexed = Db::empty();
+    for db in [&mut plain, &mut indexed] {
+        db.run("col events { id: text, tenant: i64, ts: i64, priority: i64 }").unwrap();
+        let rows = (0..128).map(|i| format!(
+            r#"{{ id: "e{i}", tenant: {}, ts: {}, priority: {} }}"#, i % 2, i % 7, i % 3
+        )).collect::<Vec<_>>().join(",");
+        db.run(&format!("insert events [{rows}]")).unwrap();
+    }
+    indexed.run("index events [tenant]").unwrap();
+    indexed.run("index events [tenant, priority, ts]").unwrap();
+    for (ts, priority) in [("", ""), (" desc", " desc"), ("", " desc")] {
+        for skip in [0, 13, 80] {
+            let q = format!("events | tenant == 1 | sort ts{ts} | sort priority{priority} | skip {skip} | take 9");
+            assert_eq!(ids(&mut indexed, &q), ids(&mut plain, &q), "{q}");
+        }
+    }
+}

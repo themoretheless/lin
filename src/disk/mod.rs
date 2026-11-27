@@ -2344,6 +2344,11 @@ impl DiskEngine {
     }
 
     #[inline]
+    pub(crate) fn can_share_snapshot_arc(&self) -> bool {
+        !self.has_any_overlay && self.active_savepoint.is_none()
+    }
+
+    #[inline]
     pub fn table_has_dirty_overlay(&self, table: &str) -> bool {
         self.dirty_overlay.contains(table)
     }

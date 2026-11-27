@@ -549,7 +549,7 @@ impl Db {
                             all_bytes.push_str(text);
                             all_bytes[start..].make_ascii_lowercase();
                         } else {
-                            all_bytes.extend(text.chars().flat_map(char::to_lowercase));
+                            all_bytes.push_str(&text.to_lowercase());
                         }
                         all_bytes.push(' ');
                     }

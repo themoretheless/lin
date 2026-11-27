@@ -2446,12 +2446,16 @@ pub(super) fn decode_column_record_mode(
                 let mut last_s_raw: Option<&[u8]> = None;
                 let mut last_p_raw: Option<&[u8]> = None;
                 let mut last_o_raw: Option<&[u8]> = None;
+                let mut s_state: (u32, u32, bool) = (0, 0, true);
+                let mut p_state: (u32, u32, bool) = (0, 0, true);
+                let mut o_state: (u32, u32, bool) = (0, 0, true);
 
                 #[inline(always)]
                 fn push_interned<'a, const N: usize>(
                     raw: &'a [u8],
                     last_raw: &mut Option<&'a [u8]>,
                     slots: &mut [(&'a [u8], u32); N],
+                    state: &mut (u32, u32, bool),
                     out: &mut Vec<Arc<str>>,
                 ) -> Result<(), ()> {
                     if *last_raw == Some(raw) {
@@ -2459,10 +2463,12 @@ pub(super) fn decode_column_record_mode(
                         return Ok(());
                     }
                     *last_raw = Some(raw);
-                    if raw.len() <= 64 {
+                    if state.2 && raw.len() <= 64 {
+                        state.0 += 1;
                         let h = fast_bytes_hash(raw) & (N - 1);
                         let (craw, cidx) = slots[h];
                         if cidx != u32::MAX && craw == raw {
+                            state.1 += 1;
                             out.push(Arc::clone(&out[cidx as usize]));
                             return Ok(());
                         }
@@ -2470,20 +2476,23 @@ pub(super) fn decode_column_record_mode(
                         let idx = out.len() as u32;
                         out.push(arc_from_validated_str(s_str));
                         slots[h] = (raw, idx);
+                        if state.0 == 32 && state.1 == 0 {
+                            state.2 = false;
+                        }
                     } else {
                         let s_str = std::str::from_utf8(raw).map_err(|_| ())?;
-                        out.push(Arc::from(s_str));
+                        out.push(arc_from_validated_str(s_str));
                     }
                     Ok(())
                 }
 
                 for _ in 0..n {
                     let s_raw = take_raw_bytes(buf, &mut i)?;
-                    push_interned(s_raw, &mut last_s_raw, &mut s_slots, &mut s)?;
+                    push_interned(s_raw, &mut last_s_raw, &mut s_slots, &mut s_state, &mut s)?;
                     let p_raw = take_raw_bytes(buf, &mut i)?;
-                    push_interned(p_raw, &mut last_p_raw, &mut p_slots, &mut p)?;
+                    push_interned(p_raw, &mut last_p_raw, &mut p_slots, &mut p_state, &mut p)?;
                     let o_raw = take_raw_bytes(buf, &mut i)?;
-                    push_interned(o_raw, &mut last_o_raw, &mut o_slots, &mut o)?;
+                    push_interned(o_raw, &mut last_o_raw, &mut o_slots, &mut o_state, &mut o)?;
                 }
             }
             Ok(LogRecord {

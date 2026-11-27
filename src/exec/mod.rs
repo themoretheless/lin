@@ -619,10 +619,9 @@ impl Db {
             p.sync = sync;
         }
         if self.store.is_native_disk()
-            && let Some(d) = self.store.disk.as_ref()
-            && let Ok(mut eng) = d.engine.write()
+            && let Some(d) = self.store.disk.as_mut()
         {
-            eng.set_sync_full(sync == SyncMode::Full);
+            d.engine_mut().set_sync_full(sync == SyncMode::Full);
         }
         self
     }
@@ -857,12 +856,9 @@ impl Db {
         if let Some(mut p) = self.persist.take() {
             self.store.checkpoint(&mut p)?;
         } else if self.store.is_native_disk()
-            && let Some(d) = self.store.disk.as_ref()
+            && let Some(d) = self.store.disk.as_mut()
         {
-            d.engine
-                .write()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?
-                .checkpoint()?;
+            d.engine_mut().checkpoint()?;
         }
         self.reader_lock = None;
         Ok(())
@@ -873,12 +869,9 @@ impl Db {
         if let Some(p) = self.persist.as_mut() {
             self.store.checkpoint(p)?;
         } else if self.store.is_native_disk()
-            && let Some(d) = self.store.disk.as_ref()
+            && let Some(d) = self.store.disk.as_mut()
         {
-            d.engine
-                .write()
-                .map_err(|_| Error::runtime("disk engine lock poisoned"))?
-                .checkpoint()?;
+            d.engine_mut().checkpoint()?;
         }
         Ok(())
     }
@@ -1084,11 +1077,18 @@ impl Db {
 
         let n = to_apply.len();
         let mut saw_schema = false;
-        for (_, rec) in &to_apply {
+        for (_, rec) in to_apply {
             if pack_has_schema(&rec.pack) {
                 saw_schema = true;
             }
-            self.store.apply_pack(&rec.pack);
+            match rec.pack {
+                Pack::AppendFactsBulk { s, p, o } => {
+                    self.store.append_facts_spo_bulk_owned(s, p, o);
+                }
+                other => {
+                    self.store.apply_pack(&other);
+                }
+            }
             self.store.next_id = rec.next_id;
             self.store.r#gen = rec.r#gen;
         }
@@ -2896,12 +2896,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.upsert_rows_mem_only(collection, rows.clone())?;
                     eng.count_table(collection)
                 };
@@ -2922,12 +2919,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.delete_id_mem_only(collection, id)?;
                     eng.count_table(collection)
                 } else {
@@ -2941,12 +2935,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.delete_by_ids_mem_only(collection, &ids)?;
                     eng.count_table(collection)
                 };
@@ -2963,12 +2954,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.upsert_row_mem_only(collection, row.clone())?;
                     eng.count_table(collection)
                 };
@@ -2988,12 +2976,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.upsert_rows_mem_only(collection, rows.clone())?;
                     eng.count_table(collection)
                 };
@@ -3016,12 +3001,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.upsert_rows_mem_only(collection, built)?;
                     eng.count_table(collection)
                 };
@@ -3029,7 +3011,7 @@ impl Db {
                 Ok(())
             }
             _ => {
-                self.store.apply_pack(pack);
+                self.store.apply_pack_mem_only(pack);
                 Ok(())
             }
         }
@@ -3112,12 +3094,9 @@ impl Db {
                         let d = self
                             .store
                             .disk
-                            .as_ref()
+                            .as_mut()
                             .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                        let mut eng = d
-                            .engine
-                            .write()
-                            .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                        let eng = d.engine_mut();
                         eng.upsert_rows_mem_only(&collection, rows)?;
                         eng.count_table(&collection)
                     };
@@ -3134,12 +3113,9 @@ impl Db {
                             let d = self
                                 .store
                                 .disk
-                                .as_ref()
+                                .as_mut()
                                 .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                            let mut eng = d
-                                .engine
-                                .write()
-                                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                            let eng = d.engine_mut();
                             eng.delete_id_mem_only(&collection, id)?;
                             eng.count_table(&collection)
                         };
@@ -3156,12 +3132,9 @@ impl Db {
                             let d = self
                                 .store
                                 .disk
-                                .as_ref()
+                                .as_mut()
                                 .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                            let mut eng = d
-                                .engine
-                                .write()
-                                .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                            let eng = d.engine_mut();
                             eng.delete_by_ids_mem_only(&collection, &ids)?;
                             eng.count_table(&collection)
                         };
@@ -3179,12 +3152,9 @@ impl Db {
                     let d = self
                         .store
                         .disk
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| Error::runtime("disk engine missing"))?;
-                    let mut eng = d
-                        .engine
-                        .write()
-                        .map_err(|_| Error::runtime("disk engine lock poisoned"))?;
+                    let eng = d.engine_mut();
                     eng.upsert_row_mem_only(&collection, row)?;
                     eng.count_table(&collection)
                 };
@@ -5585,31 +5555,49 @@ impl Db {
     /// Stable index-order top-k for an equality prefix followed by the sort column.
     fn ordered_index_top_k(&self, q: &Query, now: i64) -> Option<Vec<Row>> {
         let Source::Collection(name) = &q.source else { return None };
-        let [Step::Filter(pred), Step::Sort { field, desc }, Step::Take { n: Some(limit) }] =
+        let [Step::Filter(pred), middle @ .., Step::Take { n: Some(limit) }] =
             q.steps.as_slice() else { return None };
         if self.store.is_disk_backed(name) || (name == "docs" && self.store.has_deferred_doc_ops()) {
             return None;
         }
-        let sort = field.leaf()?;
-        let ty = &self.catalog.collection(name)?.field(sort)?.ty;
-        if !matches!(ty, crate::catalog::Type::I64 | crate::catalog::Type::Time) {
-            return None;
-        }
-        let (uses, covered) = crate::index::pick_index_with_coverage(&self.catalog, name, pred)?;
-        let [access] = uses.as_slice() else { return None };
-        if access.eqs.is_empty() || access.def.fields.len() != access.eqs.len() + 1
-            || access.def.fields.last()?.as_str() != sort {
-            return None;
-        }
+        let (sorts, mut skip) = match middle {
+            [sorts @ .., Step::Skip { n }] => (sorts, (*n).max(0) as usize),
+            sorts => (sorts, 0),
+        };
+        let Step::Sort { desc, .. } = sorts.first()? else { return None };
+        let schema = self.catalog.collection(name)?;
+        // Successive stable sorts make the last sort the most significant key.
+        let sort_keys = sorts.iter().rev().map(|step| {
+            let Step::Sort { field, desc: direction } = step else { return None };
+            let key = field.leaf()?;
+            (direction == desc && matches!(schema.field(key)?.ty,
+                crate::catalog::Type::I64 | crate::catalog::Type::Time)).then_some(key)
+        }).collect::<Option<Vec<_>>>()?;
+        let (access, covered) = self.catalog.indexes_on(name).into_iter().find_map(|def| {
+            let prefix = def.fields.len().checked_sub(sort_keys.len())?;
+            if prefix == 0 || def.fields[prefix..] != sort_keys[..] {
+                return None;
+            }
+            let (mut uses, covered) = crate::index::pick_from_indexes(&[def], pred)?;
+            if uses.len() != 1 {
+                return None;
+            }
+            let access = uses.pop()?;
+            (access.eqs.len() == prefix).then_some((access, covered))
+        })?;
         let index = self.store.indexes.get(&access.def.label())?;
         let limit = (*limit).max(0) as usize;
         let mut rows = Vec::new();
         if limit > 0 {
             let mut slots = eval::PredSlots::new(pred);
-            index.seek_ordered_limit(access, now, *desc, |pos| {
+            index.seek_ordered_limit(&access, now, *desc, |pos| {
                 if let Some(row) = self.store.get_by_idx(name, pos)
                     && (covered || slots.eval(row, now)) {
-                    rows.push(row.clone());
+                    if skip > 0 {
+                        skip -= 1;
+                    } else {
+                        rows.push(row.clone());
+                    }
                 }
                 rows.len() < limit
             });
