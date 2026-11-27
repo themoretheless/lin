@@ -1,0 +1,40 @@
+name: Linux release binaries
+on:
+  push:
+    branches: [main, codex/merge-linux-release-allocator]
+    paths:
+      - scripts/build-linux-release.sh
+      - .github/workflows/linux-release-build.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.96.0'
+      - name: Build and verify allocator in both binaries
+        run: |
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            sudo apt-get update -qq
+            (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+            dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+            export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
+          fi
+          scripts/build-linux-release.sh
+          for binary in target/release/{lin,lin-peer-worker}; do
+            nm --defined-only "$binary" > "$RUNNER_TEMP/symbols"
+            if [[ "$(uname -m)" = x86_64 ]]; then
+              grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/symbols"
+              grep -Eq ' [TW] malloc$' "$RUNNER_TEMP/symbols"
+            elif grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/symbols"; then
+              exit 1
+            fi
+          done
+          echo '{"insert_rows":1000,"samples":1,"timestamp_ms":123456}' | target/release/lin-peer-worker | jq -e '.result | length == 1000'
