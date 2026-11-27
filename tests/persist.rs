@@ -6074,3 +6074,34 @@ fn declared_column_mirror_matches_row_pipeline() {
     decl.declare_columns("ev", &[]).unwrap();
     check(&mut plain, &mut decl, "undeclared");
 }
+
+#[test]
+fn ordered_batch_checks_late_duplicate_keys_and_recovers_after_retry() {
+    let path = tmp();
+    let mut db = Db::open(&path).unwrap();
+    for (last_id, last_uri, expected_error) in [
+        (0, 511, Some("duplicate id")),
+        (511, 7, Some("duplicate uri")),
+        (511, 511, None),
+    ] {
+        let records = (0..512)
+            .map(|i| {
+                let (id, uri) = if i == 511 { (last_id, last_uri) } else { (i, i) };
+                format!(r#"{{id:"d-{id}",uri:"raw://{uri}",title:"doc",layer:"wiki"}}"#)
+            })
+            .collect::<Vec<_>>();
+        let prepared = db.prepare(&format!("insert docs [{}]", records.join(","))).unwrap();
+        let result = prepared.run(&mut db);
+        if let Some(message) = expected_error {
+            assert!(result.unwrap_err().to_string().contains(message));
+            assert!(db.store.collection("docs").is_empty());
+        } else {
+            assert_eq!(result.unwrap().done.n, 512);
+        }
+    }
+    drop(db);
+    let recovered = Db::open(&path).unwrap();
+    assert_eq!(recovered.store.collection("docs").len(), 512);
+    drop(recovered);
+    fs::remove_dir_all(path).unwrap();
+}
