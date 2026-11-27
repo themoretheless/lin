@@ -112,6 +112,7 @@ fn measure_insert(
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        let before_clones = lin::Row::wide_clone_count();
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
@@ -125,6 +126,7 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        eprintln!("wide_clones {}", lin::Row::wide_clone_count() - before_clones);
         if affected != n {
             return Err("insert affected count mismatch".into());
         }

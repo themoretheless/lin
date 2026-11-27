@@ -319,9 +319,11 @@ pub struct Row {
     cells: Cells,
 }
 
+pub static WIDE_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 impl Clone for Row {
     fn clone(&self) -> Self {
         let cells = if self.cells.len() > self.cells.inline_size() {
+            WIDE_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Cells::from_vec(self.cells.as_slice().to_vec())
         } else {
             self.cells.clone()
@@ -334,6 +336,10 @@ impl Clone for Row {
 }
 
 impl Row {
+    pub fn wide_clone_count() -> usize {
+        WIDE_CLONES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[inline]
     pub const fn new() -> Self {
         Row {
