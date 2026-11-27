@@ -1,0 +1,54 @@
+name: Compare native embedded Rust clients
+
+on:
+  push:
+    branches: [codex/native-embedded-clients]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-embedded-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  peers:
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned peer clients
+        run: python -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Build frozen Lin peer worker
+        run: |
+          link=()
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            sudo apt-get update -qq
+            (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+            dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+            link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
+          fi
+          for binary in lin-peer-worker embedded-native; do
+            cargo rustc --locked --release -p lin-peer-worker --bin "$binary" -- "${link[@]}"
+          done
+          lscpu > cpu.txt
+          python scripts/native-embedded-pairs.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-embedded-${{ matrix.runner }}
+          path: |
+            cpu.txt
+            embedded-results.json
