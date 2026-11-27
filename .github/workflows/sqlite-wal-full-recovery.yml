@@ -1,7 +1,7 @@
-name: SQLite WAL FULL with verified Lin recovery
+name: Profile storage cost of SQLite and Lin FULL commits
 on:
   push:
-    branches: [codex/main-partitioned-fts]
+    branches: [codex/wal-storage-cost-profile]
 permissions:
   contents: read
 jobs:
@@ -57,10 +57,11 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git worktree add --detach "$RUNNER_TEMP/base" 39fed900b
-          (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
-          sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
-          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt
+          test "$(stat -f -c %T /dev/shm)" = tmpfs
+          test "$(stat -f -c %T /tmp)" != tmpfs
+          export TMPDIR=/tmp
+          df -T /tmp /dev/shm >> provenance.txt
+          python3 scripts/profile-wal-storage-cost.py target/release/lin-peer-worker wal-storage.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -68,5 +69,4 @@ jobs:
           path: |
             runner-cpu.txt
             provenance.txt
-            wal-full.json
-            summary.txt
+            wal-storage.json
