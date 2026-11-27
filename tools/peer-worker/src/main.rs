@@ -117,6 +117,7 @@ fn measure_insert(
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        eprintln!("frame_profile_begin");
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
@@ -130,6 +131,7 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        eprintln!("frame_profile_end");
         if affected != n {
             return Err("insert affected count mismatch".into());
         }

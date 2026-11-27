@@ -22,18 +22,25 @@ def fixture(n):
              123456, f"body {i}") for i in range(n)]
 
 
-def run_lin(worker, directory, rows):
+def run_lin(worker, directory, rows, profile=False):
     request = dict(insert_rows=len(rows), samples=1, timestamp_ms=123456, durable_dir=directory)
-    result = json.loads(subprocess.check_output([worker], input=json.dumps(request) + "\n", text=True))
+    proc = subprocess.run([worker], input=json.dumps(request) + "\n", text=True, capture_output=True, check=True)
+    result = json.loads(proc.stdout)
+    if profile:
+        measured = proc.stderr.split("frame_profile_begin\n")[1].split("frame_profile_end\n")[0]
+        frames = [line.split() for line in measured.splitlines() if line.startswith("frame_cost ")]
+        if len(frames) != 1 or frames[0][-1] != "Full":
+            raise ValueError(f"Unexpected measured WAL frames: {frames}")
+        frame = dict(zip(("bytes", "write_ns", "sync_ns"), map(int, frames[0][1:4])))
     if not (len(result.get("reopen_ns", [])) == 1 and result["reopen_ns"][0] > 0
             and any(Path(directory).iterdir())):
         raise ValueError("Lin worker did not confirm a durable database reopen")
     if [tuple(row) for row in result["result"]] != rows:
         raise ValueError("Lin durable INSERT readback disagrees with fixture")
-    return result["samples_ns"][0]
+    return (result["samples_ns"][0], frame) if profile else result["samples_ns"][0]
 
 
-def run_sqlite(directory, rows):
+def run_sqlite(directory, rows, profile=False):
     path = Path(directory) / "db.sqlite"
     db = sqlite3.connect(path, isolation_level=None)
     try:
@@ -43,11 +50,16 @@ def run_sqlite(directory, rows):
         if db.execute("PRAGMA synchronous").fetchone() != (2,):
             raise RuntimeError("SQLite refused FULL sync")
         db.executescript(SCHEMA)
+        if profile:
+            wal_path = Path(str(path) + "-wal")
+            wal_before = wal_path.stat().st_size
         start = perf_counter_ns()
         db.execute("BEGIN")
         db.executemany("INSERT INTO docs VALUES (?,?,?,?,?,?)", rows)
         db.execute("COMMIT")
         elapsed = perf_counter_ns() - start
+        if profile:
+            wal_growth = wal_path.stat().st_size - wal_before
     finally:
         db.close()
     db = sqlite3.connect(path)
@@ -56,7 +68,7 @@ def run_sqlite(directory, rows):
             raise ValueError("SQLite durable INSERT readback disagrees with fixture")
     finally:
         db.close()
-    return elapsed
+    return (elapsed, wal_growth) if profile else elapsed
 
 
 def main():

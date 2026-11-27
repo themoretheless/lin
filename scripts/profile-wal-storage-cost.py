@@ -22,13 +22,14 @@ for rows in (1000, 10000):
     randomizer.shuffle(orders)
     for order in orders:
         timings = {}
+        frames = {}
         for engine, storage in order:
             root = "/dev/shm" if storage == "tmpfs" else tempfile.gettempdir()
             with tempfile.TemporaryDirectory(dir=root) as directory:
                 if engine == "lin":
-                    duration = bench["run_lin"](worker, directory, fixture)
+                    duration, frames["lin_" + storage] = bench["run_lin"](worker, directory, fixture, profile=True)
                 else:
-                    duration = bench["run_sqlite"](directory, fixture)
+                    duration, frames["sqlite_growth_" + storage] = bench["run_sqlite"](directory, fixture, profile=True)
             timings[f"{engine}_{storage}"] = duration
-        report["samples"].append(dict(rows=rows, order=order, ns=timings))
+        report["samples"].append(dict(rows=rows, order=order, ns=timings, frames=frames))
         Path(sys.argv[2]).write_text(json.dumps(report))
