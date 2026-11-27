@@ -2359,7 +2359,7 @@ pub(crate) fn build_batch_insert_rows(
     };
 
     let rows = if n >= 256 && (can_inline_embed || needs_hash || n >= 4096) {
-        let min_chunk = if can_inline_embed { 128 } else { 1024 };
+        let min_chunk = if can_inline_embed { 512 } else { 1024 };
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)

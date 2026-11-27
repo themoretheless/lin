@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/native-embedded-clients]
+    branches: [codex/typed-batch-512-linux]
 
 permissions:
   contents: read
@@ -42,13 +42,17 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
+          git show HEAD^:src/exec/dml.rs > src/exec/dml.rs
+          cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          cp target/release/embedded-native target/release/typed-baseline
+          git restore src/exec/dml.rs
           cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          python scripts/typed-storage-modes.py
+          python scripts/typed-wal-triplets.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            typed-storage-modes.json
+            typed-wal-triplets.json
