@@ -2,7 +2,7 @@ name: Profile native typed INSERT stages
 
 on:
   push:
-    branches: [codex/linux-typed-insert-stages]
+    branches: [codex/linux-typed-wal-io]
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ jobs:
           fi
           cargo rustc --locked --release -p lin --example profile_typed_insert -- "${link[@]}"
           lscpu > cpu.txt
-          for mode in lin-wal lin-memory; do
+          for mode in lin-wal; do
             for n in 1000 10000; do
               target/release/examples/profile_typed_insert "$mode" "$n" 24 "$(mktemp -d)" > "$mode-$n-total.txt" 2> "$mode-$n-stages.txt"
             done

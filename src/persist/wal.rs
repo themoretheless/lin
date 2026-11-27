@@ -746,12 +746,19 @@ pub(super) fn write_in_place_frame_buf(
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
+    let begin = std::time::Instant::now();
     if framed.len() >= 64 * 1024 + 13 {
         reserve_wal_space_at(log, *log_bytes, framed.len());
     }
+    let reserved = std::time::Instant::now();
     log.write_all(framed).map_err(io_err)?;
+    let written = std::time::Instant::now();
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;
+    }
+    let synced = std::time::Instant::now();
+    if framed.len() > 1024 {
+        eprintln!("wal_io_ns {} {} {} {}", framed.len(), (reserved-begin).as_nanos(), (written-reserved).as_nanos(), (synced-written).as_nanos());
     }
     *log_bytes += framed.len() as u64;
     Ok(())
