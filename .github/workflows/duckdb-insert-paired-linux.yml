@@ -1,7 +1,7 @@
 name: Qualify linked Linux allocator against DuckDB on main
 on:
   push:
-    branches: [codex/main-release-lto-ab]
+    branches: [codex/linux-insert-pgo]
 permissions:
   contents: read
 jobs:
@@ -32,6 +32,7 @@ jobs:
         if: steps.cpu.outputs.matched == 'true'
         with:
           toolchain: '1.96.0'
+          components: llvm-tools-preview
       - uses: actions/setup-python@v6
         if: steps.cpu.outputs.matched == 'true'
         with:
@@ -45,10 +46,7 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
           fi
-          CARGO_PROFILE_RELEASE_LTO=thin scripts/build-linux-release.sh
-          cp target/release/lin-peer-worker "$RUNNER_TEMP/thin-worker"
-          CARGO_PROFILE_RELEASE_LTO=fat scripts/build-linux-release.sh
-          sha256sum "$RUNNER_TEMP/thin-worker" target/release/lin-peer-worker > lto-binaries.txt
+          scripts/qualify-insert-pgo.sh
           if [[ "$(uname -m)" = x86_64 ]]; then
             for binary in target/release/{lin,lin-peer-worker}; do
               nm --defined-only "$binary" > symbols.txt
@@ -81,6 +79,7 @@ jobs:
           name: paired-duckdb-insert-${{ matrix.replica }}
           path: |
             runner-cpu.txt
+            training-summary.txt
             lto-binaries.txt
             allocator-provenance.txt
             glibc-tunables.txt
