@@ -1,7 +1,7 @@
-name: SQLite WAL FULL with verified Lin recovery
+name: Compare encoder and writer LZ4 under FULL sync
 on:
   push:
-    branches: [codex/wal-lz4-before-checksum]
+    branches: [codex/lz4-encoder-paired]
 permissions:
   contents: read
 jobs:
@@ -57,7 +57,7 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git worktree add --detach "$RUNNER_TEMP/base" 1bc367fef8d67ce443821746a02ed0ab28151708
+          git worktree add --detach "$RUNNER_TEMP/base" 430d8a911f5a44535a201aca3d202d5ee7680b71
           (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
           sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
           python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt
