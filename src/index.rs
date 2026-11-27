@@ -749,38 +749,22 @@ impl LiveIndex {
                 self.reverse.reserve(rows.len());
             }
             let first = &rows[0];
-            let uniform = Row::share_field_positions(rows);
-            if uniform && first.len() <= 32 && self.def.fields.len() <= 8 {
-                let mut slot_to_part = [None; 32];
-                let mut all_found = true;
-                for (part_idx, field) in self.def.fields.iter().enumerate() {
-                    if let Some(pos) = first.keys().position(|k| k == field) {
-                        if pos < 32 {
-                            slot_to_part[pos] = Some(part_idx);
-                        } else {
-                            all_found = false;
-                            break;
-                        }
-                    } else {
-                        all_found = false;
-                        break;
-                    }
+            if Row::share_field_positions(rows) {
+                let positions: smallvec::SmallVec<[Option<usize>; 2]> = self.def.fields.iter()
+                    .map(|field| first.keys().position(|name| name == field))
+                    .collect();
+                for (i, row) in rows.iter().enumerate() {
+                    let cells = row.cells();
+                    let key = match positions.as_slice() {
+                        [Some(a)] => Self::single_cell_key(&cells[*a]),
+                        [Some(a), Some(b)] => Self::two_cell_key(&cells[*a], &cells[*b]),
+                        positions => IndexKey(positions.iter().map(|slot| {
+                            slot.map_or(IndexPart::Null, |pos| cell_part(&cells[pos]))
+                        }).collect()),
+                    };
+                    self.insert_one_slab_key(start + i, row, key, bitmap_sample)?;
                 }
-                if all_found {
-                    let num_parts = self.def.fields.len();
-                    for (i, row) in rows.iter().enumerate() {
-                        let orig_idx = start + i;
-                        let mut parts = smallvec::smallvec![IndexPart::Null; num_parts];
-                        for (pos, val) in row.values().enumerate() {
-                            if let Some(&Some(part_idx)) = slot_to_part.get(pos) {
-                                parts[part_idx] = cell_part(val);
-                            }
-                        }
-                        let key = IndexKey(parts);
-                        self.insert_one_slab_key(orig_idx, row, key, bitmap_sample)?;
-                    }
-                    return Ok(());
-                }
+                return Ok(());
             }
             for (i, row) in rows.iter().enumerate() {
                 let orig_idx = start + i;
