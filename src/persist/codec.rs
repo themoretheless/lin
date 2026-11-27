@@ -1498,6 +1498,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
         let mut sparse_decoded_bytes = 0usize;
 
         for (fi, f) in fields.iter().enumerate() {
+            let column_start = buf.len();
             put_str(buf, f);
             match col_types[fi] {
                 DirectColType::Text => {
@@ -1647,6 +1648,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                     }
                 }
             }
+            eprintln!("wal_column {} {} {}", rows.len(), f, buf.len() - column_start);
         }
 
         Some((

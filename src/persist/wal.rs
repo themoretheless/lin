@@ -567,6 +567,7 @@ pub(crate) fn write_frame_precomputed(
     let start = std::time::Instant::now();
     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
     let written = start.elapsed();
+    if payload.len() > 100000 && let Some(path) = std::env::var_os("LIN_CAPTURE_WAL_PAYLOAD") { std::fs::write(path, payload).unwrap(); }
 
     if sync == SyncMode::Full {
         durable_sync(log).map_err(io_err)?;

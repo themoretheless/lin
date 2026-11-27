@@ -1,7 +1,7 @@
 name: Profile storage cost of SQLite and Lin FULL commits
 on:
   push:
-    branches: [codex/wal-frame-cost-profile]
+    branches: [codex/wal-column-size-profile]
 permissions:
   contents: read
 jobs:
@@ -61,7 +61,7 @@ jobs:
           test "$(stat -f -c %T /tmp)" != tmpfs
           export TMPDIR=/tmp
           df -T /tmp /dev/shm >> provenance.txt
-          python3 scripts/profile-wal-storage-cost.py target/release/lin-peer-worker wal-storage.json
+          python3 scripts/profile-lz4-write-cost.py target/release/lin-peer-worker wal-lz4.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,4 +69,4 @@ jobs:
           path: |
             runner-cpu.txt
             provenance.txt
-            wal-storage.json
+            wal-lz4.json
