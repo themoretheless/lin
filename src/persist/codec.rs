@@ -442,6 +442,15 @@ pub(super) unsafe fn append_sparse_iter_avx2<'a, const WIDE: bool>(
                 !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
             };
             for (block, values) in emb.chunks(width).enumerate() {
+                if WIDE && values.len() == 32 {
+                    let ptr = values.as_ptr().cast::<__m256i>();
+                    let low = _mm256_or_si256(_mm256_loadu_si256(ptr), _mm256_loadu_si256(ptr.add(1)));
+                    let high = _mm256_or_si256(_mm256_loadu_si256(ptr.add(2)), _mm256_loadu_si256(ptr.add(3)));
+                    let combined = _mm256_or_si256(low, high);
+                    if _mm256_testz_si256(combined, combined) != 0 {
+                        continue;
+                    }
+                }
                 let mut mask = if values.len() == width {
                     let first = vector_mask(values);
                     if WIDE {

@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/linux-wal-compressed-append]
+    branches: [codex/typed-wal-x64-zero-blocks]
 
 permissions:
   contents: read
@@ -15,7 +15,7 @@ jobs:
   peers:
     strategy:
       matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        runner: [ubuntu-22.04]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
@@ -42,18 +42,23 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
+          git show HEAD^:src/persist/codec.rs > src/persist/codec.rs
+          cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          cp target/release/embedded-native target/release/typed-baseline
+          git restore src/persist/codec.rs
           cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          sudo apt-get install -y liblz4-dev
-          c++ -O3 -std=c++17 scripts/bench-compressed-sync.cpp -llz4 -o "$RUNNER_TEMP/compressed-sync"
           for n in 1000 10000; do
-            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
+            for worker in typed-baseline embedded-native; do
+              LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/$worker.wal" "target/release/$worker" lin-wal "$n" 1 "$(mktemp -d)"
+            done
+            cmp "$RUNNER_TEMP/typed-baseline.wal" "$RUNNER_TEMP/embedded-native.wal"
           done
-          "$RUNNER_TEMP/compressed-sync" "$RUNNER_TEMP/wal-1000" "$RUNNER_TEMP/wal-10000" | tee compressed-sync.txt
+          python scripts/typed-wal-triplets.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            compressed-sync.txt
+            typed-wal-triplets.json
