@@ -1,7 +1,7 @@
 name: Qualify linked Linux allocator against DuckDB on main
 on:
   push:
-    branches: [codex/main-release-lto-ab]
+    branches: [codex/fts-selected-slots]
 permissions:
   contents: read
 jobs:
@@ -45,9 +45,10 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
           fi
-          CARGO_PROFILE_RELEASE_LTO=thin scripts/build-linux-release.sh
-          cp target/release/lin-peer-worker "$RUNNER_TEMP/thin-worker"
-          CARGO_PROFILE_RELEASE_LTO=fat scripts/build-linux-release.sh
+          git worktree add --detach "$RUNNER_TEMP/base" origin/main
+          (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
+          cp "$RUNNER_TEMP/base/target/release/lin-peer-worker" "$RUNNER_TEMP/thin-worker"
+          scripts/build-linux-release.sh
           sha256sum "$RUNNER_TEMP/thin-worker" target/release/lin-peer-worker > lto-binaries.txt
           if [[ "$(uname -m)" = x86_64 ]]; then
             for binary in target/release/{lin,lin-peer-worker}; do

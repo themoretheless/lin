@@ -119,15 +119,16 @@ impl FtsIndex {
                 let mut scratch = String::with_capacity(256);
                 for (i, row) in rows.iter().enumerate() {
                     let row_idx = start + i;
-                    for (pos, val) in row.values().enumerate().take(32) {
-                        if (slot_mask & (1u32 << pos)) != 0 {
-                            if let Some(text) = val.text() {
-                                let lowered = lowercased(text, &mut scratch);
-                                // Same word boundaries as single-row inserts, removals
-                                // and queries (Unicode whitespace, not ASCII only).
-                                for tok in lowered.split_whitespace() {
-                                    add_posting(&mut self.postings, tok, row_idx);
-                                }
+                    let mut values = row.values();
+                    let mut remaining = slot_mask;
+                    while remaining != 0 {
+                        let skip = remaining.trailing_zeros();
+                        let val = values.nth(skip as usize).expect("uniform FTS row shape");
+                        remaining = (remaining >> skip) >> 1;
+                        if let Some(text) = val.text() {
+                            let lowered = lowercased(text, &mut scratch);
+                            for tok in lowered.split_whitespace() {
+                                add_posting(&mut self.postings, tok, row_idx);
                             }
                         }
                     }
