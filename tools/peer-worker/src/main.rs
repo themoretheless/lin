@@ -118,8 +118,18 @@ fn measure_insert(
         } else {
             let mut tx = db.transaction()?;
             let mut affected = 0;
-            for statement in &prepared {
+            let faults = || -> u64 {
+                // After the process name, minflt is field 10 (state is field 3).
+                std::fs::read_to_string("/proc/self/stat").unwrap()
+                    .rsplit_once(')').unwrap().1.split_whitespace()
+                    .nth(7).unwrap().parse().unwrap()
+            };
+            for (chunk, statement) in prepared.iter().enumerate() {
+                let before = faults();
+                let clock = Instant::now();
                 affected += black_box(tx.run_prepared(statement)?).done.n;
+                let elapsed = clock.elapsed().as_nanos();
+                eprintln!("{} {} {} {}", timings.len(), chunk, elapsed, faults() - before);
             }
             tx.commit()?;
             affected
