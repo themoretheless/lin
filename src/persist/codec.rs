@@ -1084,6 +1084,7 @@ pub(super) fn append_dictionary_rows<'a>(
 // float bits. Reuse its index/value pairs instead of traversing dense vectors again.
 fn dictionary_from_sparse(mut sparse: &[u8], out: &mut Vec<u8>) -> bool {
     let limit = sparse.len();
+    let mut entries = Vec::new();
     while !sparse.is_empty() {
         if out.len() >= limit { return false; }
         let (dimension, rest) = sparse.split_at(4);
@@ -1098,27 +1099,35 @@ fn dictionary_from_sparse(mut sparse: &[u8], out: &mut Vec<u8>) -> bool {
         sparse = tail;
         let mut values = [[0u8; 4]; DICTIONARY_MAX_VALUES];
         let mut used = 0;
+        entries.clear();
+        let width = if code <= 65537 { 2 } else { 4 };
         let mut raw = false;
         for entry in pairs.chunks_exact(8) {
             let bits: [u8; 4] = entry[4..].try_into().unwrap();
-            if !values[..used].contains(&bits) {
-                if used == values.len() { raw = true; break; }
-                values[used] = bits;
-                used += 1;
-            }
+            let ordinal = match values[..used].iter().position(|value| *value == bits) {
+                Some(index) => index,
+                None if used < values.len() => {
+                    values[used] = bits;
+                    used += 1;
+                    used - 1
+                }
+                None => {
+                    raw = true;
+                    break;
+                }
+            };
+            entries.extend_from_slice(&entry[..width]);
+            entries.push(ordinal as u8);
         }
         if raw {
             out.push(0);
             out.extend_from_slice(pairs);
-            continue;
-        }
-        out.push(used as u8);
-        for bits in &values[..used] { out.extend_from_slice(bits); }
-        let width = if code <= 65537 { 2 } else { 4 };
-        for entry in pairs.chunks_exact(8) {
-            out.extend_from_slice(&entry[..width]);
-            let ordinal = values[..used].iter().position(|bits| bits[..] == entry[4..]).unwrap();
-            out.push(ordinal as u8);
+        } else {
+            out.push(used as u8);
+            for bits in &values[..used] {
+                out.extend_from_slice(bits);
+            }
+            out.extend_from_slice(&entries);
         }
     }
     out.len() < limit
