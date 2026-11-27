@@ -1170,6 +1170,8 @@ pub(super) fn append_sparse_cells_parallel(
     }
     static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
         std::sync::OnceLock::new();
+    let pool_start = wal_trace_clock();
+    let cold = POOL.get().is_none();
     let mutex = POOL.get_or_init(|| {
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
@@ -1231,6 +1233,7 @@ pub(super) fn append_sparse_cells_parallel(
     let Some(pool) = guard.as_mut() else {
         return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
     };
+    let pool_ready = wal_trace_clock();
     let total_ways = (pool.workers.len() + 1).min(num_rows.div_ceil(128)).max(1);
     if total_ways <= 1 {
         return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
@@ -1297,8 +1300,10 @@ pub(super) fn append_sparse_cells_parallel(
         }
     }
 
+    let sent = wal_trace_clock();
     let first_res = append_sparse_cells_range(cells, num_fields, fi, 0, first_end, buf);
 
+    let first_done = wal_trace_clock();
     while drain_guard.pending > 0 {
         drain_guard.pending -= 1;
         if let Ok((cidx, res, b)) = drain_guard.done_rx.recv() {
@@ -1312,6 +1317,7 @@ pub(super) fn append_sparse_cells_parallel(
         }
     }
 
+    let all_done = wal_trace_clock();
     let mut out_res = first_res;
     for slot in &mut slots[..dispatched] {
         if let Some((res, mut chunk_buf)) = slot.take() {
@@ -1331,6 +1337,9 @@ pub(super) fn append_sparse_cells_parallel(
     if out_res.is_ok() && fallback_start < num_rows {
         append_sparse_cells_range(cells, num_fields, fi, fallback_start, num_rows, buf)?;
     }
+    let joined = wal_trace_clock();
+    eprintln!(r#"{{"pool":true,"cold":{cold},"lanes":{total_ways},"init":{},"dispatch":{},"caller_chunk":{},"wait":{},"join":{}}}"#,
+        pool_ready-pool_start, sent-pool_ready, first_done-sent, all_done-first_done, joined-all_done);
     out_res
 }
 
