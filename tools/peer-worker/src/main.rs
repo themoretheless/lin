@@ -104,6 +104,7 @@ fn measure_insert(
         .collect::<Vec<_>>();
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
+    let mut phases = Vec::with_capacity(samples);
     let mut result = Value::Null;
     for _ in 0..samples {
         let mut db = Db::empty();
@@ -112,19 +113,24 @@ fn measure_insert(
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut boundaries = Vec::with_capacity(prepared.len() + 2);
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
         } else {
             let mut tx = db.transaction()?;
+            boundaries.push(start.elapsed().as_nanos() as u64);
             let mut affected = 0;
             for statement in &prepared {
                 affected += black_box(tx.run_prepared(statement)?).done.n;
+                boundaries.push(start.elapsed().as_nanos() as u64);
             }
             tx.commit()?;
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        boundaries.push(*timings.last().unwrap() as u64);
+        phases.push(boundaries);
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
@@ -141,7 +147,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"boundaries_ns":phases,"samples_ns":timings,"result":result,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
