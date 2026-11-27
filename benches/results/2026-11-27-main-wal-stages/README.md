@@ -515,3 +515,16 @@ macOS ARM64, локальная файловая система. Журнал с
 | Neoverse-N2 | duckdb | 100000 | повторные | 106.385 | 278.951 | -172.123 | 12/12 |
 
 [Исходные данные](https://github.com/themoretheless/lin/actions/runs/46051066165)
+
+### Типизированная вставка на Intel Xeon Platinum 8573C до оптимизации проверки типов
+
+| CPU | Движок | Строк | Вызов | Lin, мс | Второй движок, мс | Lin − второй, мс | Побед Lin |
+|---|---|---:|---|---:|---:|---:|---:|
+| INTEL(R) XEON(R) PLATINUM 8573C | sqlite | 1000 | первый | 3.389 | 2.276 | +1.122 | 0/12 |
+| INTEL(R) XEON(R) PLATINUM 8573C | sqlite | 10000 | первый | 32.947 | 21.082 | +11.785 | 0/12 |
+| INTEL(R) XEON(R) PLATINUM 8573C | duckdb | 10000 | первый | 15.940 | 27.736 | -11.706 | 12/12 |
+| INTEL(R) XEON(R) PLATINUM 8573C | duckdb | 10000 | повторные | 9.274 | 26.886 | -17.665 | 12/12 |
+| INTEL(R) XEON(R) PLATINUM 8573C | duckdb | 100000 | первый | 165.730 | 268.825 | -103.192 | 12/12 |
+| INTEL(R) XEON(R) PLATINUM 8573C | duckdb | 100000 | повторные | 107.097 | 261.038 | -153.890 | 12/12 |
+
+[Исходные данные](https://github.com/themoretheless/lin/actions/runs/46051066165)
