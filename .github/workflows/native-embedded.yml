@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/native-embedded-clients]
+    branches: [codex/linux-wal-compression-io]
 
 permissions:
   contents: read
@@ -44,11 +44,16 @@ jobs:
           fi
           cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          python scripts/typed-storage-modes.py
+          sudo apt-get install -y liblz4-dev
+          c++ -O3 -std=c++17 scripts/bench-compressed-sync.cpp -llz4 -o "$RUNNER_TEMP/compressed-sync"
+          for n in 1000 10000; do
+            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
+          done
+          "$RUNNER_TEMP/compressed-sync" "$RUNNER_TEMP/wal-1000" "$RUNNER_TEMP/wal-10000" | tee compressed-sync.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            typed-storage-modes.json
+            compressed-sync.txt

@@ -59,6 +59,9 @@ fn main() -> Result<()> {
                 elapsed = start.elapsed();
                 assert_eq!(done.n, n);
                 if durable {
+                    if let Some(target) = std::env::var_os("LIN_BENCH_EXPORT_WAL") {
+                        std::fs::copy(lin::persist::log_path(&path), target)?;
+                    }
                     let recovery = path.join("recovery");
                     std::fs::create_dir(&recovery)?;
                     for file in [
