@@ -46,7 +46,9 @@ def lin_stage(path, rows):
     spans = {r["span"]: r for r in events if "span" in r}
     assert set(spans) == {"encoding", "maintenance"}, events
     assert [r["phase"] for r in phases] == ["build", "validate", "maintain", "append", "wal_io"], phases
-    return dict(total_ns=result["samples_ns"][0], phases=phases, spans=spans)
+    columns, = [r for r in events if r.get("columns")]
+    assert 0 < columns["sparse_write"] <= columns["vector"]
+    return dict(total_ns=result["samples_ns"][0], phases=phases, spans=spans, columns=columns)
 
 
 def main():

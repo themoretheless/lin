@@ -1355,6 +1355,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
     if rows.is_empty() {
         return None;
     }
+    let direct_start = wal_trace_clock();
     let first = &rows[0];
     let num_fields = first.len();
     if num_fields == 0 {
@@ -1430,7 +1431,12 @@ pub(crate) fn encode_insert_rows_direct_ext(
         let mut dictionary_codec = false;
         let mut sparse_decoded_bytes = 0usize;
 
+        let columns_start = wal_trace_clock();
+        let mut scalar_ns = 0;
+        let mut vector_ns = 0;
+        let mut sparse_write_ns = 0;
         for (fi, f) in fields.iter().enumerate() {
+            let column_start = wal_trace_clock();
             put_str(buf, f);
             match col_types[fi] {
                 DirectColType::Text => {
@@ -1516,12 +1522,14 @@ pub(crate) fn encode_insert_rows_direct_ext(
                         let mark = buf.len();
                         buf.push(7);
                         let payload_start = buf.len();
+                        let sparse_start = wal_trace_clock();
                         if append_sparse_cells_parallel(&cells, num_fields, fi, rows.len(), buf)
                             .is_err()
                         {
                             buf.truncate(mark);
                             return None;
                         }
+                        sparse_write_ns += wal_trace_clock() - sparse_start;
                         let sparse_bytes = buf.len() - payload_start;
                         if !has_empty && sparse_bytes >= dense {
                             buf.truncate(mark);
@@ -1580,7 +1588,15 @@ pub(crate) fn encode_insert_rows_direct_ext(
                     }
                 }
             }
+            let elapsed = wal_trace_clock() - column_start;
+            if matches!(col_types[fi], DirectColType::Vec) {
+                vector_ns += elapsed;
+            } else {
+                scalar_ns += elapsed;
+            }
         }
+        let setup_ns = columns_start - direct_start;
+        eprintln!(r#"{{"columns":true,"setup":{setup_ns},"scalar":{scalar_ns},"vector":{vector_ns},"sparse_write":{sparse_write_ns}}}"#);
 
         Some((
             if dictionary_codec {
