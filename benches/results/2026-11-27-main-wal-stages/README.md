@@ -183,3 +183,41 @@
 | Neoverse-N2 / wal-full-arm64 | 10000 | 23.460 | 23.177 | 27.099 | 0.255 | -3.905 | 24 / 24 |
 
 На 1k исправление быстрее SQLite на всех четырёх раннерах. На 10k остаётся отставание на EPYC 9V74, на 9V45 выиграно 13 пар из 24. [Исходные измерения](https://github.com/themoretheless/lin/actions/runs/46034184961)
+
+### Блоки по 128 строк при INSERT от 4096 строк
+
+Контроль с блоками по 64 и той же проверкой порядка id. 24 тройки на размер. SQLite 3.37.2 на x64 и 3.45.1 на ARM64. Медианы парных разностей.
+
+| CPU / раннер | Строк | Lin, мс | Контроль, мс | SQLite, мс | Lin − контроль, мс | Lin − SQLite, мс | Побед над SQLite |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor / wal-full-amd-1 | 1000 | 2.140 | 2.254 | 2.546 | -0.057 | -0.407 | 22 / 24 |
+| AMD EPYC 9V74 80-Core Processor / wal-full-amd-1 | 10000 | 30.482 | 30.670 | 29.765 | -0.310 | 0.381 | 10 / 24 |
+| AMD EPYC 9V74 80-Core Processor / wal-full-amd-2 | 1000 | 2.591 | 2.580 | 3.208 | 0.011 | -0.630 | 24 / 24 |
+| AMD EPYC 9V74 80-Core Processor / wal-full-amd-2 | 10000 | 27.180 | 26.739 | 34.588 | 0.200 | -7.532 | 24 / 24 |
+| AMD EPYC 9V74 80-Core Processor / wal-full-amd-3 | 1000 | 2.164 | 2.145 | 2.546 | 0.002 | -0.381 | 22 / 24 |
+| AMD EPYC 9V74 80-Core Processor / wal-full-amd-3 | 10000 | 31.448 | 31.233 | 29.252 | -0.452 | 2.028 | 8 / 24 |
+| AMD EPYC 7763 64-Core Processor / wal-full-amd-4 | 1000 | 2.629 | 2.662 | 3.346 | -0.015 | -0.733 | 23 / 24 |
+| AMD EPYC 7763 64-Core Processor / wal-full-amd-4 | 10000 | 26.967 | 26.645 | 35.023 | 0.304 | -7.865 | 24 / 24 |
+| Neoverse-N2 / wal-full-arm64 | 1000 | 2.023 | 2.064 | 2.399 | -0.005 | -0.394 | 24 / 24 |
+| Neoverse-N2 / wal-full-arm64 | 10000 | 23.050 | 23.021 | 27.175 | 0.043 | -4.172 | 24 / 24 |
+
+[Исходные данные SQLite](https://github.com/themoretheless/lin/actions/runs/46035888517)
+
+### Первый и повторные INSERT на main против DuckDB
+
+Релизный Lin 3b967b4c5, DuckDB 2.0.0, pandas 3.0.6 как источник для DuckDB. Оба движка в памяти на одном Linux-раннере. 12 пар, первый вызов в новом процессе и медиана следующих четырёх в том же процессе. Отрицательная парная разность в пользу Lin. THP означает запрос через glibc.malloc.hugetlb=1, фактическое выделение больших страниц отдельно не измерялось.
+
+| Раннер | Строк | Первый, мс | Повторные, мс | Первый THP, мс | Повторные THP, мс |
+|---|---:|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 10000 | -4.74 | -14.02 | -4.76 | -14.01 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 100000 | +3.61 | -90.95 | +2.74 | -89.38 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-2 | 10000 | -3.72 | -10.93 | -3.40 | -10.90 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-2 | 100000 | +4.85 | -65.98 | +5.63 | -65.30 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 10000 | -4.19 | -13.00 | -4.24 | -13.08 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 100000 | +0.03 | -89.63 | -1.89 | -90.46 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-4 | 10000 | -4.26 | -13.11 | -3.75 | -13.00 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-4 | 100000 | -0.31 | -89.56 | -1.29 | -90.02 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 10000 | -13.17 | -17.70 | -15.15 | -17.68 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 100000 | -108.04 | -149.52 | -133.69 | -151.17 |
+
+[Исходные данные DuckDB](https://github.com/themoretheless/lin/actions/runs/46036033984)
