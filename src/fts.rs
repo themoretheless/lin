@@ -1118,6 +1118,22 @@ mod tests {
     use crate::store::Cell;
 
     #[test]
+    fn partitioned_postings_match_individual_rows_after_overlap() {
+        let rows: Vec<_> = (0..4097)
+            .map(|i| Row::from([("title", Cell::text_arc(format!("Common {i} ΟΔΟΣ common")))]))
+            .collect();
+        let mut reference = FtsIndex::empty(&["title".into()]);
+        let mut partitioned = Postings::default();
+        for (start, batch) in [(30, &rows[..64]), (0, rows.as_slice())] {
+            for (offset, row) in batch.iter().enumerate() {
+                reference.append_row(start + offset, row);
+            }
+            append_parallel_postings(&mut partitioned, start, batch, 1);
+        }
+        assert_eq!(partitioned, reference.postings);
+    }
+
+    #[test]
     fn snippet_mutations_match_rebuilt_index() {
         for fields in [vec!["title".into()], vec!["title".into(), "snippet".into()]] {
             let before = Row::from([
