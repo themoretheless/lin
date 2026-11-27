@@ -2,17 +2,20 @@ name: Compare durable loopback INSERT
 
 on:
   push:
-    branches: [codex/native-client-bulk-insert]
+    branches: [codex/native-mysql-mongo-bulk]
 
 permissions:
   contents: read
 
 concurrency:
-  group: paired-tcp-${{ github.ref }}
+  group: paired-mysql-mongo-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   peers:
+    strategy:
+      matrix:
+        peer: [mysql, mongo]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -40,22 +43,36 @@ jobs:
           grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/symbols"
       - name: Measure same-host durable inserts
         run: |
-          docker run -d --name pg -p 127.0.0.1:55432:5432 -e POSTGRES_USER=lin -e POSTGRES_PASSWORD=lin -e POSTGRES_DB=lin -v "$RUNNER_TEMP/pgdata:/var/lib/postgresql/data" postgres:16-alpine
-          for i in {1..60}; do
-            if pg_isready -h localhost -p 55432; then break; fi
-            sleep 1
-          done
+          if [[ "${{ matrix.peer }}" = mysql ]]; then
+            docker run -d --name mysql -p 127.0.0.1:53306:3306 -e MYSQL_DATABASE=lin -e MYSQL_USER=lin -e MYSQL_PASSWORD=lin -e MYSQL_ROOT_PASSWORD=lin mysql:8.4
+            for i in {1..90}; do
+              if docker exec mysql mysql -ulin -plin -e 'SELECT 1' lin >/dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            export LIN_BENCH_MYSQL_URL=mysql://lin:lin@127.0.0.1:53306/lin
+          else
+            docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:8 --replSet rs0 --bind_ip_all
+            for i in {1..60}; do
+              if docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -qx 1; then break; fi
+              sleep 1
+            done
+            docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+            for i in {1..60}; do
+              if docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -qx true; then break; fi
+              sleep 1
+            done
+            export LIN_BENCH_MONGO_URL='mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true'
+          fi
           lscpu > cpu.txt
-          export LIN_BENCH_PG_URL=postgresql://lin:lin@127.0.0.1:55432/lin
           for size in 1000 10000 100000; do
             for rep in {1..12}; do
-              roles=(lin postgres)
-              if (( rep % 2 == 0 )); then roles=(postgres lin); fi
+              roles=(lin "${{ matrix.peer }}")
+              if (( rep % 2 == 0 )); then roles=("${{ matrix.peer }}" lin); fi
               for role in "${roles[@]}"; do
                 if [[ "$role" = lin ]]; then
                   ns=$(target/release/tcp-full "$(mktemp -d)" "$size")
                 else
-                  ns=$(target/release/sql-tcp-full postgres "$size")
+                  ns=$(target/release/sql-tcp-full "$role" "$size")
                 fi
                 echo "$size $rep $role $ns" >> rust-tcp.txt
               done
@@ -64,7 +81,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: tcp-results
+          name: tcp-results-${{ matrix.peer }}
           path: |
             cpu.txt
             rust-tcp.txt

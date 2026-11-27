@@ -140,11 +140,111 @@ async fn mssql(rows: &[Doc]) -> Result<u128> {
     Ok(ns)
 }
 
+fn mysql_insert(rows: &[Doc]) -> Result<u128> {
+    use mysql::{Conn, Opts, Params, TxOpts, prelude::Queryable};
+    let mut db = Conn::new(Opts::from_url(&env::var("LIN_BENCH_MYSQL_URL")?)?)?;
+    assert_eq!(
+        db.query_first::<u64, _>("SELECT @@innodb_flush_log_at_trx_commit")?,
+        Some(1)
+    );
+    db.query_drop("CREATE TABLE docs(id varchar(64) PRIMARY KEY, uri varchar(128) UNIQUE,wing varchar(16),title varchar(128),ts bigint,body varchar(128),layer varchar(16),INDEX docs_wing_ts(wing,ts)) ENGINE=InnoDB")?;
+    let start = Instant::now();
+    for chunk in rows.chunks(10000) {
+        let mut tx = db.start_transaction(TxOpts::default())?;
+        // Keep the number of bound parameters below the server limit.
+        for group in chunk.chunks(1000) {
+            let sql = format!(
+                "INSERT INTO docs VALUES {}",
+                vec!["(?,?,?,?,?,?,?)"; group.len()].join(",")
+            );
+            let mut values = Vec::with_capacity(group.len() * 7);
+            for (id, uri, wing, title, ts, body, layer) in group {
+                values.extend([
+                    id.as_str().into(),
+                    uri.as_str().into(),
+                    wing.as_str().into(),
+                    title.as_str().into(),
+                    (*ts).into(),
+                    body.as_str().into(),
+                    layer.as_str().into(),
+                ]);
+            }
+            tx.exec_drop(sql, Params::Positional(values))?;
+        }
+        tx.commit()?;
+    }
+    let ns = start.elapsed().as_nanos();
+    let mut got: Vec<Doc> = db.query("SELECT * FROM docs")?;
+    verify(&mut got, rows);
+    db.query_drop("DROP TABLE docs")?;
+    Ok(ns)
+}
+
+fn mongo_insert(rows: &[Doc]) -> Result<u128> {
+    use mongodb::{
+        IndexModel,
+        bson::{Document, doc},
+        options::{Acknowledgment, WriteConcern},
+        sync::Client,
+    };
+    let client = Client::with_uri_str(env::var("LIN_BENCH_MONGO_URL")?)?;
+    let db = client.database("lin_native_bench");
+    let coll = db.collection::<Document>("docs");
+    db.create_collection("docs").run()?;
+    coll.create_index(
+        IndexModel::builder()
+            .keys(doc! {"uri":1})
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .unique(true)
+                    .build(),
+            )
+            .build(),
+    )
+    .run()?;
+    coll.create_index(IndexModel::builder().keys(doc! {"wing":1,"ts":1}).build())
+        .run()?;
+    let mut session = client.start_session().run()?;
+    let wc = WriteConcern::builder()
+        .w(Acknowledgment::Majority)
+        .journal(true)
+        .build();
+    let start = Instant::now();
+    for chunk in rows.chunks(10000) {
+        session
+            .start_transaction()
+            .write_concern(wc.clone())
+            .run()?;
+        let docs=chunk.iter().map(|(id,uri,wing,title,ts,body,layer)|doc!{"_id":id,"uri":uri,"wing":wing,"title":title,"ts":ts,"body":body,"layer":layer});
+        coll.insert_many(docs).session(&mut session).run()?;
+        session.commit_transaction().run()?;
+    }
+    let ns = start.elapsed().as_nanos();
+    let mut got = Vec::with_capacity(rows.len());
+    for item in coll.find(doc! {}).run()? {
+        let d = item?;
+        got.push((
+            d.get_str("_id")?.into(),
+            d.get_str("uri")?.into(),
+            d.get_str("wing")?.into(),
+            d.get_str("title")?.into(),
+            d.get_i64("ts")?,
+            d.get_str("body")?.into(),
+            d.get_str("layer")?.into(),
+        ));
+    }
+    verify(&mut got, rows);
+    coll.drop().run()?;
+    Ok(ns)
+}
+
 fn main() -> Result<()> {
     let args = env::args().collect::<Vec<_>>();
     let rows = fixture(args[2].parse()?);
     let ns = match args[1].as_str() {
         "postgres" => pg(&rows)?,
+        "mysql" => mysql_insert(&rows)?,
+        "mongo" => mongo_insert(&rows)?,
         "mssql" => tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
