@@ -21,10 +21,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (col, cell) in cols.iter_mut().zip(cells) { col.push(cell); }
     }
     let batch = RecordBatch::from_columns(names.to_vec(), cols);
+    let source = batch.to_rows();
+    let batches: Vec<_> = source.chunks(10000).map(RecordBatch::from_rows).collect();
     let start = Instant::now();
-    let receipt = client.insert_batch("docs", &batch)?;
+    let mut affected = 0;
+    for part in &batches {
+        affected += client.insert_batch("docs", part)?.affected;
+    }
     let elapsed = start.elapsed().as_nanos();
-    assert_eq!(receipt.affected, n);
+    assert_eq!(affected, n);
     drop(client);
     drop(server.shutdown()?);
     let db = Db::open(&dir)?;

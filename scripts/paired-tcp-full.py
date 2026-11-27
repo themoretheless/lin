@@ -12,12 +12,13 @@ def postgres(db, rows):
     db.execute("CREATE TABLE docs(id text PRIMARY KEY, uri text UNIQUE, wing text, title text, ts bigint, body text, layer text)")
     db.execute("CREATE INDEX docs_wing_ts ON docs(wing, ts)")
     start = time.perf_counter_ns()
-    data = io.StringIO(newline="")
-    csv.writer(data, quoting=csv.QUOTE_ALL).writerows(rows)
-    payload = data.getvalue().encode()
-    with db.transaction(), db.cursor() as cursor:
-        with cursor.copy("COPY docs FROM STDIN WITH (FORMAT CSV)") as copy:
-            copy.write(payload)
+    for i in range(0, len(rows), 10000):
+        data = io.StringIO(newline="")
+        csv.writer(data, quoting=csv.QUOTE_ALL).writerows(rows[i:i+10000])
+        payload = data.getvalue().encode()
+        with db.transaction(), db.cursor() as cursor:
+            with cursor.copy("COPY docs FROM STDIN WITH (FORMAT CSV)") as copy:
+                copy.write(payload)
     elapsed = time.perf_counter_ns() - start
     assert sorted(db.execute("SELECT * FROM docs").fetchall()) == sorted(rows)
     return elapsed
