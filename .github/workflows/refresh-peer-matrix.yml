@@ -53,8 +53,9 @@ jobs:
           for size in 1000 10000 100000; do
             for mode in reads insert; do
               cases=()
-              if [[ "$mode" = insert ]]; then cases=(--cases insert_native); fi
-              python scripts/bench-peers.py --lin-binary target/release/lin-peer-worker --engines lin postgres mysql mongo pandas "${cases[@]}" --rows "$size" --samples 8 --repeats 3 --output "$RUNNER_TEMP/peer-results/$mode-$size"
+              engines=(lin postgres mysql mongo pandas)
+              if [[ "$mode" = insert ]]; then cases=(--cases insert_native); engines=(lin postgres mysql mongo); fi
+              python scripts/bench-peers.py --lin-binary target/release/lin-peer-worker --engines "${engines[@]}" "${cases[@]}" --rows "$size" --samples 8 --repeats 3 --output "$RUNNER_TEMP/peer-results/$mode-$size"
             done
           done
       - uses: actions/upload-artifact@v4
