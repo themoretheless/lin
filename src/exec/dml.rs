@@ -1206,15 +1206,26 @@ impl Db {
         } else {
             None
         };
+        // Diagnostic only. RUSAGE_SELF includes the row-building workers.
+        fn minor_faults() -> i64 {
+            let mut usage = std::mem::MaybeUninit::uninit();
+            assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
+            unsafe { usage.assume_init().ru_minflt as i64 }
+        }
+        let initial_faults = minor_faults();
+        let start_build = std::time::Instant::now();
         let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        let build_ns = start_build.elapsed().as_nanos();
+        let built_faults = minor_faults();
+        let after_build = std::time::Instant::now();
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
             || records
                 .iter()
                 .any(|r| !r.fields.iter().any(|(k, _)| k == "id"));
-        self.insert_bulk_built(
+        let result = self.insert_bulk_built(
             collection,
             built,
             BuiltShape {
@@ -1229,7 +1240,10 @@ impl Db {
             edges,
             allow_preencode,
             caller_wants_rows,
-        )
+        );
+        let rest_ns = after_build.elapsed().as_nanos();
+        eprintln!("INSERT_PHASE {build_ns} {rest_ns} {} {}", built_faults - initial_faults, minor_faults() - built_faults);
+        result
     }
 
     /// Bulk insert of rows already built from the statement (or straight from a
