@@ -5,10 +5,12 @@ mkdir "$scratch/build-profiles" "$scratch/training"
 scripts/build-linux-release.sh
 cp target/release/lin-peer-worker "$RUNNER_TEMP/thin-worker"
 RUSTFLAGS="-Cprofile-generate=$scratch/build-profiles" scripts/build-linux-release.sh
-for size in 768 4096 32768; do
+for size in 768 4096 8192; do
   fixture=$(mktemp -d "$scratch/db.XXXXXX")
   printf '{"insert_rows":%d,"samples":1,"timestamp_ms":987654,"durable_dir":"%s"}\n' "$size" "$fixture" |
     LLVM_PROFILE_FILE="$scratch/training/disk-$size-%m.profraw" target/release/lin-peer-worker > /dev/null
+done
+for size in 768 4096 32768; do
   printf '{"insert_rows":%d,"samples":2,"timestamp_ms":987654}\n' "$size" |
     LLVM_PROFILE_FILE="$scratch/training/memory-$size-%m.profraw" target/release/lin-peer-worker > /dev/null
 done
