@@ -57,7 +57,10 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json | tee summary.txt
+          git worktree add --detach "$RUNNER_TEMP/base" bb5d697ff
+          (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
+          sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
+          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -63,10 +63,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("worker", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--control", type=Path, help="Optional reference Lin worker")
     parser.add_argument("--blocks", type=int, default=4)
     args = parser.parse_args()
     if args.blocks < 1:
         parser.error("--blocks must be positive")
+    workers = {"lin": args.worker.resolve(), "lin_control": (args.control or args.worker).resolve()}
     rng = random.Random(2929273)
     report = dict(sqlite=sqlite3.sqlite_version, samples=[])
     for n in (1000, 10000):
@@ -79,7 +81,7 @@ def main():
                 for role in order:
                     with tempfile.TemporaryDirectory() as directory:
                         elapsed = (run_sqlite(directory, rows) if role == "sqlite"
-                                   else run_lin(args.worker.resolve(), directory, rows))
+                                   else run_lin(workers[role], directory, rows))
                     if elapsed <= 0:
                         raise ValueError(f"Nonpositive measurement: {role}, {elapsed}")
                     samples[role] = elapsed
@@ -88,7 +90,7 @@ def main():
         pairs = [row["ns"] for row in report["samples"] if row["rows"] == n]
         print(n, {role: median(row[role] for row in pairs) / 1e6 for role in orders[0]},
               "Lin wins", sum(row["lin"] < row["sqlite"] for row in pairs), "/", len(pairs),
-              "median A/A %", median(abs(100 * (1 - row["lin_control"] / row["lin"])) for row in pairs))
+              "median absolute Lin/control %", median(abs(100 * (1 - row["lin_control"] / row["lin"])) for row in pairs))
 
 
 if __name__ == "__main__":
