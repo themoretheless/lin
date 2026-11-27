@@ -43,7 +43,7 @@ jobs:
             echo '{"insert_rows":100000,"samples":3,"timestamp_ms":123456}' |
               target/release/lin-peer-worker 2> "memory-$trial.jsonl" |
               jq -e '.result | length == 100000'
-            jq -es '([.[]|select(has("stage"))]|length == 6) and ([.[]|select(has("phase"))]|length == 120)' "memory-$trial.jsonl"
+            jq -es '([.[]|select(has("stage"))]|length == 6) and ([.[]|select(has("phase"))]|length == 120) and ([.[]|select(.census == true and .rows == 100000)]|length == 1)' "memory-$trial.jsonl"
           done
       - uses: actions/upload-artifact@v4
         with:

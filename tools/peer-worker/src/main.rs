@@ -93,6 +93,42 @@ fn record_memory(stage: &str, sample: usize) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+// Inspect retained storage only after the measured transaction. Fixture rows all
+// spill their SmallVec. Their first cell is the base of the spilled allocation.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn row_memory(rows: &[lin::Row]) {
+    use std::collections::HashSet;
+    use std::ffi::c_void;
+    unsafe extern "C" {
+        fn MallocExtension_GetAllocatedSize(ptr: *const c_void) -> usize;
+        fn MallocExtension_GetEstimatedAllocatedSize(bytes: usize) -> usize;
+    }
+    let mut vectors = HashSet::new();
+    let mut hashes = HashSet::new();
+    let mut vector_storage = 0;
+    let mut hash_storage = 0;
+    let mut cell_storage = 0;
+    let mut vector_payload = 0;
+    let header = 2 * size_of::<usize>();
+    for row in rows {
+        assert!(row.len() > 4);
+        cell_storage += unsafe { MallocExtension_GetAllocatedSize(row.cells().as_ptr().cast()) };
+        let vector = row.get("embedding").and_then(Cell::as_vec).unwrap();
+        if vectors.insert(vector.as_ptr()) {
+            vector_payload += size_of_val(vector);
+            vector_storage += unsafe { MallocExtension_GetEstimatedAllocatedSize(header + size_of_val(vector)) };
+        }
+        let hash = row.get("hash").and_then(Cell::text).unwrap();
+        if hashes.insert(hash.as_ptr()) {
+            hash_storage += unsafe { MallocExtension_GetEstimatedAllocatedSize(header + hash.len()) };
+        }
+    }
+    eprintln!("{}", json!({"census":true,"rows":rows.len(),"row_width":size_of::<lin::Row>(),
+        "cell_width":size_of::<Cell>(),"cells":cell_storage,"vector_objects":vectors.len(),
+        "vector_payload":vector_payload,"vector_class_estimate":vector_storage,
+        "hash_objects":hashes.len(),"hash_class_estimate":hash_storage}));
+}
+
 fn measure_insert(
     n: usize,
     samples: usize,
@@ -160,6 +196,8 @@ fn measure_insert(
             return Err("insert affected count mismatch".into());
         }
         let rows = db.store.collection("docs");
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if _sample == 2 { row_memory(rows); }
         if rows.len() != n
             || rows
                 .iter()
