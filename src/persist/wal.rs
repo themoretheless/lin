@@ -746,6 +746,15 @@ pub(super) fn write_in_place_frame_buf(
     sync: SyncMode,
     log_bytes: &mut u64,
 ) -> Result<(), Error> {
+    #[cfg(feature = "wal-lz4-trial")]
+    if sync == SyncMode::Full && framed.len() >= 1024 * 1024 + 13 && framed[8] == LOG_MAGIC_SPARSE[3] {
+        let payload = &framed[9..framed.len() - 4];
+        if let Ok(packed) = lz4::block::compress(payload, None, true)
+            && packed.len() < payload.len()
+        {
+            return write_frame(log, b"LIN\x07", &packed, sync, log_bytes);
+        }
+    }
     if framed.len() >= 64 * 1024 + 13 {
         reserve_wal_space_at(log, *log_bytes, framed.len());
     }
@@ -792,15 +801,6 @@ pub(crate) fn write_frame_precomputed(
     else {
         return Err(io_err("log record exceeds 16MiB"));
     };
-    #[cfg(feature = "wal-lz4-trial")]
-    if sync == SyncMode::Full && *magic == LOG_MAGIC_SPARSE && payload.len() >= 1024 * 1024 {
-        use lz4::block::compress;
-        if let Ok(packed) = compress(payload, None, true)
-            && packed.len() < payload.len()
-        {
-            return write_frame(log, b"LIN\x07", &packed, sync, log_bytes);
-        }
-    }
     let codec = magic[3];
     write_frame_bytes(log, codec, payload, checksum, len as u32, *log_bytes).map_err(io_err)?;
 

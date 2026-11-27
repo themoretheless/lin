@@ -45,6 +45,18 @@ jobs:
           cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           cp target/release/embedded-native target/release/typed-baseline
           cargo rustc --features lin/wal-lz4-trial --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          for n in 1000 10000; do
+            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
+          done
+          python - <<'PYCODE'
+          import os
+          from pathlib import Path
+          for size, codec in [(1000, 3), (10000, 7)]:
+              data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
+              start = 8 + int.from_bytes(data[4:8], "little")
+              assert data[start + 8] == codec
+              assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
+          PYCODE
           lscpu > cpu.txt
           python scripts/typed-wal-triplets.py
       - uses: actions/upload-artifact@v4
