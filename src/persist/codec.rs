@@ -190,6 +190,10 @@ pub(super) fn append_sparse_iter_scalar<'a>(
     iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    let initial_capacity = buf.capacity();
+    let mut expansions = 0;
+    let mut relocated_bytes = 0;
+    let mut reserve_ns = 0;
     for row in iter {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -205,7 +209,16 @@ pub(super) fn append_sparse_iter_scalar<'a>(
             .and_then(|n| n.checked_add(8))
             .ok_or_else(|| io_err("sparse vector size overflow"))?;
         let base = buf.len();
-        buf.reserve(max_bytes);
+        if max_bytes > buf.capacity() - base {
+            let started = wal_trace_clock();
+            let address = buf.as_ptr() as usize;
+            buf.reserve(max_bytes);
+            reserve_ns += wal_trace_clock() - started;
+            expansions += 1;
+            if address != buf.as_ptr() as usize {
+                relocated_bytes += base;
+            }
+        }
         let mut count = 0u32;
         unsafe {
             let start_ptr = buf.as_mut_ptr().add(base);
@@ -244,6 +257,7 @@ pub(super) fn append_sparse_iter_scalar<'a>(
             buf.set_len(cur.offset_from(buf.as_ptr()) as usize);
         }
     }
+    eprintln!(r#"{{"growth":true,"initial":{initial_capacity},"expansions":{expansions},"relocated":{relocated_bytes},"reserve_ns":{reserve_ns}}}"#);
     Ok(())
 }
 
@@ -279,6 +293,10 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
     iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    let initial_capacity = buf.capacity();
+    let mut expansions = 0;
+    let mut relocated_bytes = 0;
+    let mut reserve_ns = 0;
     for row in iter {
         let Some(emb) = row else {
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -294,7 +312,16 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
             .and_then(|n| n.checked_add(8))
             .ok_or_else(|| io_err("sparse vector size overflow"))?;
         let base = buf.len();
-        buf.reserve(max_bytes);
+        if max_bytes > buf.capacity() - base {
+            let started = wal_trace_clock();
+            let address = buf.as_ptr() as usize;
+            buf.reserve(max_bytes);
+            reserve_ns += wal_trace_clock() - started;
+            expansions += 1;
+            if address != buf.as_ptr() as usize {
+                relocated_bytes += base;
+            }
+        }
         let mut count = 0u32;
         unsafe {
             let start_ptr = buf.as_mut_ptr().add(base);
@@ -333,6 +360,7 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
             buf.set_len(cur.offset_from(buf.as_ptr()) as usize);
         }
     }
+    eprintln!(r#"{{"growth":true,"initial":{initial_capacity},"expansions":{expansions},"relocated":{relocated_bytes},"reserve_ns":{reserve_ns}}}"#);
     Ok(())
 }
 

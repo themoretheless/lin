@@ -48,9 +48,11 @@ def lin_stage(path, rows):
     assert [r["phase"] for r in phases] == ["build", "validate", "maintain", "append", "wal_io"], phases
     pool, = [r for r in events if r.get("pool")]
     assert pool["cold"] and pool["lanes"] >= 2
+    growth = [r for r in events if r.get("growth")]
+    assert len(growth) == pool["lanes"]
     columns, = [r for r in events if r.get("columns")]
     assert 0 < columns["sparse_write"] <= columns["vector"]
-    return dict(total_ns=result["samples_ns"][0], phases=phases, spans=spans, columns=columns, pool=pool)
+    return dict(total_ns=result["samples_ns"][0], phases=phases, spans=spans, columns=columns, pool=pool, growth=growth)
 
 
 def main():
