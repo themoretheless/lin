@@ -1834,6 +1834,13 @@ pub(super) fn encode_insert_rows_lcol(rows: &[Row], buf: &mut Vec<u8>) -> bool {
     true
 }
 
+// 255 signals a literal. Nonzero IEEE bit patterns occupy the remaining cache slots.
+#[cfg(feature = "wal-delta-trial")]
+fn sparse_value_slot(bits: u32) -> usize {
+    let slot = (bits.wrapping_mul(0x9e37_79b1) >> 24) as usize;
+    if slot == 255 { 0 } else { slot }
+}
+
 fn encode_insert_rows_direct_at(
     start_off: usize,
     rec_gen: u64,
@@ -2123,9 +2130,10 @@ fn encode_insert_rows_direct_at(
                             buf.truncate(mark);
                         } else {
                             #[cfg(feature = "wal-delta-trial")]
-                            if start_off == 9 && rows.iter().all(|r| matches!(&r.cells_slice()[fi], Cell::Vec(v) if v.len() < (1 << 28))) {
+                            if start_off == 9 && rows.iter().all(|r| matches!(&r.cells_slice()[fi], Cell::Vec(v) if v.len() < (1 << 21))) {
                                 let mut read = payload_start;
                                 let mut write = payload_start;
+                                let mut cache = [0u32; 255];
                                 for _ in rows {
                                     let dim = u32::from_le_bytes(buf[read..read+4].try_into().ok()?);
                                     let header = if dim == 0 { 4 } else { 8 };
@@ -2148,14 +2156,23 @@ fn encode_insert_rows_direct_at(
                                         }
                                         buf[write] = gap as u8;
                                         write += 1;
-                                        buf[write..write+4].copy_from_slice(&bits);
-                                        write += 4;
+                                        let value = u32::from_le_bytes(bits);
+                                        let slot = sparse_value_slot(value);
+                                        if cache[slot] == value {
+                                            buf[write] = slot as u8;
+                                            write += 1;
+                                        } else {
+                                            cache[slot] = value;
+                                            buf[write] = 255;
+                                            buf[write+1..write+5].copy_from_slice(&bits);
+                                            write += 5;
+                                        }
                                         read += 8;
                                     }
                                 }
                                 debug_assert_eq!(read, buf.len());
                                 buf.truncate(write);
-                                buf[mark] = 9;
+                                buf[mark] = 10;
                             }
                             accepted_sparse = true;
                         }
@@ -2718,7 +2735,7 @@ pub(super) fn decode_column_record_mode(
                             &mut sparse_decoded_bytes,
                         )?)
                     }
-                    tag @ (7 | 9) if allow_sparse && (tag == 7 || cfg!(feature = "wal-delta-trial")) => {
+                    tag @ (7 | 9 | 10) if allow_sparse && (tag == 7 || cfg!(feature = "wal-delta-trial")) => {
                         saw_sparse = true;
                         let storage = (n as usize)
                             .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
@@ -2730,6 +2747,8 @@ pub(super) fn decode_column_record_mode(
                         if n as usize > buf.len().saturating_sub(i) / 4 {
                             return Err(());
                         }
+                        #[cfg(feature = "wal-delta-trial")]
+                        let mut cache = [0u32; 255];
                         let mut rows = Vec::with_capacity(n as usize);
                         for _ in 0..n {
                             let code = take_u32(buf, &mut i)?;
@@ -2739,7 +2758,7 @@ pub(super) fn decode_column_record_mode(
                             }
                             let dim = (code - 1) as usize;
                             let count = take_u32(buf, &mut i)? as usize;
-                            if count > dim || count > buf.len().saturating_sub(i) / if tag == 9 { 5 } else { 8 } {
+                            if count > dim || count > buf.len().saturating_sub(i) / match tag { 10 => 2, 9 => 5, _ => 8 } {
                                 return Err(());
                             }
                             sparse_decoded_bytes = sparse_decoded_bytes
@@ -2749,7 +2768,7 @@ pub(super) fn decode_column_record_mode(
                             let mut values = vec![0.0f32; dim];
                             let mut previous = None;
                             for _ in 0..count {
-                                let pos = if tag == 9 {
+                                let pos = if tag != 7 {
                                     let mut gap = 0u32;
                                     let mut shift = 0;
                                     loop {
@@ -2762,6 +2781,22 @@ pub(super) fn decode_column_record_mode(
                                     }
                                     (previous.unwrap_or(0usize)).checked_add(gap as usize).ok_or(())?
                                 } else { take_u32(buf, &mut i)? as usize };
+                                #[cfg(feature = "wal-delta-trial")]
+                                let bits = if tag == 10 {
+                                    let code = *buf.get(i).ok_or(())?;
+                                    i += 1;
+                                    if code == 255 {
+                                        let value = take_u32(buf, &mut i)?;
+                                        if value == 0 { return Err(()); }
+                                        cache[sparse_value_slot(value)] = value;
+                                        value
+                                    } else {
+                                        let value = cache[usize::from(code)];
+                                        if value == 0 { return Err(()); }
+                                        value
+                                    }
+                                } else { take_u32(buf, &mut i)? };
+                                #[cfg(not(feature = "wal-delta-trial"))]
                                 let bits = take_u32(buf, &mut i)?;
                                 if pos >= dim || previous.is_some_and(|last| pos <= last) {
                                     return Err(());

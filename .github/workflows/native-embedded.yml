@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/main-wal-delta-pack]
+    branches: [codex/main-wal-delta-value-cache]
 
 permissions:
   contents: read
@@ -46,7 +46,7 @@ jobs:
           for size, codec in [(1000, 3), (10000, 3)]:
               data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
               start = 8 + int.from_bytes(data[4:8], "little")
-              assert len(data) == {1000: 337083-86622, 10000: 3558455-922374}[size]
+              assert len(data) == {1000: 250461-86078, 10000: 2636081-914922}[size]
               assert data[start + 8] == codec
               assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
           PYCODE
