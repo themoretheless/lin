@@ -56,7 +56,7 @@ mod embed;
 mod embed_ollama;
 #[cfg(feature = "embed-onnx")]
 mod embed_onnx;
-mod error;
+pub mod error;
 mod eval;
 mod exact_sum;
 mod exec;
@@ -75,10 +75,15 @@ mod work_steal;
 
 pub mod cache;
 pub mod cluster;
+pub mod io_formats;
+pub mod migration;
 pub mod query;
 pub mod row;
+pub mod security;
 pub mod server;
 pub mod ship;
+pub mod stats;
+pub mod telemetry;
 
 #[cfg(feature = "async")]
 pub mod async_db;
