@@ -2103,37 +2103,6 @@ fn encode_insert_rows_direct_at(
                             try_raw_sparse = has_empty || (dict_ok && exact_sparse_bytes < dense);
                         }
                     }
-                    #[cfg(feature = "wal-delta-trial")]
-                    if try_raw_sparse && start_off == 9 {
-                        buf.push(9);
-                        for row in rows {
-                            let Cell::Vec(vector) = &row.cells_slice()[fi] else { return None };
-                            let dim = u32::try_from(vector.len()).ok()?.checked_add(1)?;
-                            buf.extend_from_slice(&dim.to_le_bytes());
-                            let count_offset = buf.len();
-                            buf.extend_from_slice(&0u32.to_le_bytes());
-                            let mut previous = 0;
-                            let mut count = 0u32;
-                            for (pos, x) in vector.iter().enumerate() {
-                                let bits = x.to_bits();
-                                if bits == 0 { continue }
-                                let pos = pos as u32;
-                                let mut gap = pos - previous;
-                                previous = pos;
-                                while gap >= 128 {
-                                    buf.push(gap as u8 | 128);
-                                    gap >>= 7;
-                                }
-                                buf.push(gap as u8);
-                                buf.extend_from_slice(&bits.to_le_bytes());
-                                count += 1;
-                            }
-                            buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
-                        }
-                        accepted_sparse = has_empty || buf.len() - mark - 1 < dense;
-                        if !accepted_sparse { buf.truncate(mark); }
-                        try_raw_sparse = false;
-                    }
                     if try_raw_sparse {
                         buf.push(7);
                         let payload_start = buf.len();
@@ -2153,6 +2122,41 @@ fn encode_insert_rows_direct_at(
                         if !has_empty && (!sparse_ok || sparse_bytes >= dense) {
                             buf.truncate(mark);
                         } else {
+                            #[cfg(feature = "wal-delta-trial")]
+                            if start_off == 9 && rows.iter().all(|r| matches!(&r.cells_slice()[fi], Cell::Vec(v) if v.len() < (1 << 28))) {
+                                let mut read = payload_start;
+                                let mut write = payload_start;
+                                for _ in rows {
+                                    let dim = u32::from_le_bytes(buf[read..read+4].try_into().ok()?);
+                                    let header = if dim == 0 { 4 } else { 8 };
+                                    let count = if dim == 0 { 0 } else {
+                                        u32::from_le_bytes(buf[read+4..read+8].try_into().ok()?)
+                                    };
+                                    buf.copy_within(read..read+header, write);
+                                    read += header;
+                                    write += header;
+                                    let mut last = 0;
+                                    for _ in 0..count {
+                                        let idx = u32::from_le_bytes(buf[read..read+4].try_into().ok()?);
+                                        let mut gap = idx - last;
+                                        last = idx;
+                                        let bits: [u8;4] = buf[read+4..read+8].try_into().ok()?;
+                                        while gap >= 128 {
+                                            buf[write] = gap as u8 | 128;
+                                            write += 1;
+                                            gap >>= 7;
+                                        }
+                                        buf[write] = gap as u8;
+                                        write += 1;
+                                        buf[write..write+4].copy_from_slice(&bits);
+                                        write += 4;
+                                        read += 8;
+                                    }
+                                }
+                                debug_assert_eq!(read, buf.len());
+                                buf.truncate(write);
+                                buf[mark] = 9;
+                            }
                             accepted_sparse = true;
                         }
                     }
