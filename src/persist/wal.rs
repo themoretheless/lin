@@ -564,10 +564,14 @@ pub(crate) fn write_frame_precomputed(
         return Err(io_err("log record exceeds 16MiB"));
     };
     let codec = magic[3];
+    let write_start = std::time::Instant::now();
     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;
+    let write_ns = write_start.elapsed().as_nanos();
 
     if sync == SyncMode::Full {
+        let sync_start = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!(r#"{{"phase":"wal_io","write_ns":{write_ns},"sync_ns":{},"payload_bytes":{}}}"#, sync_start.elapsed().as_nanos(), payload.len());
     }
     *log_bytes += 8 + len as u64;
     Ok(())
@@ -1033,9 +1037,13 @@ pub(crate) fn append_validated_frames(
     if frames.len() >= 64 * 1024 {
         reserve_wal_space(log, frames.len(), false);
     }
+    let write_start = std::time::Instant::now();
     log.write_all(frames).map_err(io_err)?;
+    let write_ns = write_start.elapsed().as_nanos();
     if sync == SyncMode::Full {
+        let sync_start = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!(r#"{{"phase":"wal_io","write_ns":{write_ns},"sync_ns":{},"payload_bytes":{}}}"#, sync_start.elapsed().as_nanos(), frames.len());
     }
     *log_bytes += frames.len() as u64;
     Ok(())
@@ -1055,9 +1063,13 @@ pub(crate) fn append_validated_frame_slices(
     if total_len >= 64 * 1024 {
         reserve_wal_space(log, total_len, false);
     }
+    let write_start = std::time::Instant::now();
     write_all_vectored(log, slices).map_err(io_err)?;
+    let write_ns = write_start.elapsed().as_nanos();
     if sync == SyncMode::Full {
+        let sync_start = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!(r#"{{"phase":"wal_io","write_ns":{write_ns},"sync_ns":{},"payload_bytes":{}}}"#, sync_start.elapsed().as_nanos(), total_len);
     }
     *log_bytes += total_len as u64;
     Ok(())

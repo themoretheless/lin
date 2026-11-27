@@ -70,6 +70,7 @@ fn measure_insert(
     n: usize,
     samples: usize,
     timestamp: i64,
+    durable: Option<&std::path::Path>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
@@ -104,14 +105,19 @@ fn measure_insert(
         .collect::<Vec<_>>();
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
+    let mut reopen_ns = Vec::new();
     let mut result = Value::Null;
     for _ in 0..samples {
-        let mut db = Db::empty();
+        let mut db = match durable {
+            Some(path) => Db::open_with(path, lin::OpenOpts { sync: lin::SyncMode::Full, cold: false })?,
+            None => Db::empty(),
+        };
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        eprintln!("BEGIN INSERT");
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
@@ -125,8 +131,30 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        eprintln!("END INSERT");
         if affected != n {
             return Err("insert affected count mismatch".into());
+        }
+        if let Some(path) = durable {
+            let recovery_dir = path.join("recovery");
+            std::fs::create_dir(&recovery_dir)?;
+            let log = lin::persist::log_path(path);
+            std::fs::copy(&log, lin::persist::log_path(&recovery_dir))?;
+            let head = lin::persist::head_path(path);
+            if head.exists() {
+                std::fs::copy(&head, lin::persist::head_path(&recovery_dir))?;
+            }
+            let snapshot = lin::persist::snapshot_path(path);
+            if snapshot.exists() {
+                std::fs::copy(&snapshot, lin::persist::snapshot_path(&recovery_dir))?;
+            }
+            let reopen = Instant::now();
+            let recovered = Db::open(&recovery_dir)?;
+            reopen_ns.push(reopen.elapsed().as_nanos() as u64);
+            let recovered_rows = recovered.store.collection("docs");
+            if canonical(recovered_rows, &fields) != Value::Array(expected.clone()) {
+                return Err("WAL recovery exact values mismatch".into());
+            }
         }
         let rows = db.store.collection("docs");
         if rows.len() != n
@@ -141,7 +169,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,
+    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }
@@ -160,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 out,
                 "{}",
-                measure_insert(n as usize, samples as usize, timestamp)?
+                measure_insert(n as usize, samples as usize, timestamp, request["durable_dir"].as_str().map(std::path::Path::new))?
             )?;
         } else if request.get("worker_version").and_then(Value::as_bool) == Some(true) {
             writeln!(out, "{}", json!({"version":lin::VERSION}))?;
@@ -207,7 +235,7 @@ mod tests {
     fn hundred_thousand_native_rows_respect_default_statement_quotas() {
         // A single AST for this fixture exceeds the default 8 MiB quota.
         // Exact six-field readback and default embeddings are checked by measure_insert.
-        let measured = measure_insert(100_000, 1, 123456).unwrap();
+        let measured = measure_insert(100_000, 1, 123456, None).unwrap();
         assert_eq!(measured["statements"], 10);
         assert_eq!(measured["samples_ns"].as_array().unwrap().len(), 1);
         assert_eq!(measured["result"].as_array().unwrap().len(), 100_000);

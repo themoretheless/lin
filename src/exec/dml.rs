@@ -984,8 +984,10 @@ impl Db {
         } else {
             None
         };
+        let build_stage = InsertStage::begin();
         let (built, all_uniform, all_embedded) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        build_stage.end("build");
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
@@ -1025,6 +1027,7 @@ impl Db {
         allow_preencode: bool,
         caller_wants_rows: bool,
     ) -> Result<(Vec<Row>, Vec<Edge>, Option<crate::persist::PreparedInsert>), Error> {
+        let validate_stage = InsertStage::begin();
         let BuiltShape {
             all_uniform,
             all_embedded,
@@ -1150,6 +1153,8 @@ impl Db {
         let uniform_keys = all_uniform && !needs_id;
         // The pre-encoded record is the compact columnar one; rows it cannot represent
         // exactly (missing fields, mixed types) are logged row by row after the insert.
+        validate_stage.end("validate");
+        let maintain_stage = InsertStage::begin();
         let staged = if allow_preencode
             && (512..=16384).contains(&n)
             && edges.is_empty()
@@ -1274,6 +1279,8 @@ impl Db {
             self.maintain_insert_slab(collection, start, &built)?;
             None
         };
+        maintain_stage.end("maintain");
+        let append_stage = InsertStage::begin();
         self.store
             .update_col_count(collection, built.len() as isize);
         let want_rows = caller_wants_rows && built.len() <= 128;
@@ -1284,6 +1291,7 @@ impl Db {
             Ok((built, new_edges, staged))
         } else {
             self.store.collection_mut(collection).extend(built);
+            append_stage.end("append");
             Ok((Vec::new(), new_edges, staged))
         }
     }
@@ -1811,6 +1819,15 @@ pub(crate) struct BuiltShape {
     pub hashing_dim: Option<usize>,
     /// Time the rows were built at (edge targets such as `now` resolve to it).
     pub now: i64,
+}
+
+// Diagnostic build: capture elapsed time on the writer thread.
+struct InsertStage(std::time::Instant);
+impl InsertStage {
+    fn begin() -> Self { Self(std::time::Instant::now()) }
+    fn end(self, name: &str) {
+        eprintln!(r#"{{"phase":"{name}","ns":{}}}"#, self.0.elapsed().as_nanos());
+    }
 }
 
 fn build_insert_rows(

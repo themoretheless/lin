@@ -1,7 +1,7 @@
 name: Linux release binaries
 on:
   push:
-    branches: [main, codex/merge-linux-release-allocator]
+    branches: [codex/profile-release-wal-stages]
     paths:
       - scripts/build-linux-release.sh
       - .github/workflows/linux-release-build.yml
@@ -12,7 +12,11 @@ jobs:
   build:
     strategy:
       matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        include:
+          - {runner: ubuntu-22.04, replica: x64-1}
+          - {runner: ubuntu-22.04, replica: x64-2}
+          - {runner: ubuntu-22.04, replica: x64-3}
+          - {runner: ubuntu-24.04-arm, replica: arm64}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -37,4 +41,11 @@ jobs:
               exit 1
             fi
           done
-          echo '{"insert_rows":1000,"samples":1,"timestamp_ms":123456}' | target/release/lin-peer-worker | jq -e '.result | length == 1000'
+          lscpu > cpu.txt
+          python3 scripts/profile-wal-insert.py target/release/lin-peer-worker 6 > phases.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wal-phases-${{ matrix.replica }}
+          path: |
+            cpu.txt
+            phases.jsonl
