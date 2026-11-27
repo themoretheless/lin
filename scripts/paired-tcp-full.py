@@ -1,3 +1,4 @@
+from itertools import permutations
 import csv
 import io
 import json
@@ -7,18 +8,24 @@ import time
 from pathlib import Path
 import psycopg
 
-def postgres(db, rows):
+def postgres(db, rows, binary):
     db.execute("DROP TABLE IF EXISTS docs")
     db.execute("CREATE TABLE docs(id text PRIMARY KEY, uri text UNIQUE, wing text, title text, ts bigint, body text, layer text)")
     db.execute("CREATE INDEX docs_wing_ts ON docs(wing, ts)")
     start = time.perf_counter_ns()
     for i in range(0, len(rows), 10000):
-        data = io.StringIO(newline="")
-        csv.writer(data, quoting=csv.QUOTE_ALL).writerows(rows[i:i+10000])
-        payload = data.getvalue().encode()
+        chunk = rows[i:i+10000]
         with db.transaction(), db.cursor() as cursor:
-            with cursor.copy("COPY docs FROM STDIN WITH (FORMAT CSV)") as copy:
-                copy.write(payload)
+            if binary:
+                with cursor.copy("COPY docs FROM STDIN (FORMAT BINARY)") as copy:
+                    copy.set_types(["text", "text", "text", "text", "int8", "text", "text"])
+                    for row in chunk:
+                        copy.write_row(row)
+            else:
+                data = io.StringIO(newline="")
+                csv.writer(data, quoting=csv.QUOTE_ALL).writerows(chunk)
+                with cursor.copy("COPY docs FROM STDIN WITH (FORMAT CSV)") as copy:
+                    copy.write(data.getvalue().encode())
     elapsed = time.perf_counter_ns() - start
     assert sorted(db.execute("SELECT * FROM docs").fetchall()) == sorted(rows)
     return elapsed
@@ -30,11 +37,11 @@ with psycopg.connect("postgresql://lin:lin@127.0.0.1:55432/lin", autocommit=True
     for n in (1000, 10000, 100000):
         rows = [(f"d-{i}", f"bench://{i}", "rag" if i%2==0 else "sys",
                  f"doc {i} " + ("wal note" if i%10==0 else "plain"), 123456, f"body {i}", "wiki") for i in range(n)]
-        for i in range(12):
-            sample = dict(n=n)
-            for engine in (("lin","pg") if i%2==0 else ("pg","lin")):
+        for order in list(permutations(("lin", "pg_csv", "pg_binary"))) * 2:
+            sample = dict(n=n, order=order)
+            for engine in order:
                 with tempfile.TemporaryDirectory() as directory:
                     sample[engine] = (int(subprocess.check_output(["target/release/tcp-full",directory,str(n)]))
-                                      if engine=="lin" else postgres(db,rows))
+                                      if engine=="lin" else postgres(db, rows, engine == "pg_binary"))
             report["samples"].append(sample)
             Path("tcp-results.json").write_text(json.dumps(report))
