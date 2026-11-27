@@ -1626,7 +1626,7 @@ fn append_vec_rows_field_parallel(
     buf: &mut Vec<u8>,
 ) -> Result<(bool, usize), Error> {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let short_serial = !dict_mode && (512..2048).contains(&num_rows);
+    let short_serial = !cfg!(target_arch = "aarch64") && !dict_mode && (512..2048).contains(&num_rows);
     #[cfg(target_arch = "x86_64")]
     let short_dictionary_serial =
         dict_mode && (512..2048).contains(&num_rows) && std::arch::is_x86_feature_detected!("avx2");
