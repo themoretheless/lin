@@ -2476,7 +2476,8 @@ pub(super) fn decode_column_record_mode(
                         let idx = out.len() as u32;
                         out.push(arc_from_validated_str(s_str));
                         slots[h] = (raw, idx);
-                        if state.0 == 32 && state.1 == 0 {
+                        // Give a working set that fits the table a second pass to hit.
+                        if state.0 as usize == 2 * N && state.1 == 0 {
                             state.2 = false;
                         }
                     } else {
