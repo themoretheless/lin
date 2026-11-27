@@ -1118,6 +1118,21 @@ pub(super) fn append_sparse_cells_range(
         Cell::Vec(emb) => Some(emb.as_ref()),
         _ => None,
     });
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if buf.capacity() == 0 {
+        let mut iter = iter;
+        if let Some(first) = iter.next() {
+            append_sparse_iter_serial(std::iter::once(first), buf)?;
+            let remaining = iter.len();
+            // The encoder reserves space for a fully populated final row.
+            // Bound the estimate when the first row is atypically dense.
+            let reserve = buf.len().saturating_mul(remaining)
+                .saturating_add(first.map_or(0, |v| v.len().saturating_mul(8)))
+                .min(1024 * 1024);
+            buf.reserve(reserve);
+        }
+        return append_sparse_iter_serial(iter, buf);
+    }
     append_sparse_iter_serial(iter, buf)
 }
 
