@@ -1,0 +1,47 @@
+name: Measure allocator size classes for INSERT
+on:
+  push:
+    branches: [codex/profile-tcmalloc-size-classes]
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Measure usable allocations on native Linux
+        run: |
+          set -eu
+          lscpu | grep 'Model name'
+          link=()
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            sudo apt-get update -qq
+            apt-get download libgoogle-perftools-dev
+            dpkg-deb -x libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+            link=(-Wl,-u,tc_malloc "$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -pthread)
+          fi
+          cat > measure.cpp <<'CPP'
+          #include <cstdio>
+          #include <cstdlib>
+          #include <malloc.h>
+          int main() {
+              const size_t sizes[] = {216, 3072, 3088};
+              for (size_t size : sizes) {
+                  void* p = malloc(size);
+                  if (!p) return 1;
+                  const size_t usable = malloc_usable_size(p);
+                  if (usable < size) return 2;
+                  std::printf("requested=%zu usable=%zu\n", size, usable);
+                  free(p);
+              }
+          }
+          CPP
+          c++ measure.cpp "${link[@]}" -o measure
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            nm --defined-only measure > symbols
+            grep -E ' [TW] (tc_malloc|malloc_usable_size|malloc)$' symbols
+            grep -Eq ' [TW] tc_malloc$' symbols
+          fi
+          ./measure
