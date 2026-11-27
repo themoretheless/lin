@@ -1253,6 +1253,34 @@ mod dictionary_wal_tests {
         assert!(for_each_wal_frame(&packed, |_| Ok(())).is_err());
     }
 
+    #[cfg(feature = "wal-lz4-trial")]
+    #[test]
+    fn compressed_wal_exports_and_replays_on_follower() {
+        let vectors = few_valued(2200, 768, 5);
+        let frame = vector_frame_with_sync(&vectors, false, SyncMode::Full);
+        assert_eq!(frame[8], 7);
+
+        let leader = fresh();
+        let follower = fresh();
+        fs::create_dir(&leader).unwrap();
+        fs::create_dir(&follower).unwrap();
+        fs::write(log_path(&leader), &frame).unwrap();
+        let exported = export_wal_since(&leader, 0).unwrap();
+        assert_eq!(exported, frame);
+        assert!(export_wal_since(&leader, 1).unwrap().is_empty());
+        assert_eq!(export_wal_since_indexed(&leader, 0, &[(1, 0)]).unwrap(), frame);
+
+        let mut bytes = 0;
+        let mut file = open_log(&follower).unwrap();
+        append_raw_frames(&mut file, &exported, SyncMode::Full, &mut bytes).unwrap();
+        drop(file);
+        assert_eq!(bytes as usize, frame.len());
+        let replicated = export_wal_since(&follower, 0).unwrap();
+        assert_eq!(decoded_bits(&replicated), bits_of(&vectors));
+        fs::remove_dir_all(leader).unwrap();
+        fs::remove_dir_all(follower).unwrap();
+    }
+
     /// With the writer on, a column that is smaller in the dictionary layout is framed
     /// under codec 5 and reads back bit for bit, including absent and empty vectors,
     /// `-0.0`, infinities and NaN payloads, rows with more than 16 distinct values (raw
