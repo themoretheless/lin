@@ -458,3 +458,16 @@ Lin заранее разбирает запрос с литералами и з
 Оба клиента проверяют шесть сохранённых полей. Lin дополнительно формирует штатные эмбеддинги. Для SQLite WAL/FULL проверяется чтение после повторного открытия, для Lin — восстановление из копии файлов до закрытия исходной базы.
 
 [Код клиента Lin](https://github.com/themoretheless/lin/blob/811545199/tools/peer-worker/src/main.rs) · [Код клиентов SQLite и DuckDB](https://github.com/themoretheless/lin/blob/811545199/tools/peer-worker/src/bin/embedded-native.rs)
+
+### Подготовленные INSERT на AMD EPYC 9V74
+
+Медианы по 12 парам. Разница рассчитана внутри каждой пары до взятия медианы.
+
+| CPU | Движок | Строк | Вызов | Lin, мс | Второй движок, мс | Lin − второй, мс | Побед Lin |
+|---|---|---:|---|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor | sqlite | 1000 | первый | 2.121 | 1.791 | +0.334 | 0/12 |
+| AMD EPYC 9V74 80-Core Processor | sqlite | 10000 | первый | 30.618 | 21.185 | +9.206 | 0/12 |
+| AMD EPYC 9V74 80-Core Processor | duckdb | 10000 | первый | 12.221 | 21.807 | -9.477 | 12/12 |
+| AMD EPYC 9V74 80-Core Processor | duckdb | 10000 | повторные | 4.880 | 18.120 | -13.284 | 12/12 |
+| AMD EPYC 9V74 80-Core Processor | duckdb | 100000 | первый | 143.482 | 205.253 | -61.547 | 12/12 |
+| AMD EPYC 9V74 80-Core Processor | duckdb | 100000 | повторные | 71.325 | 189.085 | -117.652 | 12/12 |
