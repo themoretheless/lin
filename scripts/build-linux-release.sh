@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the CLI and qualification worker with the same allocator on native Linux.
 set -euo pipefail
-args=(--locked --release)
+args=(--locked --release --features lin/wal-lz4-trial)
 link=()
 case "$(rustc -vV | sed -n 's/^host: //p')" in
     x86_64-unknown-linux-gnu)
