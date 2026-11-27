@@ -1,7 +1,7 @@
 name: Qualify linked Linux allocator against DuckDB on main
 on:
   push:
-    branches: [codex/current-main-duckdb-paired]
+    branches: [codex/current-main-exact-clone]
 permissions:
   contents: read
 jobs:
@@ -45,6 +45,8 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
           fi
+          git worktree add --detach "$RUNNER_TEMP/base" 3b967b4c5
+          (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
           scripts/build-linux-release.sh
           if [[ "$(uname -m)" = x86_64 ]]; then
             for binary in target/release/{lin,lin-peer-worker}; do
@@ -71,7 +73,7 @@ jobs:
           lscpu >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
-          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+          LIN_BASE_WORKER="$RUNNER_TEMP/base/target/release/lin-peer-worker" python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

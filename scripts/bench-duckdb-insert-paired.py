@@ -56,7 +56,7 @@ def measure_lin(worker, rows, samples, role):
 
 
 def main(worker, output):
-    roles = ("lin", "thp", "duckdb", "duckdb_thp")
+    roles = ("lin", "control", "thp", "duckdb", "duckdb_thp")
     samples = 5
     rng = random.Random(2929273)
     report = dict(
@@ -79,7 +79,8 @@ def main(worker, output):
                         [sys.executable, __file__, "--duckdb", str(n), str(samples)],
                         text=True, env=role_env(role)))
                 else:
-                    timings[role] = measure_lin(worker, rows, samples, role)
+                    binary = Path(os.environ["LIN_BASE_WORKER"]) if role == "control" else worker
+                    timings[role] = measure_lin(binary, rows, samples, role)
             report["samples"].append(dict(rows=n, order=order, ns=timings))
             output.write_text(json.dumps(report, indent=2) + "\n")
         pairs = [sample["ns"] for sample in report["samples"] if sample["rows"] == n]

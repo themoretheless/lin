@@ -312,11 +312,25 @@ impl OwnedFieldSlot {
 }
 
 /// One record: field name -> [`Cell`], iterated in field-name order.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Row {
     /// `None` is the empty row (no allocation, no refcount).
     shape: Option<Arc<Shape>>,
     cells: Cells,
+}
+
+impl Clone for Row {
+    fn clone(&self) -> Self {
+        let cells = if self.cells.len() > self.cells.inline_size() {
+            Cells::from_vec(self.cells.as_slice().to_vec())
+        } else {
+            self.cells.clone()
+        };
+        Self {
+            shape: self.shape.clone(),
+            cells,
+        }
+    }
 }
 
 impl Row {
