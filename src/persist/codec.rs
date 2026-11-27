@@ -176,7 +176,83 @@ pub(super) fn append_sparse_iter_serial<'a>(
         // Runtime feature check covers all NEON loads; helper only loads full eight-value chunks.
         return unsafe { append_sparse_iter_neon(iter, buf) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // The encoder loads four eight-lane groups only for a full 32-value block.
+        return unsafe { append_sparse_iter_avx2(iter, buf) };
+    }
     append_sparse_iter_scalar(iter, buf)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn append_sparse_iter_avx2<'a>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    use std::arch::x86_64::*;
+    for row in iter {
+        let Some(emb) = row else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        };
+        let dim = u32::try_from(emb.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
+        let max_bytes = emb
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+        let base = buf.len();
+        buf.reserve(max_bytes);
+        let mut count = 0u32;
+        unsafe {
+            let start_ptr = buf.as_mut_ptr().add(base);
+            std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
+            let mut cur = start_ptr.add(8);
+            let width = 32;
+            let vector_mask = |values: &[f32]| {
+                let bits = _mm256_loadu_si256(values.as_ptr().cast());
+                let zero = _mm256_cmpeq_epi32(bits, _mm256_setzero_si256());
+                !(_mm256_movemask_ps(_mm256_castsi256_ps(zero)) as u32) & 0xff
+            };
+            for (block, values) in emb.chunks(width).enumerate() {
+                let mut mask = if values.len() == width {
+                    let first = vector_mask(values);
+                    first | (vector_mask(&values[8..]) << 8)
+                        | (vector_mask(&values[16..]) << 16)
+                        | (vector_mask(&values[24..]) << 24)
+                } else {
+                    values.iter().enumerate()
+                        .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
+                };
+                let base_idx = (block * width) as u32;
+                while mask != 0 {
+                    let offset = mask.trailing_zeros() as usize;
+                    let index = base_idx + (offset as u32);
+                    let bits = values[offset].to_bits();
+                    #[cfg(target_endian = "little")]
+                    {
+                        let packed = (index as u64) | ((bits as u64) << 32);
+                        std::ptr::write_unaligned(cur as *mut u64, packed);
+                    }
+                    #[cfg(not(target_endian = "little"))]
+                    {
+                        std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), cur, 4);
+                        std::ptr::copy_nonoverlapping(bits.to_le_bytes().as_ptr(), cur.add(4), 4);
+                    }
+                    cur = cur.add(8);
+                    count += 1;
+                    mask &= mask - 1;
+                }
+            }
+            std::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), start_ptr.add(4), 4);
+            buf.set_len(cur.offset_from(buf.as_ptr()) as usize);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn append_sparse_rows_serial(
