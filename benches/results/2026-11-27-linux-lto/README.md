@@ -39,3 +39,18 @@ Engine baseline: `fe2717127`. Lin uses static TCMalloc on Linux x64 and the syst
 DuckDB 2.0.0 runs in memory. First and repeat refer to position within the process, with a fresh database per insertion. Each repeat observation is the median of four timed insertions. SQLite used WAL with synchronous=FULL and validated readback. The x64 hosts used SQLite 3.37.2 and ARM64 used 3.45.1. Hosts filtered out by CPU selection contribute no measurements.
 
 The first 100k insertion on EPYC lost to DuckDB in all 75 pairs for each build. Full LTO did not close that gap.
+
+## WAL/FULL paired spread
+
+Quartiles use linear interpolation across 24 paired differences per size and host. Positive values mean Lin took longer. The control uses the release ThinLTO configuration.
+
+| CPU | Rows | 25th percentile (ms) | Median (ms) | 75th percentile (ms) | Lin slower |
+|---|---:|---:|---:|---:|---:|
+| AMD EPYC 7763 64-Core Processor | 1000 | +0.160 | +0.292 | +0.434 | 23/24 |
+| AMD EPYC 7763 64-Core Processor | 10000 | -7.827 | -6.885 | -6.372 | 0/24 |
+| AMD EPYC 9V74 80-Core Processor | 1000 | +0.387 | +0.451 | +0.573 | 21/24 |
+| AMD EPYC 9V74 80-Core Processor | 10000 | -9.450 | +0.440 | +5.029 | 12/24 |
+| AMD EPYC 9V45 96-Core Processor | 1000 | -0.286 | -0.158 | +0.181 | 9/24 |
+| AMD EPYC 9V45 96-Core Processor | 10000 | +0.592 | +1.195 | +2.673 | 20/24 |
+| Neoverse-N2 | 1000 | +0.316 | +0.406 | +0.575 | 24/24 |
+| Neoverse-N2 | 10000 | -2.240 | -1.574 | -0.847 | 5/24 |
