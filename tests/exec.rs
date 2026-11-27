@@ -2641,3 +2641,21 @@ fn large_grouped_aggregates_match_reference() {
         .collect();
     assert_eq!(hits, expect[..3]);
 }
+
+#[test]
+fn bulk_docs_point_lookup_uses_each_rows_actual_fields() {
+    let mut db = Db::empty();
+    let records: Vec<_> = (0..512)
+        .map(|i| {
+            let extra = if i % 2 == 0 { r#"layer:"wiki""# } else { r#"wing:"sys""# };
+            format!(r#"{{id:"d-{i}",uri:"test://{i}",title:"title-{i}",{extra}}}"#)
+        })
+        .collect();
+    let inserted = db.run(&format!("insert docs [{}]", records.join(","))).unwrap();
+    assert_eq!(inserted.done.n, records.len());
+    for i in 0..records.len() {
+        let id = format!("d-{i}");
+        let row = db.store.point_get_docs_id_title(&id).unwrap();
+        assert_eq!(text(&row, "title"), format!("title-{i}"));
+    }
+}

@@ -3663,14 +3663,15 @@ impl Store {
             let title_pos = first.keys().position(|k| k == "title");
             let layer_pos = first.keys().position(|k| k == "layer");
             let wing_pos = first.keys().position(|k| k == "wing");
-            let uniform = built[1..].iter().all(|r| r.len() == first.len());
-            if uniform && first.len() <= 32 {
+            let uniform = first.shape().is_some_and(|shape| {
+                built[1..].iter().all(|row| {
+                    row.shape().is_some_and(|other| Arc::ptr_eq(shape, other))
+                })
+            });
+            if uniform {
                 for (i, row) in built.iter().enumerate() {
                     let idx = start + i;
-                    let mut cells: [&Cell; 32] = [&Cell::Null; 32];
-                    for (p, val) in row.values().enumerate().take(32) {
-                        cells[p] = val;
-                    }
+                    let cells = row.cells();
                     let id_arc: Arc<str> = id_pos
                         .and_then(|p| cells[p].text_shared())
                         .unwrap_or_default();
