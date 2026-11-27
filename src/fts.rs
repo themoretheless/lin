@@ -1016,6 +1016,29 @@ mod tests {
     use crate::store::Cell;
 
     #[test]
+    fn selected_slots_match_row_inserts_at_mask_boundary() {
+        let rows = (0..3)
+            .map(|row| {
+                let mut record = Row::default();
+                for slot in 0..32 {
+                    record.insert(format!("field{slot:02}"), Cell::text_arc(format!("row{row} term{slot}")));
+                }
+                record
+            })
+            .collect::<Vec<_>>();
+        for selected in [vec![], vec![31], vec![0, 2, 30, 31], (0..32).collect()] {
+            let fields = selected.iter().map(|slot| format!("field{slot:02}")).collect::<Vec<_>>();
+            let mut batch = FtsIndex::empty(&fields);
+            let mut reference = FtsIndex::empty(&fields);
+            batch.append_slab(9, &rows);
+            for (i, row) in rows.iter().enumerate() {
+                reference.insert_row(9 + i, row);
+            }
+            assert_eq!(batch.postings, reference.postings);
+        }
+    }
+
+    #[test]
     fn snippet_mutations_match_rebuilt_index() {
         for fields in [vec!["title".into()], vec!["title".into(), "snippet".into()]] {
             let before = Row::from([
