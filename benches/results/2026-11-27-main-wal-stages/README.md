@@ -235,3 +235,17 @@
 | Neoverse-N2 / paired-duckdb-insert-arm64 | 44.164 | -0.000 | 4.762 | 17.596 | 21.012 | 0.000 |
 
 [Прогон с временными отметками](https://github.com/themoretheless/lin/actions/runs/46037658720)
+
+### Страничные ошибки и задержка построения строк при первом INSERT 100k
+
+Для каждого из 12 процессов суммировали десять пакетов одного INSERT и вычитали медиану четырёх повторов. В таблице медиана полученных разностей. Счётчик getrusage(RUSAGE_SELF) охватывает все потоки. После сборки измерены проверка id и вызов insert_bulk_built. Minor faults включают события без дискового чтения, счётчик не измеряет время их обработки.
+
+| Раннер | Сборка строк, мс | После сборки, мс | Доп. minor faults при сборке | Доп. minor faults после сборки |
+|---|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 49.419 | 21.811 | 86461.0 | 13439.0 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-2 | 61.128 | 28.276 | 86425.0 | 13423.2 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 61.234 | 29.007 | 86472.2 | 13421.5 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-4 | 49.800 | 22.880 | 86392.2 | 13463.2 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 28.523 | 11.392 | 31269.8 | 10439.8 |
+
+[Исходные замеры](https://github.com/themoretheless/lin/actions/runs/46038735303)
