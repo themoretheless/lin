@@ -1,0 +1,55 @@
+name: Compare durable loopback INSERT
+
+on:
+  push:
+    branches: [codex/paired-tcp-full-insert]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paired-tcp-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  peers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned peer clients
+        run: python -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Build frozen Lin peer worker
+        run: |
+          sudo apt-get update -qq
+          (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+          dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+          export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
+          cargo rustc --locked --release -p lin-peer-worker --bin tcp-full -- -C link-arg=-Wl,-u,tc_malloc -C "link-arg=$LIN_TCMALLOC_ARCHIVE" -C link-arg=-lstdc++
+          nm --defined-only target/release/tcp-full > "$RUNNER_TEMP/symbols"
+          grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/symbols"
+      - name: Measure same-host durable inserts
+        run: |
+          docker run -d --name pg -p 127.0.0.1:55432:5432 -e POSTGRES_USER=lin -e POSTGRES_PASSWORD=lin -e POSTGRES_DB=lin -v "$RUNNER_TEMP/pgdata:/var/lib/postgresql/data" postgres:16-alpine
+          for i in {1..60}; do
+            if pg_isready -h localhost -p 55432; then break; fi
+            sleep 1
+          done
+          lscpu > cpu.txt
+          python scripts/paired-tcp-full.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tcp-results
+          path: |
+            cpu.txt
+            tcp-results.json
