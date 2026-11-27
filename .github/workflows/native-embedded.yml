@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/main-wal-lz4-fast64]
+    branches: [codex/main-wal-delta-indices]
 
 permissions:
   contents: read
@@ -36,16 +36,17 @@ jobs:
           fi
           cargo rustc --no-default-features --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           cp target/release/embedded-native target/release/typed-baseline
-          cargo rustc --no-default-features --features lin/wal-lz4-trial --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          cargo rustc --no-default-features --features lin/wal-delta-trial --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           for n in 1000 10000; do
             LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
           done
           python3 - <<'PYCODE'
           import os
           from pathlib import Path
-          for size, codec in [(1000, 3), (10000, 7)]:
+          for size, codec in [(1000, 3), (10000, 3)]:
               data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
               start = 8 + int.from_bytes(data[4:8], "little")
+              assert len(data) == {1000: 337083-86622, 10000: 3558455-922374}[size]
               assert data[start + 8] == codec
               assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
           PYCODE

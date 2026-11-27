@@ -2103,6 +2103,37 @@ fn encode_insert_rows_direct_at(
                             try_raw_sparse = has_empty || (dict_ok && exact_sparse_bytes < dense);
                         }
                     }
+                    #[cfg(feature = "wal-delta-trial")]
+                    if try_raw_sparse && start_off == 9 {
+                        buf.push(9);
+                        for row in rows {
+                            let Cell::Vec(vector) = &row.cells_slice()[fi] else { return None };
+                            let dim = u32::try_from(vector.len()).ok()?.checked_add(1)?;
+                            buf.extend_from_slice(&dim.to_le_bytes());
+                            let count_offset = buf.len();
+                            buf.extend_from_slice(&0u32.to_le_bytes());
+                            let mut previous = 0;
+                            let mut count = 0u32;
+                            for (pos, x) in vector.iter().enumerate() {
+                                let bits = x.to_bits();
+                                if bits == 0 { continue }
+                                let pos = pos as u32;
+                                let mut gap = pos - previous;
+                                previous = pos;
+                                while gap >= 128 {
+                                    buf.push(gap as u8 | 128);
+                                    gap >>= 7;
+                                }
+                                buf.push(gap as u8);
+                                buf.extend_from_slice(&bits.to_le_bytes());
+                                count += 1;
+                            }
+                            buf[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+                        }
+                        accepted_sparse = has_empty || buf.len() - mark - 1 < dense;
+                        if !accepted_sparse { buf.truncate(mark); }
+                        try_raw_sparse = false;
+                    }
                     if try_raw_sparse {
                         buf.push(7);
                         let payload_start = buf.len();
@@ -2683,7 +2714,7 @@ pub(super) fn decode_column_record_mode(
                             &mut sparse_decoded_bytes,
                         )?)
                     }
-                    7 if allow_sparse => {
+                    tag @ (7 | 9) if allow_sparse && (tag == 7 || cfg!(feature = "wal-delta-trial")) => {
                         saw_sparse = true;
                         let storage = (n as usize)
                             .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())
@@ -2704,7 +2735,7 @@ pub(super) fn decode_column_record_mode(
                             }
                             let dim = (code - 1) as usize;
                             let count = take_u32(buf, &mut i)? as usize;
-                            if count > dim || count > buf.len().saturating_sub(i) / 8 {
+                            if count > dim || count > buf.len().saturating_sub(i) / if tag == 9 { 5 } else { 8 } {
                                 return Err(());
                             }
                             sparse_decoded_bytes = sparse_decoded_bytes
@@ -2714,7 +2745,19 @@ pub(super) fn decode_column_record_mode(
                             let mut values = vec![0.0f32; dim];
                             let mut previous = None;
                             for _ in 0..count {
-                                let pos = take_u32(buf, &mut i)? as usize;
+                                let pos = if tag == 9 {
+                                    let mut gap = 0u32;
+                                    let mut shift = 0;
+                                    loop {
+                                        let byte = *buf.get(i).ok_or(())?;
+                                        i += 1;
+                                        if shift == 28 && byte > 15 { return Err(()); }
+                                        gap |= u32::from(byte & 127) << shift;
+                                        if byte < 128 { break; }
+                                        shift += 7;
+                                    }
+                                    (previous.unwrap_or(0usize)).checked_add(gap as usize).ok_or(())?
+                                } else { take_u32(buf, &mut i)? as usize };
                                 let bits = take_u32(buf, &mut i)?;
                                 if pos >= dim || previous.is_some_and(|last| pos <= last) {
                                     return Err(());
