@@ -1165,6 +1165,10 @@ mod dictionary_wal_tests {
     }
     /// One frame holding one vector column, encoded with the dictionary writer on or off.
     fn vector_frame(vectors: &[Option<Vec<f32>>], dictionary: bool) -> Vec<u8> {
+        vector_frame_with_sync(vectors, dictionary, SyncMode::Normal)
+    }
+
+    fn vector_frame_with_sync(vectors: &[Option<Vec<f32>>], dictionary: bool, sync: SyncMode) -> Vec<u8> {
         let path = fresh();
         let mut f = OpenOptions::new()
             .create_new(true)
@@ -1186,7 +1190,7 @@ mod dictionary_wal_tests {
             },
         };
         with_dictionary_writer(dictionary, || {
-            append_record(&mut f, &rec, &mut Vec::new(), SyncMode::Normal, &mut 0).unwrap()
+            append_record(&mut f, &rec, &mut Vec::new(), sync, &mut 0).unwrap()
         });
         f.seek(SeekFrom::Start(0)).unwrap();
         let mut bytes = Vec::new();
@@ -1229,6 +1233,24 @@ mod dictionary_wal_tests {
                 Some(v)
             })
             .collect()
+    }
+
+    #[cfg(feature = "wal-lz4-trial")]
+    #[test]
+    fn large_full_frame_recovers_exact_vector_bits() {
+        let mut vectors = few_valued(2200, 768, 5);
+        vectors[0] = None;
+        vectors[1] = Some(Vec::new());
+        vectors[2] = Some(vec![-0.0, f32::from_bits(0x7fc0_1234), f32::NEG_INFINITY]);
+        let original = vector_frame(&vectors, false);
+        let mut packed = vector_frame_with_sync(&vectors, false, SyncMode::Full);
+        assert_eq!(original[8], 3);
+        assert_eq!(packed[8], 7);
+        assert!(packed.len() < original.len());
+        assert_eq!(decoded_bits(&packed), bits_of(&vectors));
+        let middle = packed.len() / 2;
+        packed[middle] ^= 1;
+        assert!(for_each_wal_frame(&packed, |_| Ok(())).is_err());
     }
 
     /// With the writer on, a column that is smaller in the dictionary layout is framed
