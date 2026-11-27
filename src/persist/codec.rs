@@ -491,6 +491,8 @@ pub(crate) struct EncodeJob {
     pub(super) collection: String,
     pub(super) rows: std::sync::Arc<Vec<Row>>,
     pub(super) uniform_keys: bool,
+    #[cfg(feature = "wal-lz4-trial")]
+    pub(super) sync: SyncMode,
     pub(super) bytes: Vec<u8>,
     #[allow(dead_code)]
     pub(super) mode: u8,
@@ -504,6 +506,8 @@ impl EncodeJob {
             collection,
             rows,
             uniform_keys,
+            #[cfg(feature = "wal-lz4-trial")]
+            sync,
             bytes,
             #[cfg(test)]
             mode,
@@ -525,6 +529,14 @@ impl EncodeJob {
                 uniform_keys,
                 bytes,
             );
+            #[cfg(feature = "wal-lz4-trial")]
+            if let PreparedEncoding::Ready(columns) = &mut staged.encoding
+                && let Some(packed) = super::wal::compress_large_sparse(&columns.magic, &columns.bytes, sync)
+            {
+                columns.magic = *b"LIN\x07";
+                columns.checksum = compute_frame_checksum(&columns.magic, &packed);
+                columns.bytes = packed;
+            }
             #[cfg(test)]
             if mode == 3 {
                 staged.encoding =
@@ -562,6 +574,8 @@ pub(crate) fn start_insert_encoding(
         collection: collection.to_owned(),
         rows,
         uniform_keys,
+        #[cfg(feature = "wal-lz4-trial")]
+        sync: persist.sync,
         bytes,
         mode,
         reply,

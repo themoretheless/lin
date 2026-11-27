@@ -548,6 +548,16 @@ pub(crate) fn compute_frame_checksum(magic: &[u8; 4], payload: &[u8]) -> [u8; 4]
     checksum.finalize().to_le_bytes()
 }
 
+#[cfg(feature = "wal-lz4-trial")]
+pub(super) fn compress_large_sparse(magic: &[u8; 4], payload: &[u8], sync: SyncMode) -> Option<Vec<u8>> {
+    use lz4::block::{compress, CompressionMode};
+    if sync != SyncMode::Full || *magic != LOG_MAGIC_SPARSE || payload.len() < 1024 * 1024 {
+        return None;
+    }
+    compress(payload, Some(CompressionMode::FAST(16)), true).ok()
+        .filter(|compressed| compressed.len() < payload.len())
+}
+
 pub(crate) fn write_frame_precomputed(
     log: &mut File,
     magic: &[u8; 4],
@@ -564,13 +574,8 @@ pub(crate) fn write_frame_precomputed(
         return Err(io_err("log record exceeds 16MiB"));
     };
     #[cfg(feature = "wal-lz4-trial")]
-    if sync == SyncMode::Full && *magic == LOG_MAGIC_SPARSE && payload.len() >= 1024 * 1024 {
-        use lz4::block::{compress, CompressionMode};
-        if let Ok(packed) = compress(payload, Some(CompressionMode::FAST(16)), true)
-            && packed.len() < payload.len()
-        {
-            return write_frame(log, b"LIN\x07", &packed, sync, log_bytes);
-        }
+    if let Some(packed) = compress_large_sparse(magic, payload, sync) {
+        return write_frame(log, b"LIN\x07", &packed, sync, log_bytes);
     }
     let codec = magic[3];
     write_frame_bytes(log, codec, payload, checksum, len as u32).map_err(io_err)?;

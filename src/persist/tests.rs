@@ -2400,6 +2400,8 @@ mod persistent_encoder_queue_tests {
                 assert!(
                     sender
                         .try_send(EncodeJob {
+                            #[cfg(feature = "wal-lz4-trial")]
+                            sync: SyncMode::Full,
                             generation: 1,
                             next_id: 2,
                             collection: "docs".into(),
