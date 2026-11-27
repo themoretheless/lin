@@ -1,0 +1,64 @@
+name: Refresh native peer benchmarks
+
+on:
+  push:
+    branches: [codex/refresh-peer-matrix]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-peers-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  peers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned peer clients
+        run: python -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Build frozen Lin peer worker
+        run: |
+          sudo apt-get update -qq
+          (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+          dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+          export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
+          scripts/build-linux-release.sh > /tmp/lin-mssql-peer-build.log 2>&1
+          nm --defined-only target/release/lin-peer-worker > "$RUNNER_TEMP/worker-symbols"
+          grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/worker-symbols"
+          lscpu | grep 'Model name:' 
+      - name: Start peer databases
+        run: |
+          docker compose -f docker-compose.bench.yml up -d --wait
+          docker run --name lin-bench-mongo -d -p 127.0.0.1:27027:27017 mongo:8
+          for i in {1..30}; do
+            if docker exec lin-bench-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' | grep -qx 1; then break; fi
+            sleep 2
+          done
+      - name: Validate reads and native batch inserts
+        run: |
+          mkdir "$RUNNER_TEMP/peer-results"
+          lscpu > "$RUNNER_TEMP/peer-results/cpu.txt"
+          for size in 1000 10000 100000; do
+            for mode in reads insert; do
+              cases=()
+              if [[ "$mode" = insert ]]; then cases=(--cases insert_native); fi
+              python scripts/bench-peers.py --lin-binary target/release/lin-peer-worker --engines lin postgres mysql mongo pandas "${cases[@]}" --rows "$size" --samples 8 --repeats 3 --output "$RUNNER_TEMP/peer-results/$mode-$size"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: peer-results
+          path: ${{ runner.temp }}/peer-results
