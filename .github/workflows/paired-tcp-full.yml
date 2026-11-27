@@ -2,7 +2,7 @@ name: Compare durable loopback INSERT
 
 on:
   push:
-    branches: [codex/paired-tcp-full-insert]
+    branches: [codex/native-client-bulk-insert]
 
 permissions:
   contents: read
@@ -35,6 +35,7 @@ jobs:
           dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
           export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
           cargo rustc --locked --release -p lin-peer-worker --bin tcp-full -- -C link-arg=-Wl,-u,tc_malloc -C "link-arg=$LIN_TCMALLOC_ARCHIVE" -C link-arg=-lstdc++
+          cargo rustc --locked --release -p lin-peer-worker --bin sql-tcp-full -- -C link-arg=-Wl,-u,tc_malloc -C "link-arg=$LIN_TCMALLOC_ARCHIVE" -C link-arg=-lstdc++
           nm --defined-only target/release/tcp-full > "$RUNNER_TEMP/symbols"
           grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/symbols"
       - name: Measure same-host durable inserts
@@ -45,11 +46,25 @@ jobs:
             sleep 1
           done
           lscpu > cpu.txt
-          python scripts/paired-tcp-full.py
+          export LIN_BENCH_PG_URL=postgresql://lin:lin@127.0.0.1:55432/lin
+          for size in 1000 10000 100000; do
+            for rep in {1..12}; do
+              roles=(lin postgres)
+              if (( rep % 2 == 0 )); then roles=(postgres lin); fi
+              for role in "${roles[@]}"; do
+                if [[ "$role" = lin ]]; then
+                  ns=$(target/release/tcp-full "$(mktemp -d)" "$size")
+                else
+                  ns=$(target/release/sql-tcp-full postgres "$size")
+                fi
+                echo "$size $rep $role $ns" >> rust-tcp.txt
+              done
+            done
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: tcp-results
           path: |
             cpu.txt
-            tcp-results.json
+            rust-tcp.txt

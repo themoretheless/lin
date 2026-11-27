@@ -75,29 +75,12 @@ def main():
             meta['database_configuration'] = dict(recovery_model=row[0], delayed_durability=row[1])
             cursor.execute("CREATE TABLE dbo.lin_ci_sentinel (marker VARCHAR(32) NOT NULL)")
             cursor.execute("INSERT INTO dbo.lin_ci_sentinel VALUES ('keep')")
-        for mode, cases in [('read', []), ('native', ['--cases', 'insert_native'])]:
-            for rows in [1000, 10000, 100000]:
-                meta['status'] = f'measuring-{mode}-{rows}'
-                save()
-                out = args.output / mode / f'rows-{rows}'
-                command = [sys.executable, 'scripts/bench-peers.py', '--engines', 'lin', 'mssql', *cases, '--rows', str(rows), '--samples', '12', '--repeats', '3', '--require-wins', '--lin-binary', str(args.binary.resolve()), '--output', str(out)]
-                log_path = args.output / f'{mode}-{rows}.log'
-                with log_path.open('w') as log:
-                    result = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT)
-                record = dict(mode=mode, rows=rows, exit_code=result.returncode)
-                meta['runs'].append(record)
-                with connection.cursor() as cursor:
-                    cursor.execute('SELECT marker FROM dbo.lin_ci_sentinel')
-                    assert cursor.fetchall() == [('keep',)]
-                    cursor.execute("SELECT name FROM sys.tables WHERE name LIKE 'linbench[_]%'")
-                    left = [row[0] for row in cursor.fetchall()]
-                    record['sentinel_unchanged'] = True
-                    record['fixture_objects_remaining'] = left
-                    assert not left
-                save()
-                assert result.returncode in (0, 3), 'benchmark report incomplete'
-                # Public job logs must not reveal relative performance.
-                print('Completed one validated workload; results remain private.', flush=True)
+        from mssql_tcp_pairs import measure
+        assert row[1] == "DISABLED"
+        measure(connection, args.binary.resolve(), args.output)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT marker FROM dbo.lin_ci_sentinel')
+            assert cursor.fetchall() == [('keep',)]
         assert all(sha(path) == digest for path, digest in sources.items())
         assert sha(args.binary) == meta['binary_sha256']
         meta['source_unchanged'] = True

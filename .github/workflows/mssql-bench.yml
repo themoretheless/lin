@@ -28,11 +28,20 @@ jobs:
       - name: Install pinned peer clients
         run: python -m pip install -r scripts/bench-peers-requirements.lock
       - name: Build frozen Lin peer worker
-        run: cargo build --locked --release -p lin-peer-worker > /tmp/lin-mssql-peer-build.log 2>&1
+        run: |
+          sudo apt-get update -qq
+          (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+          dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+          export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
+          cargo rustc --locked --release -p lin-peer-worker --bin tcp-full -- -C link-arg=-Wl,-u,tc_malloc -C "link-arg=$LIN_TCMALLOC_ARCHIVE" -C link-arg=-lstdc++ > /tmp/lin-mssql-peer-build.log 2>&1
+          cargo rustc --locked --release -p lin-peer-worker --bin sql-tcp-full -- -C link-arg=-Wl,-u,tc_malloc -C "link-arg=$LIN_TCMALLOC_ARCHIVE" -C link-arg=-lstdc++ > /tmp/lin-mssql-peer-build.log 2>&1
+          nm --defined-only target/release/tcp-full > "$RUNNER_TEMP/worker-symbols"
+          grep -Eq ' [TW] tc_malloc$' "$RUNNER_TEMP/worker-symbols"
+          lscpu | grep 'Model name:' 
       - name: Install artifact encryption
         run: sudo apt-get update -qq && sudo apt-get install -y age
       - name: Qualify real SQL Server on native x86
-        run: python scripts/bench-mssql-native-ci.py --output "$RUNNER_TEMP/lin-mssql-private"
+        run: python scripts/bench-mssql-native-ci.py --binary target/release/tcp-full --output "$RUNNER_TEMP/lin-mssql-private"
       - name: Encrypt internal qualification results
         if: always()
         shell: bash
