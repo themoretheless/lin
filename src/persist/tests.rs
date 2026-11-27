@@ -2387,7 +2387,7 @@ mod persistent_encoder_queue_tests {
                 OpenMemOpts::default(),
             )
             .unwrap();
-            let (sender, receiver) = mpsc::sync_channel::<EncodeJob>(1);
+            let (sender, receiver) = mpsc::sync_channel::<crate::persist::codec::EncoderRequest>(1);
             persist.encoder = Some(Arc::new(EncoderWorker {
                 sender: Some(sender.clone()),
                 handle: None,
@@ -2399,7 +2399,7 @@ mod persistent_encoder_queue_tests {
                 let (reply, _response) = mpsc::sync_channel(1);
                 assert!(
                     sender
-                        .try_send(EncodeJob {
+                        .try_send(crate::persist::codec::EncoderRequest::Encode(EncodeJob {
                             generation: 1,
                             next_id: 2,
                             collection: "docs".into(),
@@ -2408,7 +2408,7 @@ mod persistent_encoder_queue_tests {
                             bytes: Vec::new(),
                             mode: 0,
                             reply
-                        })
+                        }))
                         .is_ok()
                 );
                 Some(receiver)
@@ -2450,12 +2450,12 @@ mod persistent_encoder_queue_tests {
 
     #[test]
     fn last_worker_lease_disconnects_and_joins_thread() {
-        let (sender, receiver) = mpsc::sync_channel::<EncodeJob>(1);
+        let (sender, receiver) = mpsc::sync_channel::<crate::persist::codec::EncoderRequest>(1);
         let exited = Arc::new(AtomicBool::new(false));
         let done = exited.clone();
         let handle = std::thread::spawn(move || {
-            while let Ok(job) = receiver.recv() {
-                job.run();
+            while let Ok(request) = receiver.recv() {
+                if let crate::persist::codec::EncoderRequest::Encode(job) = request { job.run(); }
             }
             done.store(true, Ordering::SeqCst);
         });

@@ -984,6 +984,12 @@ impl Db {
         } else {
             None
         };
+        if allow_preencode && (512..=16384).contains(&n) && edges.is_empty()
+            && hashing_dim.is_some_and(|dim| n.saturating_mul(dim) >= 512 * 1024)
+            && let Some(worker) = self.persist.as_ref().and_then(|p| p.encoder.as_ref())
+        {
+            worker.prepare_sparse_pool();
+        }
         let (built, all_uniform, all_embedded) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
         // Any record without an explicit id gets a generated one, wherever it sits in the

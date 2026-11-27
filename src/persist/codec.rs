@@ -373,10 +373,22 @@ pub(super) fn append_sparse_rows_parallel(
 }
 
 // A shared lease avoids a worker per open database. Last lease joins the worker.
+pub(super) enum EncoderRequest {
+    InitSparsePool,
+    Encode(EncodeJob),
+}
+
 #[derive(Debug)]
 pub(crate) struct EncoderWorker {
-    pub(super) sender: Option<std::sync::mpsc::SyncSender<EncodeJob>>,
+    pub(super) sender: Option<std::sync::mpsc::SyncSender<EncoderRequest>>,
     pub(super) handle: Option<std::thread::JoinHandle<()>>,
+}
+impl EncoderWorker {
+    pub(crate) fn prepare_sparse_pool(&self) {
+        if SPARSE_POOL.get().is_none() && let Some(sender) = self.sender.as_ref() {
+            let _ = sender.try_send(EncoderRequest::InitSparsePool);
+        }
+    }
 }
 impl Drop for EncoderWorker {
     fn drop(&mut self) {
@@ -393,12 +405,15 @@ pub(crate) fn acquire_encoder() -> Option<std::sync::Arc<EncoderWorker>> {
     if let Some(worker) = shared.as_ref() {
         return Some(std::sync::Arc::clone(worker));
     }
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<EncoderRequest>(1);
     let handle = std::thread::Builder::new()
         .name("lin-wal-encoder".into())
         .spawn(move || {
-            while let Ok(job) = receiver.recv() {
-                job.run();
+            while let Ok(request) = receiver.recv() {
+                match request {
+                    EncoderRequest::InitSparsePool => { sparse_pool(); }
+                    EncoderRequest::Encode(job) => job.run(),
+                }
             }
         })
         .ok()?;
@@ -509,12 +524,15 @@ pub(crate) fn start_insert_encoding(
     let Some(sender) = worker.sender.as_ref() else {
         return Err(job);
     };
-    match sender.try_send(job) {
+    match sender.try_send(EncoderRequest::Encode(job)) {
         Ok(()) => Ok(receiver),
         Err(
             std::sync::mpsc::TrySendError::Full(job)
             | std::sync::mpsc::TrySendError::Disconnected(job),
-        ) => Err(job),
+        ) => match job {
+            EncoderRequest::Encode(job) => Err(job),
+            EncoderRequest::InitSparsePool => unreachable!("sent an encode request"),
+        },
     }
 }
 
@@ -1148,19 +1166,11 @@ struct SparseEncodePool {
     reusable_bufs: Vec<Vec<u8>>,
 }
 
-pub(super) fn append_sparse_cells_parallel(
-    cells: &[*const Cell],
-    num_fields: usize,
-    fi: usize,
-    num_rows: usize,
-    buf: &mut Vec<u8>,
-) -> Result<(), Error> {
-    if num_rows < 512 {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
-    }
-    static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
+static SPARSE_POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
         std::sync::OnceLock::new();
-    let mutex = POOL.get_or_init(|| {
+
+fn sparse_pool() -> &'static std::sync::Mutex<Option<SparseEncodePool>> {
+    SPARSE_POOL.get_or_init(|| {
         let threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
@@ -1213,8 +1223,20 @@ pub(super) fn append_sparse_cells_parallel(
                 reusable_bufs,
             }))
         }
-    });
+    })
+}
 
+pub(super) fn append_sparse_cells_parallel(
+    cells: &[*const Cell],
+    num_fields: usize,
+    fi: usize,
+    num_rows: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    if num_rows < 512 {
+        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+    }
+    let mutex = sparse_pool();
     let Ok(mut guard) = mutex.try_lock() else {
         return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
     };
