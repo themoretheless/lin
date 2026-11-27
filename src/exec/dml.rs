@@ -1882,7 +1882,8 @@ fn build_insert_rows(
         if let Ok(guard) = mutex.try_lock()
             && let Some(pool) = guard.as_ref()
         {
-            let total_ways = (pool.workers.len() + 1).min(n.div_ceil(128)).max(1);
+            let max_ways = if n <= 1024 { 2 } else { n.div_ceil(128) };
+            let total_ways = (pool.workers.len() + 1).min(max_ways);
             if total_ways > 1 {
                 let mut rows: Vec<Row> = Vec::with_capacity(n);
                 let spare = &mut rows.spare_capacity_mut()[..n];
