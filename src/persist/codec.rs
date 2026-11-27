@@ -171,12 +171,72 @@ pub(super) fn append_sparse_iter_serial<'a>(
     iter: impl Iterator<Item = Option<&'a [f32]>>,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        return unsafe { append_sparse_iter_avx512(iter, buf) };
+    }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
         // Runtime feature check covers all NEON loads; helper only loads full eight-value chunks.
         return unsafe { append_sparse_iter_neon(iter, buf) };
     }
     append_sparse_iter_scalar(iter, buf)
+}
+
+/// Emit little-endian (position, raw bits) pairs from each eight-value group.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn append_sparse_iter_avx512<'a>(
+    iter: impl Iterator<Item = Option<&'a [f32]>>,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    use std::arch::x86_64::*;
+    let offsets = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+    for row in iter {
+        let Some(values) = row else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            continue;
+        };
+        let dim = u32::try_from(values.len()).ok().and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io_err("sparse vector dimension overflow"))?;
+        let max_bytes = values.len().checked_mul(8).and_then(|n| n.checked_add(8))
+            .ok_or_else(|| io_err("sparse vector size overflow"))?;
+        buf.reserve(max_bytes);
+        buf.extend_from_slice(&dim.to_le_bytes());
+        let count_at = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let mut count = 0usize;
+        let mut chunks = values.chunks_exact(8);
+        // Each load reads one complete chunk. At most one eight-byte pair is
+        // stored per input value in the reserved tail, in original lane order.
+        unsafe {
+            let dest = buf.as_mut_ptr().add(buf.len());
+            for (group, chunk) in chunks.by_ref().enumerate() {
+                let raw = _mm256_loadu_si256(chunk.as_ptr().cast());
+                let bits = _mm512_cvtepu32_epi64(raw);
+                let mask = _mm512_cmpneq_epi64_mask(bits, _mm512_setzero_si512());
+                if mask != 0 {
+                    let indices = _mm512_add_epi64(offsets, _mm512_set1_epi64((group * 8) as i64));
+                    let pairs = _mm512_or_si512(indices, _mm512_slli_epi64::<32>(bits));
+                    _mm512_mask_compressstoreu_epi64(dest.add(count * 8).cast(), mask, pairs);
+                    count += mask.count_ones() as usize;
+                }
+            }
+            buf.set_len(buf.len() + count * 8);
+        }
+        let tail = chunks.remainder();
+        let start = values.len() - tail.len();
+        for (i, value) in tail.iter().enumerate() {
+            let bits = value.to_bits();
+            if bits != 0 {
+                buf.extend_from_slice(&((start + i) as u32).to_le_bytes());
+                buf.extend_from_slice(&bits.to_le_bytes());
+                count += 1;
+            }
+        }
+        buf[count_at..count_at + 4].copy_from_slice(&(count as u32).to_le_bytes());
+    }
+    Ok(())
 }
 
 pub(super) fn append_sparse_rows_serial(
