@@ -32,3 +32,24 @@
 Для первого INSERT 100k с подсказкой glibc о больших страницах разницы Lin минус DuckDB составили paired-duckdb-insert-amd-2: +66.887 мс, paired-duckdb-insert-amd-3: -48.784 мс, paired-duckdb-insert-arm64: -98.715 мс. Фактический размер страниц в этом прогоне не измерялся.
 
 [SQLite WAL/FULL](https://github.com/themoretheless/lin/actions/runs/46012313025) · [DuckDB](https://github.com/themoretheless/lin/actions/runs/46012312886)
+
+## Повтор на трёх EPYC 7763
+
+На первом INSERT 100k прежний разрыв 67,916 мс не воспроизвёлся. Размеры и порядок нагрузки сохранены. Каждый раннер выполнил по 25 пар на размер. Отрицательная разница означает выигрыш первого участника.
+
+| Движок | CPU | Раннер | Строк | INSERT | Δ к main, мс | PGO − движок, мс | main − движок, мс | Побед над движком |
+|---|---|---|---:|---|---:|---:|---:|---:|
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-1 | 10000 | первый | -0.949 | -3.933 | -2.999 | 24/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-1 | 10000 | повторные | -0.599 | -12.302 | -11.697 | 25/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-1 | 100000 | первый | -10.183 | +4.020 | +14.566 | 2/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-1 | 100000 | повторные | -9.006 | -84.270 | -75.264 | 25/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-2 | 10000 | первый | -0.932 | -4.100 | -3.158 | 25/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-2 | 10000 | повторные | -0.556 | -12.589 | -12.023 | 25/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-2 | 100000 | первый | -11.148 | +4.095 | +15.321 | 1/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-2 | 100000 | повторные | -6.869 | -86.206 | -78.285 | 25/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-4 | 10000 | первый | -0.965 | -4.056 | -3.036 | 24/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-4 | 10000 | повторные | -0.869 | -12.515 | -11.812 | 25/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-4 | 100000 | первый | -10.666 | -0.182 | +9.393 | 13/25 |
+| duckdb | AMD EPYC 7763 64-Core Processor | paired-duckdb-insert-amd-4 | 100000 | повторные | -6.281 | -90.403 | -84.196 | 25/25 |
+
+[Повтор и сырые данные](https://github.com/themoretheless/lin/actions/runs/46015865238)
