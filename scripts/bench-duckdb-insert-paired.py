@@ -38,8 +38,7 @@ def role_env(role):
     env.pop("LD_PRELOAD", None)
     env.pop("MALLOC_CONF", None)
     env.pop("GLIBC_TUNABLES", None)
-    if role in ("thp", "duckdb_thp"):
-        env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
+
     return env
 
 
@@ -56,7 +55,7 @@ def measure_lin(worker, rows, samples, role):
 
 
 def main(worker, output):
-    roles = ("lin", "control", "thp", "duckdb", "duckdb_thp")
+    roles = ("lin", "thp", "duckdb", "duckdb_thp")
     samples = 5
     rng = random.Random(2929273)
     report = dict(
@@ -67,13 +66,19 @@ def main(worker, output):
     for n in (10_000, 100_000):
         rows = bench["fixture"](n)
         orders = []
-        for _ in range(5):
+        for _ in range(6):
             cycle = rng.sample(roles, len(roles))
             orders.extend(cycle[i:] + cycle[:i] for i in range(len(roles)))
         rng.shuffle(orders)
         for order in orders:
             timings = {}
             for role in order:
+                policy = "always" if role in ("thp", "duckdb_thp") else "madvise"
+                knob = Path("/sys/kernel/mm/transparent_hugepage/enabled")
+                subprocess.run(["sudo", "-n", "tee", str(knob)], input=policy + "\n",
+                               text=True, stdout=subprocess.DEVNULL, check=True)
+                if f"[{policy}]" not in knob.read_text():
+                    raise RuntimeError("kernel did not apply requested THP policy")
                 if role.startswith("duckdb"):
                     timings[role] = json.loads(subprocess.check_output(
                         [sys.executable, __file__, "--duckdb", str(n), str(samples)],

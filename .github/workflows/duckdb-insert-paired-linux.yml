@@ -1,7 +1,7 @@
-name: Qualify linked Linux allocator against DuckDB on main
+name: Compare kernel THP policies for linked Lin and DuckDB
 on:
   push:
-    branches: [codex/verify-main-linked-duckdb]
+    branches: [codex/epyc-kernel-thp-paired]
 permissions:
   contents: read
 jobs:
@@ -71,6 +71,10 @@ jobs:
           lscpu >> duckdb-provenance.txt
           rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
+          knob=/sys/kernel/mm/transparent_hugepage/enabled
+          initial=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$knob")
+          test -n "$initial"
+          trap 'echo "$initial" | sudo tee "$knob" >/dev/null' EXIT
           python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
