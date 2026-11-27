@@ -261,3 +261,32 @@ INSERT в процессе. Проверка значений после вст�
 прямой экономии в этих четырёх измеренных операциях.
 
 [Диагностический счётчик](https://github.com/themoretheless/lin/tree/codex/measure-wide-clone-count)
+
+### Точная ёмкость клона широкой строки против main и DuckDB
+
+15 пар на размер и режим. Контроль 3b967b4c5, движки в памяти на одном Linux-раннере. Первый INSERT в новом процессе, повторные — медиана следующих четырёх. Медианы парных разностей, положительные значения означают отставание кандидата. THP запрошены через glibc.malloc.hugetlb=1.
+
+| CPU / раннер | Строк | Вызов | Δ к контролю, мс | Δ к DuckDB, мс | Побед над DuckDB | Δ с THP к DuckDB с THP, мс |
+|---|---:|---|---:|---:|---:|---:|
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 10000 | первый | +0.115 | -4.233 | 15/15 | -4.410 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 10000 | повторные | +0.166 | -13.954 | 15/15 | -14.021 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 100000 | первый | -0.272 | +1.611 | 3/15 | +0.428 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-1 | 100000 | повторные | -0.170 | -90.824 | 15/15 | -90.972 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-2 | 10000 | первый | +0.024 | -3.728 | 15/15 | -3.446 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-2 | 10000 | повторные | -0.010 | -11.096 | 15/15 | -11.036 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-2 | 100000 | первый | -0.239 | +4.326 | 0/15 | +3.058 |
+| AMD EPYC 9V74 80-Core Processor / paired-duckdb-insert-amd-2 | 100000 | повторные | -0.104 | -68.782 | 15/15 | -68.327 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 10000 | первый | -0.072 | -4.018 | 15/15 | -3.995 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 10000 | повторные | -0.039 | -12.938 | 15/15 | -12.926 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 100000 | первый | +0.401 | +3.594 | 2/15 | +3.406 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-3 | 100000 | повторные | +2.048 | -86.449 | 15/15 | -85.787 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-4 | 10000 | первый | +0.103 | -4.126 | 15/15 | -3.933 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-4 | 10000 | повторные | -0.016 | -12.906 | 15/15 | -12.973 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-4 | 100000 | первый | +0.683 | +1.510 | 3/15 | +1.933 |
+| AMD EPYC 7763 64-Core Processor / paired-duckdb-insert-amd-4 | 100000 | повторные | -0.853 | -88.505 | 15/15 | -87.845 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 10000 | первый | -0.134 | -12.953 | 15/15 | -15.767 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 10000 | повторные | +0.131 | -17.648 | 15/15 | -17.621 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 100000 | первый | +1.683 | -105.283 | 15/15 | -132.511 |
+| Neoverse-N2 / paired-duckdb-insert-arm64 | 100000 | повторные | -0.362 | -147.193 | 15/15 | -148.716 |
+
+[Исходные результаты](https://github.com/themoretheless/lin/actions/runs/46039856544)
