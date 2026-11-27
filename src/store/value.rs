@@ -624,11 +624,17 @@ pub fn content_hash_arc(body: &str) -> Arc<str> {
     let mut buf = [0u8; 18];
     buf[0] = b'h';
     buf[1] = b':';
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
+    // Spread eight nibbles into eight byte lanes, then map 10..15 to a..f.
+    fn hex_half(value: u32) -> [u8; 8] {
+        let mut lanes = u64::from(value);
+        lanes = (lanes | lanes << 16) & 0x0000_ffff_0000_ffff;
+        lanes = (lanes | lanes << 8) & 0x00ff_00ff_00ff_00ff;
+        lanes = (lanes | lanes << 4) & 0x0f0f_0f0f_0f0f_0f0f;
+        let letters = ((lanes + 0x0606_0606_0606_0606) >> 4) & 0x0101_0101_0101_0101;
+        (lanes + 0x3030_3030_3030_3030 + 39 * letters).to_be_bytes()
     }
+    buf[2..10].copy_from_slice(&hex_half((h >> 32) as u32));
+    buf[10..].copy_from_slice(&hex_half(h as u32));
     // SAFETY: buf is always ASCII hex.
     Arc::from(unsafe { std::str::from_utf8_unchecked(&buf) })
 }
@@ -709,4 +715,13 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m, d)
+}
+
+#[cfg(test)]
+#[test]
+fn bulk_hash_hex_matches_scalar_format() {
+    for i in 0..100_000 {
+        let body = format!("body {i} Ω");
+        assert_eq!(content_hash_arc(&body).as_ref(), format!("h:{:016x}", fnv1a64(body.as_bytes())));
+    }
 }
