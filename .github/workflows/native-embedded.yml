@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/native-embedded-clients]
+    branches: [codex/typed-wal-syscall-profile]
 
 permissions:
   contents: read
@@ -44,11 +44,23 @@ jobs:
           fi
           cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          python scripts/typed-storage-modes.py
+          sudo apt-get update -qq
+          sudo apt-get install -y strace
+          mkdir traces
+          for n in 1000 10000; do
+            for i in {1..6}; do
+              modes=(lin-wal sqlite)
+              if (( i % 2 == 0 )); then modes=(sqlite lin-wal); fi
+              for mode in "${modes[@]}"; do
+                dir=$(mktemp -d)
+                strace -f -ttt -T -yy -s 48 -e trace=write,writev,pwrite64,fdatasync,fsync,fallocate -o "traces/$mode-$n-$i.log" target/release/embedded-native "$mode" "$n" 1 "$dir" > "traces/$mode-$n-$i.json"
+              done
+            done
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            typed-storage-modes.json
+            traces/

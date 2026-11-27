@@ -41,6 +41,7 @@ fn main() -> Result<()> {
                     Db::empty()
                 };
                 db.run("index docs [wing, ts]")?;
+                eprintln!("TIMED_INSERT_BEGIN");
                 start = Instant::now();
                 let names = ["id", "uri", "wing", "title", "ts", "body", "layer"].map(String::from);
                 let mut batch = RecordBatch::with_capacity(names.to_vec(), n);
@@ -57,6 +58,7 @@ fn main() -> Result<()> {
                 }
                 let done = db.insert_batch("docs", &batch)?;
                 elapsed = start.elapsed();
+                eprintln!("TIMED_INSERT_END");
                 assert_eq!(done.n, n);
                 if durable {
                     let recovery = path.join("recovery");
@@ -91,6 +93,7 @@ fn main() -> Result<()> {
             "duckdb" => {
                 let mut db = duckdb::Connection::open_in_memory()?;
                 db.execute_batch(DDL)?;
+                eprintln!("TIMED_INSERT_BEGIN");
                 start = Instant::now();
                 let tx = db.transaction()?;
                 {
@@ -102,6 +105,7 @@ fn main() -> Result<()> {
                 }
                 tx.commit()?;
                 elapsed = start.elapsed();
+                eprintln!("TIMED_INSERT_END");
                 let got = db
                     .prepare(READ)?
                     .query_map([], |r| {
@@ -137,6 +141,7 @@ fn main() -> Result<()> {
                 };
                 db.execute_batch(DDL)?;
                 db.prepare_cached("INSERT INTO docs VALUES(?,?,?,?,?,?)")?;
+                eprintln!("TIMED_INSERT_BEGIN");
                 start = Instant::now();
                 let tx = db.transaction()?;
                 {
@@ -147,6 +152,7 @@ fn main() -> Result<()> {
                 }
                 tx.commit()?;
                 elapsed = start.elapsed();
+                eprintln!("TIMED_INSERT_END");
                 if durable {
                     drop(db);
                     db = rusqlite::Connection::open(path)?;
