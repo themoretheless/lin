@@ -106,6 +106,7 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut reopen_ns = Vec::new();
+    let mut wal_bytes = 0;
     let mut result = Value::Null;
     for _ in 0..samples {
         let mut db = match durable {
@@ -117,6 +118,7 @@ fn measure_insert(
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        let wal_before = durable.map(|p| std::fs::metadata(lin::persist::log_path(p)).map(|m| m.len())).transpose()?;
         eprintln!("BEGIN INSERT");
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
@@ -132,6 +134,9 @@ fn measure_insert(
         };
         timings.push(start.elapsed().as_nanos() as f64);
         eprintln!("END INSERT");
+        if let (Some(path), Some(before)) = (durable, wal_before) {
+            wal_bytes = std::fs::metadata(lin::persist::log_path(path))?.len() - before;
+        }
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
@@ -169,7 +174,7 @@ fn measure_insert(
             return Err("insert exact values mismatch".into());
         }
     }
-    Ok(json!({"samples_ns":timings,"result":result,"reopen_ns":reopen_ns,
+    Ok(json!({"samples_ns":timings,"result":result,"wal_bytes":wal_bytes,"reopen_ns":reopen_ns,
         "statement_rows_limit":10_000,"statements":sources.len(),
         "api":if sources.len()==1 {"prepared run"} else {"prepared chunks in one memory transaction"}}))
 }

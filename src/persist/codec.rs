@@ -1421,6 +1421,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
         let mut sparse_decoded_bytes = 0usize;
 
         for (fi, f) in fields.iter().enumerate() {
+            let before_column = buf.len();
             put_str(buf, f);
             match col_types[fi] {
                 DirectColType::Text => {
@@ -1570,6 +1571,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                     }
                 }
             }
+            eprintln!("{}", serde_json::json!({"column":f,"bytes":buf.len()-before_column}));
         }
 
         Some((

@@ -19,12 +19,17 @@ def sqlite_stage(path, rows):
         db.execute("PRAGMA synchronous=FULL")
         assert db.execute("PRAGMA synchronous").fetchone() == (2,)
         db.executescript(bench["SCHEMA"])
+        wal = Path(str(path) + "-wal")
+        pagesize = db.execute("PRAGMA page_size").fetchone()[0]
+        before = wal.stat().st_size
         start = perf_counter_ns()
         db.execute("BEGIN")
         db.executemany("INSERT INTO docs VALUES (?,?,?,?,?,?)", rows)
         before_commit = perf_counter_ns()
         db.execute("COMMIT")
         end = perf_counter_ns()
+        added = wal.stat().st_size - before
+        assert before >= 32 and added > 0 and added % (pagesize + 24) == 0
     finally:
         db.close()
     db = sqlite3.connect(path)
@@ -32,7 +37,7 @@ def sqlite_stage(path, rows):
         assert sorted(db.execute("SELECT * FROM docs")) == sorted(rows)
     finally:
         db.close()
-    return dict(insert_ns=before_commit-start, commit_ns=end-before_commit)
+    return dict(insert_ns=before_commit-start, commit_ns=end-before_commit, wal_bytes=added, frames=added//(pagesize+24), page_bytes=pagesize)
 
 
 def lin_stage(path, rows):
@@ -41,9 +46,12 @@ def lin_stage(path, rows):
     result = json.loads(p.stdout)
     assert result["reopen_ns"][0] > 0 and [tuple(r) for r in result["result"]] == rows
     trace = p.stderr.split("BEGIN INSERT\n")[1].split("END INSERT\n")[0]
-    phases = [json.loads(line) for line in trace.splitlines()]
+    events = [json.loads(line) for line in trace.splitlines()]
+    phases = [r for r in events if "phase" in r]
+    columns = {r["column"]: r["bytes"] for r in events if "column" in r}
+    assert 0 < sum(columns.values()) <= phases[-1]["payload_bytes"]
     assert [r["phase"] for r in phases] == ["build", "validate", "maintain", "append", "wal_io"], phases
-    return dict(total_ns=result["samples_ns"][0], phases=phases)
+    return dict(total_ns=result["samples_ns"][0], phases=phases, wal_bytes=result["wal_bytes"], columns=columns)
 
 
 def main():
