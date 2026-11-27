@@ -78,3 +78,5 @@ pub(crate) use wal::{
     append_validated_frame_slices, append_validated_frames, durable_sync, prune_bins,
     replay_log_indexed, reserve_wal_space, sync_dir_checked, write_frame, write_head_no_dir_sync,
 };
+
+pub(crate) use codec::wal_trace_clock;

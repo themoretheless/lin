@@ -559,6 +559,12 @@ pub(crate) fn prepare_insert_columns(
     prepare_insert_columns_ext(generation, next_id, collection, rows, false, bytes)
 }
 
+pub(crate) fn wal_trace_clock() -> u64 {
+    static ORIGIN: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    ORIGIN.elapsed().as_nanos() as u64
+}
+
 pub(crate) fn prepare_insert_columns_ext(
     generation: u64,
     next_id: u64,
@@ -567,6 +573,7 @@ pub(crate) fn prepare_insert_columns_ext(
     uniform_keys: bool,
     mut bytes: Vec<u8>,
 ) -> PreparedInsert {
+    let encode_start = wal_trace_clock();
     if let Some((magic, fields)) = encode_insert_rows_direct_ext(
         generation,
         next_id,
@@ -576,7 +583,10 @@ pub(crate) fn prepare_insert_columns_ext(
         &mut bytes,
     ) {
         let n = rows.len() as u32;
+        let checksum_start = wal_trace_clock();
         let checksum = compute_frame_checksum(&magic, &bytes);
+        let checksum_end = wal_trace_clock();
+        eprintln!(r#"{{"span":"encoding","start":{encode_start},"checksum_start":{checksum_start},"end":{checksum_end}}}"#);
         let pack = Pack::InsertCols {
             collection: collection.to_owned(),
             fields: fields.clone(),

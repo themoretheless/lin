@@ -1195,6 +1195,7 @@ impl Db {
             #[cfg(test)]
             PREENCODE_TEST_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let shared = Arc::new(std::mem::take(&mut built));
+            let dispatch_start = crate::persist::wal_trace_clock();
             let task = crate::persist::start_insert_encoding(
                 self.persist.as_mut().unwrap(),
                 generation,
@@ -1205,7 +1206,9 @@ impl Db {
                 bytes,
                 mode,
             );
+            let maint_start = crate::persist::wal_trace_clock();
             let maintenance = self.maintain_insert_slab(collection, start, &shared);
+            let maint_end = crate::persist::wal_trace_clock();
             let staged = match task {
                 Ok(reply) => reply.recv().unwrap_or_else(|_| {
                     crate::persist::prepare_insert_columns_ext(
@@ -1224,6 +1227,8 @@ impl Db {
                     job.encode()
                 }
             };
+            let reply_end = crate::persist::wal_trace_clock();
+            eprintln!(r#"{{"span":"maintenance","dispatch":{dispatch_start},"start":{maint_start},"end":{maint_end},"reply":{reply_end}}}"#);
             built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
             maintenance?;
             Some(staged)

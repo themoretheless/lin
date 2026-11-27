@@ -41,9 +41,12 @@ def lin_stage(path, rows):
     result = json.loads(p.stdout)
     assert result["reopen_ns"][0] > 0 and [tuple(r) for r in result["result"]] == rows
     trace = p.stderr.split("BEGIN INSERT\n")[1].split("END INSERT\n")[0]
-    phases = [json.loads(line) for line in trace.splitlines()]
+    events = [json.loads(line) for line in trace.splitlines()]
+    phases = [r for r in events if "phase" in r]
+    spans = {r["span"]: r for r in events if "span" in r}
+    assert set(spans) == {"encoding", "maintenance"}, events
     assert [r["phase"] for r in phases] == ["build", "validate", "maintain", "append", "wal_io"], phases
-    return dict(total_ns=result["samples_ns"][0], phases=phases)
+    return dict(total_ns=result["samples_ns"][0], phases=phases, spans=spans)
 
 
 def main():
