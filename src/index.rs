@@ -2264,6 +2264,27 @@ mod bitmap_sample_once_tests {
         assert_eq!(a, b);
     }
     #[test]
+    fn wide_batch_keys_match_named_fields_in_index_order() {
+        let rows: Vec<Row> = (0..4).map(|i| {
+            (0..40).map(|j| (format!("field{j:02}"), Cell::Int(i * 40 + j))).collect()
+        }).collect();
+        let fields = ["field39", "field11", "missing", "field02", "field38",
+                      "field01", "field34", "field12", "field21"];
+        let mut index = LiveIndex::new(IndexDef {
+            collection: "docs".into(),
+            unique: false,
+            fields: fields.iter().map(|field| field.to_string()).collect(),
+            pred: None,
+            bitmap_card_field: None,
+        });
+        index.insert_slab_batch(7, &rows).unwrap();
+        for (i, row) in rows.iter().enumerate() {
+            let key = index.key_of(row);
+            assert_eq!(index.forward[&key].to_indices(), vec![7 + i]);
+        }
+    }
+
+    #[test]
     fn sample_once_matches_per_row_reference() {
         for n in [0, 1, 2, 99, 100, 101, 128] {
             for cardinality in [0, 1, 16, 17, 32, 33] {
