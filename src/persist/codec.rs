@@ -376,16 +376,31 @@ pub(super) unsafe fn append_sparse_iter_neon<'a>(
             let start_ptr = buf.as_mut_ptr().add(base);
             std::ptr::copy_nonoverlapping(dim.to_le_bytes().as_ptr(), start_ptr, 4);
             let mut cur = start_ptr.add(8);
-            for (block, values) in emb.chunks(8).enumerate() {
-                let mut mask = if values.len() == 8 {
-                    presence_mask8(values)
-                } else {
-                    values
-                        .iter()
-                        .enumerate()
-                        .fold(0u32, |m, (i, x)| m | (u32::from(x.to_bits() != 0) << i))
-                };
-                let base_idx = (block * 8) as u32;
+            for (block, values) in emb.chunks(32).enumerate() {
+                if values.len() == 32 {
+                    use std::arch::aarch64::*;
+                    // A single horizontal reduction skips 32 positive zeros. Test the
+                    // raw bits so negative zero and NaN payloads remain explicit.
+                    let a = vld1q_u32_x4(values.as_ptr().cast());
+                    let b = vld1q_u32_x4(values.as_ptr().add(16).cast());
+                    let lo = vorrq_u32(vorrq_u32(a.0, a.1), vorrq_u32(a.2, a.3));
+                    let hi = vorrq_u32(vorrq_u32(b.0, b.1), vorrq_u32(b.2, b.3));
+                    if vmaxvq_u32(vorrq_u32(lo, hi)) == 0 {
+                        continue;
+                    }
+                }
+                let mut mask = 0u32;
+                for (group, lanes) in values.chunks(8).enumerate() {
+                    let bits = if lanes.len() == 8 {
+                        presence_mask8(lanes)
+                    } else {
+                        lanes.iter().enumerate().fold(0, |m, (i, x)| {
+                            m | (u32::from(x.to_bits() != 0) << i)
+                        })
+                    };
+                    mask |= bits << (8 * group);
+                }
+                let base_idx = (block * 32) as u32;
                 while mask != 0 {
                     let offset = mask.trailing_zeros() as usize;
                     let index = base_idx + (offset as u32);

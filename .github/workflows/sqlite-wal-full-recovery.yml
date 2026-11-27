@@ -1,7 +1,7 @@
 name: SQLite WAL FULL with verified Lin recovery
 on:
   push:
-    branches: [codex/main-wal-small-serial]
+    branches: [codex/main-wal-neon-zero-blocks]
 permissions:
   contents: read
 jobs:
@@ -16,6 +16,7 @@ jobs:
           - {runner: ubuntu-22.04, replica: amd-3}
           - {runner: ubuntu-22.04, replica: amd-4}
           - {runner: ubuntu-24.04-arm, replica: arm64}
+          - {runner: ubuntu-24.04-arm, replica: arm64-repeat}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +58,7 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git worktree add --detach "$RUNNER_TEMP/base" 1f273f78a
+          git worktree add --detach "$RUNNER_TEMP/base" 39fed900b
           (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
           sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
           python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt
