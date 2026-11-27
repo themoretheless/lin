@@ -1206,8 +1206,10 @@ impl Db {
         } else {
             None
         };
+        crate::PROFILE_ROW_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
         let (built, all_uniform, all_embedded, lossless_cols) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        crate::PROFILE_ROW_BUILD.store(false, std::sync::atomic::Ordering::SeqCst);
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()

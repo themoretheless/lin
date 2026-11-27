@@ -220,3 +220,6 @@ pub fn explain_as(src: &str, graph: Option<GraphFmt>) -> Result<String, Error> {
 pub fn run(src: &str) -> Result<Handle, Error> {
     DEFAULT_DB.with_borrow_mut(|db| db.run(src))
 }
+
+#[doc(hidden)]
+pub static PROFILE_ROW_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

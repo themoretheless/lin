@@ -5,6 +5,39 @@ use std::hint::black_box;
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+struct CountingAllocator;
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+static COUNTS: [AtomicU64; 8193] = [const { AtomicU64::new(0) }; 8193];
+static LARGE_BYTES: AtomicU64 = AtomicU64::new(0);
+fn record_request(size: usize) {
+    if lin::PROFILE_ROW_BUILD.load(Ordering::Relaxed) {
+        COUNTS[size.min(8192)].fetch_add(1, Ordering::Relaxed);
+        if size >= 8192 {
+            LARGE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        }
+    }
+}
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_request(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record_request(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        record_request(size);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
 fn canonical(rows: &[lin::Row], fields: &[String]) -> Value {
     Value::Array(
         rows.iter()
@@ -125,6 +158,13 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        for (size, count) in COUNTS.iter().enumerate() {
+            let requests = count.swap(0, Ordering::Relaxed);
+            if requests != 0 {
+                let bytes = if size == 8192 { LARGE_BYTES.swap(0, Ordering::Relaxed) } else { size as u64 * requests };
+                eprintln!("allocation {size} {requests} {bytes}");
+            }
+        }
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
