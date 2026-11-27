@@ -1226,8 +1226,10 @@ pub(super) fn append_sparse_cells_parallel(
         return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
     }
 
-    let chunk_size = num_rows.div_ceil(total_ways);
-    let first_end = chunk_size.min(num_rows);
+    // The caller writes directly into the WAL buffer. Give it two shares to
+    // reduce the amount copied back from helper buffers after the join.
+    let chunk_size = num_rows.div_ceil(total_ways + 1);
+    let first_end = (2 * chunk_size).min(num_rows);
 
     struct SparseDrainGuard<'a> {
         done_rx: &'a std::sync::mpsc::Receiver<(usize, Result<(), Error>, Vec<u8>)>,
@@ -1256,7 +1258,7 @@ pub(super) fn append_sparse_cells_parallel(
     let mut dispatched = 0usize;
     let mut fallback_start = first_end;
     for chunk_idx in 1..total_ways {
-        let start_row = chunk_idx * chunk_size;
+        let start_row = fallback_start;
         if start_row >= num_rows {
             break;
         }
