@@ -2,8 +2,11 @@
 set -euo pipefail
 scratch=$(mktemp -d)
 mkdir "$scratch/build-profiles" "$scratch/training"
-scripts/build-linux-release.sh
-cp target/release/lin-peer-worker "$RUNNER_TEMP/thin-worker"
+control=fe271712731a6df8c8949ffc0a47339c529ee182
+git fetch --depth=1 origin "$control"
+git worktree add --detach "$scratch/control" "$control"
+(cd "$scratch/control" && scripts/build-linux-release.sh)
+cp "$scratch/control/target/release/lin-peer-worker" "$RUNNER_TEMP/thin-worker"
 RUSTFLAGS="-Cprofile-generate=$scratch/build-profiles" scripts/build-linux-release.sh
 for size in 768 4096 8192; do
   fixture=$(mktemp -d "$scratch/db.XXXXXX")
