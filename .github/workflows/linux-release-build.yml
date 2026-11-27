@@ -1,7 +1,7 @@
 name: Linux release binaries
 on:
   push:
-    branches: [main, codex/merge-linux-release-allocator]
+    branches: [codex/profile-insert-allocator-pages]
     paths:
       - scripts/build-linux-release.sh
       - .github/workflows/linux-release-build.yml
@@ -12,7 +12,8 @@ jobs:
   build:
     strategy:
       matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        runner: [ubuntu-22.04]
+        replica: [1, 2, 3]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -37,4 +38,16 @@ jobs:
               exit 1
             fi
           done
-          echo '{"insert_rows":1000,"samples":1,"timestamp_ms":123456}' | target/release/lin-peer-worker | jq -e '.result | length == 1000'
+          lscpu > cpu.txt
+          for trial in 1 2 3 4; do
+            echo '{"insert_rows":100000,"samples":3,"timestamp_ms":123456}' |
+              target/release/lin-peer-worker 2> "memory-$trial.jsonl" |
+              jq -e '.result | length == 100000'
+            jq -es 'length == 6 and all(.[]; .allocated > 0 and .heap > 0 and .rss_kib > 0)' "memory-$trial.jsonl"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-${{ matrix.replica }}
+          path: |
+            cpu.txt
+            memory-*.jsonl

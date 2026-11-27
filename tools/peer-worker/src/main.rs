@@ -66,6 +66,33 @@ fn seed(n: usize) -> Result<Db, lin::Error> {
     Ok(db)
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn record_memory(stage: &str, sample: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::{CStr, c_char, c_int};
+    unsafe extern "C" {
+        fn MallocExtension_GetNumericProperty(name: *const c_char, value: *mut usize) -> c_int;
+    }
+    let property = |name: &CStr| {
+        let mut value = 0;
+        // Both pointers stay valid for the synchronous allocator query.
+        let found = unsafe { MallocExtension_GetNumericProperty(name.as_ptr(), &mut value) };
+        (found != 0).then_some(value)
+    };
+    let smaps = std::fs::read_to_string("/proc/self/smaps_rollup")?;
+    let kib = |name: &str| smaps.lines().find_map(|line| {
+        line.strip_prefix(name)?.split_whitespace().next()?.parse::<usize>().ok()
+    });
+    eprintln!("{}", json!({
+        "stage": stage, "sample": sample,
+        "allocated": property(c"generic.current_allocated_bytes"),
+        "heap": property(c"generic.heap_size"),
+        "free": property(c"tcmalloc.pageheap_free_bytes"),
+        "unmapped": property(c"tcmalloc.pageheap_unmapped_bytes"),
+        "rss_kib": kib("Rss:"), "anon_kib": kib("Anonymous:"), "huge_kib": kib("AnonHugePages:")
+    }));
+    Ok(())
+}
+
 fn measure_insert(
     n: usize,
     samples: usize,
@@ -105,13 +132,15 @@ fn measure_insert(
     let fields = ["id", "uri", "wing", "title", "ts", "body"].map(String::from);
     let mut timings = Vec::with_capacity(samples);
     let mut result = Value::Null;
-    for _ in 0..samples {
+    for _sample in 0..samples {
         let mut db = Db::empty();
         db.run("index docs [wing, ts]")?;
         let prepared = sources
             .iter()
             .map(|source| db.prepare(source))
             .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        record_memory("prepared", _sample)?;
         let start = Instant::now();
         let affected = if prepared.len() == 1 {
             black_box(prepared[0].run(&mut db)?).done.n
@@ -125,6 +154,8 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        record_memory("committed", _sample)?;
         if affected != n {
             return Err("insert affected count mismatch".into());
         }
