@@ -1,7 +1,7 @@
 name: SQLite WAL FULL with verified Lin recovery
 on:
   push:
-    branches: [codex/linux-wal-reserve-tail]
+    branches: [codex/trace-wal-reserve-range]
 permissions:
   contents: read
 jobs:
@@ -12,10 +12,6 @@ jobs:
       matrix:
         include:
           - {runner: ubuntu-22.04, replica: amd-1}
-          - {runner: ubuntu-22.04, replica: amd-2}
-          - {runner: ubuntu-22.04, replica: amd-3}
-          - {runner: ubuntu-22.04, replica: amd-4}
-          - {runner: ubuntu-24.04-arm, replica: arm64}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +21,7 @@ jobs:
         id: cpu
         run: |
           lscpu > runner-cpu.txt
-          if [[ "$(uname -m)" = aarch64 ]] || grep -Eq 'AMD EPYC (7763|9V74|9V45)' runner-cpu.txt; then
+          if [[ "$(uname -m)" = aarch64 ]] || [[ "$(uname -m)" = x86_64 ]]; then
             echo 'matched=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@master
@@ -57,11 +53,13 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git worktree add --detach "$RUNNER_TEMP/base" 1e6880ca6
-          cp tools/peer-worker/src/main.rs "$RUNNER_TEMP/base/tools/peer-worker/src/main.rs"
-          (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
-          sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
-          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt
+          sudo apt-get install -y strace
+          for n in 1000 10000; do
+            mkdir "$RUNNER_TEMP/db-$n"
+            echo "{\"insert_rows\":$n,\"samples\":1,\"timestamp_ms\":123456,\"durable_dir\":\"$RUNNER_TEMP/db-$n\"}" |
+              strace -f -yy -e trace=fallocate,fsync,fdatasync -o "syscalls-$n.txt" target/release/lin-peer-worker |
+              jq -e --argjson n "$n" '(.result | length) == $n and .reopen_ns[0] > 0'
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -69,5 +67,4 @@ jobs:
           path: |
             runner-cpu.txt
             provenance.txt
-            wal-full.json
-            summary.txt
+            syscalls-*.txt
