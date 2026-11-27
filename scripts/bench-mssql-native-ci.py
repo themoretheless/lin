@@ -77,7 +77,7 @@ def main():
             cursor.execute("INSERT INTO dbo.lin_ci_sentinel VALUES ('keep')")
         from mssql_tcp_pairs import measure
         assert row[1] == "DISABLED"
-        measure(connection, args.binary.resolve(), args.output)
+        measure(connection, args.binary.resolve(), args.output, env)
         with connection.cursor() as cursor:
             cursor.execute('SELECT marker FROM dbo.lin_ci_sentinel')
             assert cursor.fetchall() == [('keep',)]
