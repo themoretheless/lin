@@ -1303,7 +1303,7 @@ fn large_sparse_embedding_insert_is_one_durable_frame_and_replays_exactly() {
         assert_eq!(handle.done.n, 10_000);
         expected = primary.store.collection("docs").to_vec();
         let frames = primary.export_wal_since(0).unwrap();
-        assert_eq!(frames[8], 3);
+        assert_eq!(frames[8], if cfg!(feature = "wal-lz4-trial") { 7 } else { 3 });
         log_len = frames.len();
         let dense_vector_bytes = expected
             .iter()

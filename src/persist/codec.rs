@@ -415,6 +415,7 @@ pub(crate) struct EncodeJob {
     pub(super) collection: String,
     pub(super) rows: std::sync::Arc<Vec<Row>>,
     pub(super) uniform_keys: bool,
+    pub(super) full_sync: bool,
     pub(super) bytes: Vec<u8>,
     #[allow(dead_code)]
     pub(super) mode: u8,
@@ -428,6 +429,7 @@ impl EncodeJob {
             collection,
             rows,
             uniform_keys,
+            full_sync,
             bytes,
             #[cfg(test)]
             mode,
@@ -441,13 +443,14 @@ impl EncodeJob {
                 panic!("injected WAL encoder panic");
             }
             #[allow(unused_mut)]
-            let mut staged = prepare_insert_columns_ext(
+            let mut staged = prepare_insert_columns_for_sync(
                 generation,
                 next_id,
                 &collection,
                 &rows,
                 uniform_keys,
                 bytes,
+                full_sync,
             );
             #[cfg(test)]
             if mode == 3 {
@@ -486,6 +489,7 @@ pub(crate) fn start_insert_encoding(
         collection: collection.to_owned(),
         rows,
         uniform_keys,
+        full_sync: persist.sync == SyncMode::Full,
         bytes,
         mode,
         reply,
@@ -565,7 +569,33 @@ pub(crate) fn prepare_insert_columns_ext(
     collection: &str,
     rows: &[Row],
     uniform_keys: bool,
+    bytes: Vec<u8>,
+) -> PreparedInsert {
+    prepare_insert_columns_for_sync(generation, next_id, collection, rows, uniform_keys, bytes, false)
+}
+
+fn checksum_prepared_payload(mut magic: [u8; 4], bytes: &mut Vec<u8>, full_sync: bool) -> ([u8; 4], [u8; 4]) {
+    #[cfg(feature = "wal-lz4-trial")]
+    if full_sync && magic == LOG_MAGIC_SPARSE && (1024 * 1024..=super::types::MAX_RECORD as usize - 5).contains(&bytes.len()) {
+        use lz4::block::{compress, CompressionMode};
+        if let Ok(packed) = compress(bytes, Some(CompressionMode::FAST(16)), true)
+            && packed.len() < bytes.len()
+        {
+            *bytes = packed;
+            magic = *b"LIN\x07";
+        }
+    }
+    (magic, compute_frame_checksum(&magic, bytes))
+}
+
+fn prepare_insert_columns_for_sync(
+    generation: u64,
+    next_id: u64,
+    collection: &str,
+    rows: &[Row],
+    uniform_keys: bool,
     mut bytes: Vec<u8>,
+    full_sync: bool,
 ) -> PreparedInsert {
     if let Some((magic, fields)) = encode_insert_rows_direct_ext(
         generation,
@@ -576,7 +606,7 @@ pub(crate) fn prepare_insert_columns_ext(
         &mut bytes,
     ) {
         let n = rows.len() as u32;
-        let checksum = compute_frame_checksum(&magic, &bytes);
+        let (magic, checksum) = checksum_prepared_payload(magic, &mut bytes, full_sync);
         let pack = Pack::InsertCols {
             collection: collection.to_owned(),
             fields: fields.clone(),
@@ -608,7 +638,7 @@ pub(crate) fn prepare_insert_columns_ext(
             ) {
                 Ok(magic) => {
                     cols.clear();
-                    let checksum = compute_frame_checksum(&magic, &bytes);
+                    let (magic, checksum) = checksum_prepared_payload(magic, &mut bytes, full_sync);
                     PreparedEncoding::Ready(EncodedColumns {
                         generation,
                         next_id,
