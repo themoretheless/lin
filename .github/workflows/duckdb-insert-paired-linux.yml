@@ -1,7 +1,7 @@
-name: Qualify linked Linux allocator against DuckDB on main
+name: Profile first and repeated 100k inserts
 on:
   push:
-    branches: [codex/main-partitioned-fts]
+    branches: [codex/partitioned-insert-stage-profile]
 permissions:
   contents: read
 jobs:
@@ -54,32 +54,14 @@ jobs:
               if ldd "$binary" | grep -q tcmalloc; then exit 1; fi
             done
           fi
-          python3 -m pip install -r scripts/bench-peers-requirements.lock
-      - name: Record huge-page and glibc settings
-        if: steps.cpu.outputs.matched == 'true'
-        run: |
-          cat /sys/kernel/mm/transparent_hugepage/enabled >> allocator-provenance.txt
-          loader=$(ldd target/release/lin-peer-worker | awk '/ld-linux/ { print $1 }')
-          "$loader" --list-tunables > glibc-tunables.txt
-          grep -q '^glibc.malloc.hugetlb:' glibc-tunables.txt
-      - name: Measure paired first and subsequent insertions
-        if: steps.cpu.outputs.matched == 'true'
-        run: |
-          set -o pipefail
           git rev-parse HEAD > duckdb-provenance.txt
-          uname -a >> duckdb-provenance.txt
-          lscpu >> duckdb-provenance.txt
-          rustc -Vv >> duckdb-provenance.txt
           sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
-          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+          python3 scripts/profile-partitioned-stages.py target/release/lin-peer-worker > stages.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: paired-duckdb-insert-${{ matrix.replica }}
           path: |
             runner-cpu.txt
-            allocator-provenance.txt
-            glibc-tunables.txt
-            duckdb-results.json
-            duckdb-summary.txt
+            stages.json
             duckdb-provenance.txt

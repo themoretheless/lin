@@ -3493,8 +3493,10 @@ impl Store {
         if collection == "docs" {
             self.flush_fts_deferred_docs();
         }
+        let timer = std::time::Instant::now();
         self.collection_mut(collection).reserve(built.len());
         self.row_maps_reserve(collection, built.len());
+        eprintln!("insert_profile reserve {}", timer.elapsed().as_nanos());
         let has_unique = self
             .indexes
             .values()

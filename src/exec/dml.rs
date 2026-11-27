@@ -984,8 +984,10 @@ impl Db {
         } else {
             None
         };
+        let timer = std::time::Instant::now();
         let (built, all_uniform, all_embedded) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
+        eprintln!("insert_profile build {}", timer.elapsed().as_nanos());
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
