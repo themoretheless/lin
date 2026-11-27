@@ -1,0 +1,85 @@
+name: Qualify linked Linux allocator against DuckDB on main
+on:
+  push:
+    branches: [codex/current-main-duckdb-paired]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-22.04, replica: amd-1}
+          - {runner: ubuntu-22.04, replica: amd-2}
+          - {runner: ubuntu-22.04, replica: amd-3}
+          - {runner: ubuntu-22.04, replica: amd-4}
+          - {runner: ubuntu-24.04-arm, replica: arm64}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Record CPU and select target hosts
+        id: cpu
+        run: |
+          lscpu > runner-cpu.txt
+          if [[ "$(uname -m)" = aarch64 ]] || grep -Eq 'AMD EPYC (7763|9V74|9V45)' runner-cpu.txt; then
+            echo 'matched=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.cpu.outputs.matched == 'true'
+        with:
+          toolchain: '1.96.0'
+      - uses: actions/setup-python@v6
+        if: steps.cpu.outputs.matched == 'true'
+        with:
+          python-version: '3.14'
+      - name: Build Lin peer worker and install pinned Python peers
+        if: steps.cpu.outputs.matched == 'true'
+        run: |
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            sudo apt-get update -qq
+            (cd "$RUNNER_TEMP" && apt-get download libgoogle-perftools-dev)
+            dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
+            export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
+          fi
+          scripts/build-linux-release.sh
+          if [[ "$(uname -m)" = x86_64 ]]; then
+            for binary in target/release/{lin,lin-peer-worker}; do
+              nm --defined-only "$binary" > symbols.txt
+              grep -Eq ' [TW] malloc$' symbols.txt
+              grep -Eq ' [TW] tc_malloc$' symbols.txt
+              if ldd "$binary" | grep -q tcmalloc; then exit 1; fi
+            done
+          fi
+          python3 -m pip install -r scripts/bench-peers-requirements.lock
+      - name: Record huge-page and glibc settings
+        if: steps.cpu.outputs.matched == 'true'
+        run: |
+          cat /sys/kernel/mm/transparent_hugepage/enabled >> allocator-provenance.txt
+          loader=$(ldd target/release/lin-peer-worker | awk '/ld-linux/ { print $1 }')
+          "$loader" --list-tunables > glibc-tunables.txt
+          grep -q '^glibc.malloc.hugetlb:' glibc-tunables.txt
+      - name: Measure paired first and subsequent insertions
+        if: steps.cpu.outputs.matched == 'true'
+        run: |
+          set -o pipefail
+          git rev-parse HEAD > duckdb-provenance.txt
+          uname -a >> duckdb-provenance.txt
+          lscpu >> duckdb-provenance.txt
+          rustc -Vv >> duckdb-provenance.txt
+          sha256sum target/release/lin-peer-worker >> duckdb-provenance.txt
+          python3 scripts/bench-duckdb-insert-paired.py target/release/lin-peer-worker duckdb-results.json | tee duckdb-summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paired-duckdb-insert-${{ matrix.replica }}
+          path: |
+            runner-cpu.txt
+            allocator-provenance.txt
+            glibc-tunables.txt
+            duckdb-results.json
+            duckdb-summary.txt
+            duckdb-provenance.txt
