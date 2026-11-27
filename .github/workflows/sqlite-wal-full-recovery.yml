@@ -1,7 +1,7 @@
 name: SQLite WAL FULL with verified Lin recovery
 on:
   push:
-    branches: [codex/main-release-lto-ab]
+    branches: [codex/ordered-batch-unique]
 permissions:
   contents: read
 jobs:
@@ -46,10 +46,7 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             export LIN_TCMALLOC_ARCHIVE="$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a"
           fi
-          CARGO_PROFILE_RELEASE_LTO=thin scripts/build-linux-release.sh
-          cp target/release/lin-peer-worker "$RUNNER_TEMP/thin-worker"
-          CARGO_PROFILE_RELEASE_LTO=fat scripts/build-linux-release.sh
-          sha256sum "$RUNNER_TEMP/thin-worker" target/release/lin-peer-worker > lto-binaries.txt
+          scripts/build-linux-release.sh
           if [[ "$(uname -m)" = x86_64 ]]; then
             for binary in target/release/{lin,lin-peer-worker}; do
               nm --defined-only "$binary" > symbols.txt
@@ -60,14 +57,16 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/thin-worker" | tee summary.txt
+          git worktree add --detach "$RUNNER_TEMP/base" 1bc367fef8d67ce443821746a02ed0ab28151708
+          (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
+          sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
+          python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wal-full-${{ matrix.replica }}
           path: |
             runner-cpu.txt
-            lto-binaries.txt
             provenance.txt
             wal-full.json
             summary.txt

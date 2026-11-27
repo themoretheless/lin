@@ -1732,6 +1732,29 @@ fn check_batch_unique_records(
     docs_by_uri: &FxHashMap<Arc<str>, usize>,
     col_len: usize,
 ) -> Result<bool, Error> {
+    // Strict order proves that a batch contains no equal keys. Length first
+    // also handles numbered text IDs across digit-width changes.
+    if col_len == 0 && records.len() >= 512 {
+        let ordered = |position: usize, require_nonempty: bool| {
+            let mut previous: Option<&str> = None;
+            for record in records {
+                let Some((_, Value::String(value))) = record.fields.get(position) else {
+                    return false;
+                };
+                let key = value.as_ref();
+                if (require_nonempty && key.is_empty())
+                    || previous.is_some_and(|last| (last.len(), last) >= (key.len(), key))
+                {
+                    return false;
+                }
+                previous = Some(key);
+            }
+            true
+        };
+        if ordered(id_pos, true) && uri_pos_opt.is_none_or(|position| ordered(position, false)) {
+            return Ok(true);
+        }
+    }
     BATCH_DEDUP_SETS.with(|cell| {
         let mut clear_guard = DedupSetsClearGuard {
             guard: cell.borrow_mut(),
