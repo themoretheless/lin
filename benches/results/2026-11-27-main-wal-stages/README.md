@@ -415,3 +415,21 @@ Intel(R) Xeon(R) 6975P-C, PostgreSQL 16.16. Каждый из шести пор�
 | 100000 | 225.089 | 544.844 | 452.675 | 12/12 |
 
 [Полные тройки измерений](https://github.com/themoretheless/lin/actions/runs/46047148129)
+
+### Серверные INSERT через нативные Rust-клиенты
+
+Таймер и верификация строк в Rust у обеих сторон. Lin FULL по TCP и нативные postgres binary COPY, MySQL prepared multi-row INSERT или MongoDB insert_many. Три отдельных парных прогона. Варианты чередуются, по 12 пар на размер. 100k — десять подтверждений по 10k. MongoDB — single-node replica set, majority и journal=true. MySQL — InnoDB flush_log_at_trx_commit=1. PostgreSQL — fsync, synchronous_commit, full_page_writes включены.
+
+| CPU | Движок | Строк | Lin, мс | Второй движок, мс | Побед Lin |
+|---|---|---:|---:|---:|---:|
+| Intel(R) Xeon(R) 6975P-C | postgres | 1000 | 4.649 | 5.231 | 12/12 |
+| Intel(R) Xeon(R) 6975P-C | postgres | 10000 | 24.731 | 41.402 | 12/12 |
+| Intel(R) Xeon(R) 6975P-C | postgres | 100000 | 217.831 | 459.022 | 12/12 |
+| AMD EPYC 9V74 80-Core Processor | mongo | 1000 | 4.742 | 13.318 | 12/12 |
+| AMD EPYC 9V74 80-Core Processor | mongo | 10000 | 32.216 | 120.653 | 12/12 |
+| AMD EPYC 9V74 80-Core Processor | mongo | 100000 | 305.784 | 1317.153 | 12/12 |
+| Intel(R) Xeon(R) 6975P-C | mysql | 1000 | 4.747 | 14.112 | 12/12 |
+| Intel(R) Xeon(R) 6975P-C | mysql | 10000 | 24.509 | 103.271 | 12/12 |
+| Intel(R) Xeon(R) 6975P-C | mysql | 100000 | 222.076 | 956.364 | 12/12 |
+
+[PostgreSQL](https://github.com/themoretheless/lin/actions/runs/46048621898) · [MySQL и MongoDB](https://github.com/themoretheless/lin/actions/runs/46048771905)
