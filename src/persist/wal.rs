@@ -792,6 +792,15 @@ pub(crate) fn write_frame_precomputed(
     else {
         return Err(io_err("log record exceeds 16MiB"));
     };
+    #[cfg(feature = "wal-lz4-trial")]
+    if sync == SyncMode::Full && *magic == LOG_MAGIC_SPARSE && payload.len() >= 1024 * 1024 {
+        use lz4::block::compress;
+        if let Ok(packed) = compress(payload, None, true)
+            && packed.len() < payload.len()
+        {
+            return write_frame(log, b"LIN\x07", &packed, sync, log_bytes);
+        }
+    }
     let codec = magic[3];
     write_frame_bytes(log, codec, payload, checksum, len as u32, *log_bytes).map_err(io_err)?;
 
@@ -1405,6 +1414,20 @@ pub(super) fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord,
             2 => LOG_MAGIC_V2,
             3 => LOG_MAGIC_SPARSE,
             5 => LOG_MAGIC_DICTIONARY,
+            #[cfg(feature = "wal-lz4-trial")]
+            7 => {
+                let packed = &payload[1..end];
+                let size = packed.get(..4).ok_or_else(|| io_err("short LZ4 WAL block"))?;
+                let size = u32::from_le_bytes(size.try_into().unwrap());
+                if size == 0 || size > MAX_RECORD - 5 {
+                    return Err(io_err("invalid decoded LZ4 WAL length"));
+                }
+                let raw = lz4::block::decompress(&packed[4..], Some(size as i32)).map_err(io_err)?;
+                if raw.len() != size as usize {
+                    return Err(io_err("LZ4 WAL length mismatch"));
+                }
+                return decode_column_record(&raw, true).map_err(|_| io_err("bad LZ4 sparse WAL payload"));
+            }
             #[cfg(any(feature = "compress-wal", feature = "compress-flate"))]
             4 => {
                 use flate2::read::GzDecoder;
