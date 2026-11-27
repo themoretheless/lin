@@ -1841,6 +1841,52 @@ fn sparse_value_slot(bits: u32) -> usize {
     if slot == 255 { 0 } else { slot }
 }
 
+#[cfg(feature = "wal-delta-trial")]
+fn encode_small_cached_vectors(rows: &[Row], fi: usize, out: &mut Vec<u8>) -> Option<()> {
+    let mut cache = [0u32; 255];
+    for row in rows {
+        let Cell::Vec(vector) = &row.cells_slice()[fi] else { return None };
+        let dim = u32::try_from(vector.len()).ok()?.checked_add(1)?;
+        out.extend_from_slice(&dim.to_le_bytes());
+        let count_offset = out.len();
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut count = 0u32;
+        let mut last = 0;
+        for (block, chunk) in vector.chunks(8).enumerate() {
+            let mut mask = 0u32;
+            if cfg!(target_feature = "neon") && chunk.len() == 8 {
+                #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+                { mask = unsafe { presence_mask8(chunk) }; }
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+                for (i, x) in chunk.iter().enumerate() { mask |= u32::from(x.to_bits() != 0) << i; }
+            } else {
+                for (i, x) in chunk.iter().enumerate() { mask |= u32::from(x.to_bits() != 0) << i; }
+            }
+            while mask != 0 {
+                let offset = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let pos = (block * 8 + offset) as u32;
+                let mut gap = pos - last;
+                last = pos;
+                while gap >= 128 { out.push(gap as u8 | 128); gap >>= 7; }
+                out.push(gap as u8);
+                let bits = chunk[offset].to_bits();
+                let slot = sparse_value_slot(bits);
+                if cache[slot] == bits {
+                    out.push(slot as u8);
+                } else {
+                    cache[slot] = bits;
+                    out.push(255);
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+                count += 1;
+            }
+        }
+        out[count_offset..count_offset+4].copy_from_slice(&count.to_le_bytes());
+    }
+    Some(())
+}
+
 fn encode_insert_rows_direct_at(
     start_off: usize,
     rec_gen: u64,
@@ -2109,6 +2155,14 @@ fn encode_insert_rows_direct_at(
                             buf.truncate(mark);
                             try_raw_sparse = has_empty || (dict_ok && exact_sparse_bytes < dense);
                         }
+                    }
+                    #[cfg(feature = "wal-delta-trial")]
+                    if try_raw_sparse && start_off == 9 && (512..2048).contains(&rows.len()) {
+                        buf.push(10);
+                        encode_small_cached_vectors(rows, fi, buf)?;
+                        accepted_sparse = has_empty || buf.len() - mark - 1 < dense;
+                        if !accepted_sparse { buf.truncate(mark); }
+                        try_raw_sparse = false;
                     }
                     if try_raw_sparse {
                         buf.push(7);

@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/main-wal-delta-value-cache]
+    branches: [codex/small-direct-value-cache]
 
 permissions:
   contents: read
@@ -22,6 +22,8 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.0"
@@ -34,11 +36,21 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
-          cargo rustc --no-default-features --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          build_worker() {
+            cargo rustc --no-default-features --locked --release -p lin-peer-worker --bin embedded-native "$@" -- "${link[@]}"
+          }
+          git show 3b967b4c5:src/persist/codec.rs > src/persist/codec.rs
+          build_worker
           cp target/release/embedded-native target/release/typed-baseline
-          cargo rustc --no-default-features --features lin/wal-delta-trial --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          git show 91837f13229463b1c1bf279379208c6eeec4353f:src/persist/codec.rs > src/persist/codec.rs
+          build_worker --features lin/wal-delta-trial
+          cp target/release/embedded-native target/release/typed-two-pass
+          git restore src/persist/codec.rs
+          build_worker --features lin/wal-delta-trial
           for n in 1000 10000; do
             LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
+            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/scalar-$n" target/release/typed-two-pass lin-wal "$n" 1 "$(mktemp -d)"
+            cmp "$RUNNER_TEMP/wal-$n" "$RUNNER_TEMP/scalar-$n"
           done
           python3 - <<'PYCODE'
           import os
@@ -46,16 +58,16 @@ jobs:
           for size, codec in [(1000, 3), (10000, 3)]:
               data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
               start = 8 + int.from_bytes(data[4:8], "little")
-              assert len(data) == {1000: 250461-86078, 10000: 2636081-914922}[size]
+              assert len(data) == {1000: 164383, 10000: 1721159}[size]
               assert data[start + 8] == codec
               assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
           PYCODE
           lscpu > cpu.txt
-          python3 scripts/typed-wal-triplets.py
+          python3 scripts/typed-wal-four-way.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            typed-wal-triplets.json
+            typed-wal-four-way.json
