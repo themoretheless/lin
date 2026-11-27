@@ -2034,6 +2034,7 @@ fn build_batch_shape_rows_into(
             }
         })
         .collect::<Vec<_>>();
+    let shape = template.shape().expect("nonempty insert fields");
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
     let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
@@ -2089,30 +2090,23 @@ fn build_batch_shape_rows_into(
             } else {
                 None
             };
-            let mut row = template.clone();
-            for (cell, slot) in row.values_mut().zip(&slots) {
-                match slot {
-                    ShapeSlot::Source(src) => {
-                        *cell = value_cell(&record.fields[*src].1, now);
-                    }
-                    ShapeSlot::Hash(b_src) => {
-                        if let Value::String(body) = &record.fields[*b_src].1 {
-                            *cell = Cell::Text(if total_n >= 512 && body.len() <= 64 {
-                                content_hash_arc(body.as_ref())
-                            } else {
-                                cached_content_hash(body.as_ref())
-                            });
+            let cells = slots.iter().map(|slot| match slot {
+                ShapeSlot::Source(src) => value_cell(&record.fields[*src].1, now),
+                ShapeSlot::Hash(b_src) => {
+                    if let Value::String(body) = &record.fields[*b_src].1 {
+                        Cell::Text(if total_n >= 512 && body.len() <= 64 {
+                            content_hash_arc(body.as_ref())
                         } else {
-                            all_same = false;
-                        }
-                    }
-                    ShapeSlot::Embed => {
-                        if let Some(v) = emb_vec.take() {
-                            *cell = Cell::Vec(v);
-                        }
+                            cached_content_hash(body.as_ref())
+                        })
+                    } else {
+                        all_same = false;
+                        Cell::Null
                     }
                 }
-            }
+                ShapeSlot::Embed => emb_vec.take().map_or(Cell::Null, Cell::Vec),
+            });
+            let row = Row::from_parts(Arc::clone(shape), cells);
             slot_out.write(row);
         }
     };
