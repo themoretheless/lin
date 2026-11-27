@@ -2440,3 +2440,37 @@ pub fn cols_to_rows(fields: &[String], cols: &[ColData], n: usize) -> Vec<crate:
     rows
 }
 
+
+#[cfg(test)]
+mod sparse_dictionary_equivalence {
+    use super::*;
+
+    #[test]
+    fn matches_dense_reference_at_width_and_dictionary_boundaries() {
+        let mut vectors = vec![None, Some(vec![]), Some(vec![0.0; 8])];
+        for dimension in [65536, 65537] {
+            for distinct in [1, 16, 17] {
+                let mut row = vec![0.0; dimension];
+                for i in 0..distinct {
+                    row[i * 3] = match i {
+                        0 => -0.0,
+                        1 => f32::from_bits(0x7fc01234),
+                        2 => f32::INFINITY,
+                        _ => i as f32,
+                    };
+                }
+                row[dimension - 1] = row[0];
+                vectors.push(Some(row));
+            }
+        }
+        let rows = || vectors.iter().map(Option::as_deref);
+        let mut sparse = Vec::new();
+        append_sparse_iter_scalar(rows(), &mut sparse).unwrap();
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        let accepted = append_dictionary_rows(rows(), &mut expected, sparse.len()).unwrap();
+        assert!(accepted);
+        assert_eq!(dictionary_from_sparse(&sparse, &mut actual), accepted);
+        assert_eq!(actual, expected);
+    }
+}
