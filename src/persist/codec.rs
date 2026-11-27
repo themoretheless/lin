@@ -1952,10 +1952,36 @@ fn encode_insert_rows_direct_at(
     let mut dictionary_codec = false;
     let mut sparse_decoded_bytes = 0usize;
 
+    #[cfg(feature = "wal-delta-trial")]
+    let mut prefix_budget = MAX_RECORD as usize;
     for (fi, f) in fields.iter().enumerate() {
         put_str(buf, f);
         match col_types[fi] {
             DirectColType::Text => {
+                #[cfg(feature = "wal-delta-trial")]
+                if start_off == 9 && rows.len() >= 128 {
+                    let mark = buf.len();
+                    let mut previous = &[][..];
+                    let mut decoded = 0usize;
+                    buf.push(11);
+                    for row in rows {
+                        let text = row.cells_slice()[fi].text()?.as_bytes();
+                        decoded = decoded.checked_add(text.len() + 4)?;
+                        if text.len() > 127 || decoded > prefix_budget {
+                            buf.truncate(mark);
+                            break;
+                        }
+                        let common = text.iter().zip(previous).take_while(|(a,b)| a == b).count();
+                        buf.push(common as u8);
+                        buf.push((text.len() - common) as u8);
+                        buf.extend_from_slice(&text[common..]);
+                        previous = text;
+                    }
+                    if buf.len() > mark {
+                        prefix_budget -= decoded;
+                        continue;
+                    }
+                }
                 buf.push(1);
                 for r in rows {
                     if let Some(s) = r.cells_slice()[fi].text() {
@@ -2566,6 +2592,8 @@ pub(super) fn decode_column_record_mode(
                 return Err(());
             }
             let mut sparse_decoded_bytes = 0usize;
+            #[cfg(feature = "wal-delta-trial")]
+            let mut prefix_budget = MAX_RECORD as usize;
             let mut fields = Vec::with_capacity(nf);
             let mut cols = Vec::with_capacity(nf);
             for _ in 0..nf {
@@ -2577,6 +2605,30 @@ pub(super) fn decode_column_record_mode(
                 i += 1;
                 let col = match ct {
                     0 => ColData::Null,
+                    #[cfg(feature = "wal-delta-trial")]
+                    11 => {
+                        if n as usize > (buf.len() - i) / 2 || n as usize > prefix_budget / 4 {
+                            return Err(());
+                        }
+                        let mut values: Vec<Arc<str>> = Vec::with_capacity(n as usize);
+                        let mut scratch = [0u8; 127];
+                        let mut previous_len = 0usize;
+                        for _ in 0..n {
+                            let header = buf.get(i..i + 2).ok_or(())?;
+                            i += 2;
+                            let common = usize::from(header[0]);
+                            let suffix = usize::from(header[1]);
+                            let len = common + suffix;
+                            if common > previous_len || len > scratch.len() { return Err(()); }
+                            prefix_budget = prefix_budget.checked_sub(len + 4).ok_or(())?;
+                            scratch[common..len].copy_from_slice(buf.get(i..i + suffix).ok_or(())?);
+                            i += suffix;
+                            let text = std::str::from_utf8(&scratch[..len]).map_err(|_| ())?;
+                            values.push(Arc::from(text));
+                            previous_len = len;
+                        }
+                        ColData::Text(values)
+                    }
                     1 => {
                         let mut v: Vec<Arc<str>> = Vec::with_capacity(n as usize);
                         if n < 8 {
