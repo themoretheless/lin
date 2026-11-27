@@ -252,6 +252,16 @@ impl Row {
         Shape::of_sorted(sorted.into_iter())
     }
 
+    /// Rows sharing a shape can reuse field positions from the first row.
+    pub(crate) fn share_field_positions(rows: &[Self]) -> bool {
+        let Some((first, rest)) = rows.split_first() else {
+            return false;
+        };
+        first.shape().is_some_and(|shape| {
+            rest.iter().all(|row| row.shape().is_some_and(|other| Arc::ptr_eq(shape, other)))
+        })
+    }
+
     /// This row's shape (`None` for the empty row).
     #[inline]
     pub fn shape(&self) -> Option<&Arc<Shape>> {

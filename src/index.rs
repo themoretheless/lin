@@ -749,7 +749,7 @@ impl LiveIndex {
                 self.reverse.reserve(rows.len());
             }
             let first = &rows[0];
-            let uniform = rows[1..].iter().all(|r| r.len() == first.len());
+            let uniform = Row::share_field_positions(rows);
             if uniform && first.len() <= 32 && self.def.fields.len() <= 8 {
                 let mut slot_to_part = [None; 32];
                 let mut all_found = true;
