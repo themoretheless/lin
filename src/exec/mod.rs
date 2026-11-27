@@ -4868,6 +4868,7 @@ impl Db {
                                 has_null = true;
                                 continue;
                             }
+                            Cell::Text(_) | Cell::SmallText(_) if seen[0] => continue,
                             Cell::Text(_) | Cell::SmallText(_) => (0, Value::String(Arc::from(""))),
                             Cell::Int(_) => (1, Value::Int(0)),
                             Cell::Float(_) => (2, Value::Float(0.0)),
