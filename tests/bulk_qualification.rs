@@ -186,3 +186,19 @@ fn bulk_insert_survives_log_replay_unchanged() {
     assert_eq!(distinct.len(), ids.len());
     assert_eq!(ids.len(), 3260);
 }
+
+#[test]
+fn bulk_duplicate_id_across_reordered_worker_chunks_is_rejected() {
+    let mut db = Db::empty();
+    db.run(SCHEMA).unwrap();
+    let source = (0..1024).map(|i| {
+        let id = if i == 1023 { 0 } else { i };
+        if i < 512 {
+            format!(r#"{{id:"id-{id}",name:"name-{i}"}}"#)
+        } else {
+            format!(r#"{{name:"name-{i}",id:"id-{id}"}}"#)
+        }
+    }).collect::<Vec<_>>().join(",");
+    let outcome = db.run(&format!("insert t [{source}]"));
+    assert!(outcome.is_err(), "accepted duplicate id across reordered chunks");
+}

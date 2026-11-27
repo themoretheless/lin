@@ -2623,7 +2623,11 @@ fn build_insert_rows(
                 for c in 1..total_chunks {
                     let bi = c * chunk_size;
                     let same_shape = rows[bi].shape_arc().is_some_and(|s| Arc::ptr_eq(s, fs));
-                    all_uniform &= same_shape;
+                    // Stored rows have canonical key order. The uniqueness check
+                    // indexes source records, whose field order can differ.
+                    all_uniform = all_uniform && same_shape
+                        && records[bi].fields.iter().map(|(key, _)| key)
+                            .eq(records[0].fields.iter().map(|(key, _)| key));
                     if lossless_cols {
                         lossless_cols = same_shape
                             && rows[bi].cells_slice().len() == first_cells.len()
