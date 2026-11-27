@@ -14,5 +14,9 @@ Times are median paired differences in milliseconds. Negative values favor Lin. 
 | AMD EPYC 9V74 80-Core Processor / amd-4 | 10000 | repeat | -10.269 | -9.927 | +0.072 | 24/24 |
 | AMD EPYC 9V74 80-Core Processor / amd-4 | 100000 | first | +12.826 | +6.116 | -13.418 | 0/24 |
 | AMD EPYC 9V74 80-Core Processor / amd-4 | 100000 | repeat | -60.956 | -55.317 | -1.064 | 24/24 |
+| Neoverse-N2 / arm64 | 10000 | first | -11.282 | -10.577 | -0.160 | 24/24 |
+| Neoverse-N2 / arm64 | 10000 | repeat | -17.862 | -17.639 | -0.063 | 24/24 |
+| Neoverse-N2 / arm64 | 100000 | first | -86.602 | -84.953 | -3.215 | 24/24 |
+| Neoverse-N2 / arm64 | 100000 | repeat | -149.685 | -145.417 | -0.094 | 24/24 |
 
 Only runners with complete uploaded timing samples appear in the table. [Run and raw samples](https://github.com/themoretheless/lin/actions/runs/45997294522)
