@@ -26,6 +26,37 @@ const CRC32C_TABLE: [u32; 256] = {
     table
 };
 
+// Multiplication by x^(256 * 8) in the reflected CRC-32C field.
+const LANE_BYTES: usize = 256;
+const SHIFT_LANE: [[u32; 256]; 4] = {
+    let mut table = [[0; 256]; 4];
+    let mut byte = 0;
+    while byte < 4 {
+        let mut value = 0;
+        while value < 256 {
+            let mut crc = (value as u32) << (byte * 8);
+            let mut n = 0;
+            while n < LANE_BYTES {
+                crc = CRC32C_TABLE[(crc & 255) as usize] ^ (crc >> 8);
+                n += 1;
+            }
+            table[byte][value] = crc;
+            value += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
+#[inline]
+fn shift_lane(crc: u32) -> u32 {
+    let [a, b, c, d] = crc.to_le_bytes();
+    SHIFT_LANE[0][a as usize]
+        ^ SHIFT_LANE[1][b as usize]
+        ^ SHIFT_LANE[2][c as usize]
+        ^ SHIFT_LANE[3][d as usize]
+}
+
 /// Portable software fallback using precomputed Castagnoli table.
 #[inline]
 pub fn crc32c_table(mut crc: u32, data: &[u8]) -> u32 {
@@ -39,6 +70,19 @@ pub fn crc32c_table(mut crc: u32, data: &[u8]) -> u32 {
 #[target_feature(enable = "crc")]
 unsafe fn crc32c_aarch64(mut crc: u32, data: &[u8]) -> u32 {
     use core::arch::aarch64::*;
+    let mut groups = data.chunks_exact(3 * LANE_BYTES);
+    for group in &mut groups {
+        let (mut a, mut b, mut c) = (crc as u32, 0 as u32, 0 as u32);
+        for offset in (0..LANE_BYTES).step_by(8) {
+            let word =
+                |start: usize| u64::from_le_bytes(group[start..start + 8].try_into().unwrap());
+            a = __crc32cd(a, word(offset));
+            b = __crc32cd(b, word(LANE_BYTES + offset));
+            c = __crc32cd(c, word(2 * LANE_BYTES + offset));
+        }
+        crc = shift_lane(shift_lane(a as u32) ^ b as u32) ^ c as u32;
+    }
+    let data = groups.remainder();
     let mut chunks = data.chunks_exact(8);
     for chunk in &mut chunks {
         let &[b0, b1, b2, b3, b4, b5, b6, b7] = chunk else {
@@ -58,6 +102,19 @@ unsafe fn crc32c_aarch64(mut crc: u32, data: &[u8]) -> u32 {
 #[target_feature(enable = "sse4.2")]
 unsafe fn crc32c_x86_64(mut crc: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::*;
+    let mut groups = data.chunks_exact(3 * LANE_BYTES);
+    for group in &mut groups {
+        let (mut a, mut b, mut c) = (crc as u64, 0 as u64, 0 as u64);
+        for offset in (0..LANE_BYTES).step_by(8) {
+            let word =
+                |start: usize| u64::from_le_bytes(group[start..start + 8].try_into().unwrap());
+            a = _mm_crc32_u64(a, word(offset));
+            b = _mm_crc32_u64(b, word(LANE_BYTES + offset));
+            c = _mm_crc32_u64(c, word(2 * LANE_BYTES + offset));
+        }
+        crc = shift_lane(shift_lane(a as u32) ^ b as u32) ^ c as u32;
+    }
+    let data = groups.remainder();
     let mut chunks = data.chunks_exact(8);
     let mut crc64 = crc as u64;
     for chunk in &mut chunks {
@@ -135,6 +192,21 @@ pub fn hardware_crc32c(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lane_boundaries_match_serial_reference() {
+        let data: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        for n in [767, 768, 769, 1535, 1536, 1537, 8192] {
+            for prefix in [0, 1, 7, 256] {
+                let mut hasher = Hasher::new();
+                hasher.update(&data[..prefix]);
+                hasher.update(&data[prefix..n]);
+                assert_eq!(hasher.finalize(), !crc32c_table(!0, &data[..n]));
+            }
+        }
+    }
 
     #[test]
     fn test_crc32c_standard_vector() {
