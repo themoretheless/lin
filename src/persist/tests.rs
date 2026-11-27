@@ -1317,6 +1317,38 @@ mod dictionary_wal_tests {
         }
     }
 
+    #[test]
+    fn direct_row_starts_match_typed_columns_at_both_row_widths() {
+        use crate::store::Cell;
+        for width in [3, 9] {
+            for count in [1000, 1537] {
+                let rows: Vec<Row> = (0..count).map(|i| {
+                    let mut row = Row::new();
+                    for field in 0..width {
+                        row.insert(format!("f{field}"), Cell::Int(i as i64 + field));
+                    }
+                    let mut vector = vec![0.0; 128];
+                    vector[i % 128] = -0.0;
+                    vector[(i + 1) % 128] = f32::from_bits(0x7fc0_0001);
+                    row.insert("vector", Cell::Vec(vector.into()));
+                    row
+                }).collect();
+                let Pack::InsertCols { fields, cols, n, .. } =
+                    rows_to_insert_cols("docs", &rows, Vec::new()) else { panic!("column pack") };
+                let mut reference = Vec::new();
+                let magic = encode_insert_cols_v2(1, 2, "docs", &fields, &cols, n, &mut reference).unwrap();
+                for uniform in [false, true] {
+                    let mut actual = Vec::new();
+                    let (direct_magic, keys) =
+                        encode_insert_rows_direct_ext(1, 2, "docs", &rows, uniform, &mut actual).unwrap();
+                    assert_eq!(direct_magic, magic);
+                    assert_eq!(keys, fields);
+                    assert_eq!(actual, reference);
+                }
+            }
+        }
+    }
+
     /// Both encoders (from typed columns and straight from rows) make the same choice and
     /// produce frames that decode to the same vectors.
     #[test]
