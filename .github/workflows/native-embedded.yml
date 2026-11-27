@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/main-native-embedded-refresh]
+    branches: [codex/main-wal-lz4-fast64]
 
 permissions:
   contents: read
@@ -34,16 +34,27 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
-          cargo rustc --release --locked -p lin-peer-worker --bin embedded-native -- "${link[@]}"
-          git rev-parse HEAD:src > engine-tree.txt
-          rustc --version >> engine-tree.txt
+          cargo rustc --no-default-features --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          cp target/release/embedded-native target/release/typed-baseline
+          cargo rustc --no-default-features --features lin/wal-lz4-trial --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          for n in 1000 10000; do
+            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
+          done
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+          for size, codec in [(1000, 3), (10000, 7)]:
+              data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
+              start = 8 + int.from_bytes(data[4:8], "little")
+              assert data[start + 8] == codec
+              assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
+          PYCODE
           lscpu > cpu.txt
-          python3 scripts/native-embedded-pairs.py
+          python3 scripts/typed-wal-triplets.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
-            engine-tree.txt
             cpu.txt
-            embedded-results.json
+            typed-wal-triplets.json

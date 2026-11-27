@@ -91,6 +91,7 @@ fn main() -> Result<()> {
                     assert!(row.get("embedding").and_then(Cell::as_vec).is_some());
                 }
             }
+            #[cfg(feature = "duckdb-client")]
             "duckdb" => {
                 let mut db = duckdb::Connection::open_in_memory()?;
                 db.execute_batch(DDL)?;
