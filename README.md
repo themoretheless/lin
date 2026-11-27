@@ -312,6 +312,10 @@ export LIN_BENCH_MYSQL_URL='mysql://lin:lin@127.0.0.1:53306/lin'
 
 Dev-deps: `airbug` (unit) и `airbug-bench` (бенчи) с ветки `release`; плюс `postgres` / `mysql`.
 
+## Release-сборка для Linux
+
+Команда `scripts/build-linux-release.sh` собирает CLI `lin` и `lin-peer-worker`. На x86_64 GNU/Linux нужен статический архив `libtcmalloc_minimal.a` из пакета разработки gperftools. Путь к архиву можно задать через `LIN_TCMALLOC_ARCHIVE`. На ARM64 используется штатный аллокатор. [Результаты проверки кандидата](https://github.com/themoretheless/lin/blob/1914ef5bf/benches/results/2026-11-26-linux-linked-allocator.md)
+
 ## Запуск
 
 ```bash
