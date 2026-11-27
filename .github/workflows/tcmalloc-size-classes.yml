@@ -8,13 +8,14 @@ jobs:
   measure:
     strategy:
       matrix:
-        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+        runner: [ubuntu-22.04]
+        replica: [1, 2, 3, 4]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Measure usable allocations on native Linux
         run: |
           set -eu
-          lscpu | grep 'Model name'
+          lscpu | grep 'Model name' | tee cpu.txt
           link=()
           if [[ "$(uname -m)" = x86_64 ]]; then
             sudo apt-get update -qq
@@ -62,5 +63,7 @@ jobs:
           done | tee measurements.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: memory-${{ matrix.runner }}
-          path: measurements.txt
+          name: memory-${{ matrix.replica }}
+          path: |
+            measurements.txt
+            cpu.txt
