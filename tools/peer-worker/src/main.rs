@@ -72,6 +72,7 @@ fn measure_insert(
     timestamp: i64,
     durable: Option<&std::path::Path>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    lin::persist::set_wal_dictionary_writer(true);
     if n == 0 || samples == 0 {
         return Err("empty insert measurement".into());
     }

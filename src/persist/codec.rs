@@ -1004,6 +1004,7 @@ const DICTIONARY_MAX_VALUES: usize = 16;
 /// distinct values) follow raw `(u32 index, u32 bits)` entries. Values are compared and
 /// stored as bits, so `-0.0`, infinities and NaN payloads survive; `+0.0` is the absent
 /// value.
+#[cfg(test)]
 pub(super) fn append_dictionary_rows<'a>(
     rows: impl Iterator<Item = Option<&'a [f32]>>,
     out: &mut Vec<u8>,
@@ -1079,6 +1080,50 @@ pub(super) fn append_dictionary_rows<'a>(
     Ok(out.len() < give_up_at)
 }
 
+// The sparse encoder already removed positive zeroes and retained the original
+// float bits. Reuse its index/value pairs instead of traversing dense vectors again.
+fn dictionary_from_sparse(mut sparse: &[u8], out: &mut Vec<u8>) -> bool {
+    let limit = sparse.len();
+    while !sparse.is_empty() {
+        if out.len() >= limit { return false; }
+        let (dimension, rest) = sparse.split_at(4);
+        out.extend_from_slice(dimension);
+        let code = u32::from_le_bytes(dimension.try_into().unwrap());
+        sparse = rest;
+        if code == 0 { continue; }
+        let (count, rest) = sparse.split_at(4);
+        out.extend_from_slice(count);
+        let n = u32::from_le_bytes(count.try_into().unwrap()) as usize;
+        let (pairs, tail) = rest.split_at(n * 8);
+        sparse = tail;
+        let mut values = [[0u8; 4]; DICTIONARY_MAX_VALUES];
+        let mut used = 0;
+        let mut raw = false;
+        for entry in pairs.chunks_exact(8) {
+            let bits: [u8; 4] = entry[4..].try_into().unwrap();
+            if !values[..used].contains(&bits) {
+                if used == values.len() { raw = true; break; }
+                values[used] = bits;
+                used += 1;
+            }
+        }
+        if raw {
+            out.push(0);
+            out.extend_from_slice(pairs);
+            continue;
+        }
+        out.push(used as u8);
+        for bits in &values[..used] { out.extend_from_slice(bits); }
+        let width = if code <= 65537 { 2 } else { 4 };
+        for entry in pairs.chunks_exact(8) {
+            out.extend_from_slice(&entry[..width]);
+            let ordinal = values[..used].iter().position(|bits| bits[..] == entry[4..]).unwrap();
+            out.push(ordinal as u8);
+        }
+    }
+    out.len() < limit
+}
+
 /// A sparse vector column was just written at `mark` (its tag byte, then the rows). When
 /// the dictionary writer is on and the same rows are strictly smaller in the dictionary
 /// layout, replace the column in place and return `true`; the caller then frames the
@@ -1095,7 +1140,8 @@ fn rewrite_sparse_as_dictionary<'a>(
     debug_assert_eq!(buf.get(mark), Some(&7));
     let sparse_len = buf.len().saturating_sub(mark + 1);
     let mut dict = Vec::with_capacity(sparse_len);
-    if !append_dictionary_rows(rows, &mut dict, sparse_len)? {
+    let _ = rows;
+    if !dictionary_from_sparse(&buf[mark + 1..], &mut dict) {
         return Ok(false);
     }
     buf.truncate(mark);
