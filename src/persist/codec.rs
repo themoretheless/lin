@@ -1182,15 +1182,14 @@ fn rewrite_sparse_as_dictionary<'a>(
 
 #[inline]
 pub(super) fn append_sparse_cells_range(
-    cells: &[*const Cell],
-    num_fields: usize,
+    row_starts: &[*const Cell],
     fi: usize,
     start_row: usize,
     end_row: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    // Safety: all pointers in `cells` borrow from `rows: &[Row]` live for the duration of `encode_insert_rows_direct_ext`.
-    let iter = (start_row..end_row).map(|ri| match unsafe { &*cells[ri * num_fields + fi] } {
+    // Safety: each pointer starts a live row with at least fi + 1 contiguous cells; workers finish before the input is released.
+    let iter = (start_row..end_row).map(|ri| match unsafe { &*row_starts[ri].add(fi) } {
         Cell::Vec(emb) => Some(emb.as_ref()),
         _ => None,
     });
@@ -1198,20 +1197,18 @@ pub(super) fn append_sparse_cells_range(
 }
 
 pub(super) fn append_sparse_cells_serial(
-    cells: &[*const Cell],
-    num_fields: usize,
+    row_starts: &[*const Cell],
     fi: usize,
     num_rows: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    append_sparse_cells_range(cells, num_fields, fi, 0, num_rows, buf)
+    append_sparse_cells_range(row_starts, fi, 0, num_rows, buf)
 }
 
 struct SparseEncodeJob {
     chunk_idx: usize,
     cells_ptr: usize,
     cells_len: usize,
-    num_fields: usize,
     fi: usize,
     start_row: usize,
     end_row: usize,
@@ -1225,15 +1222,14 @@ struct SparseEncodePool {
 }
 
 pub(super) fn append_sparse_cells_parallel(
-    cells: &[*const Cell],
-    num_fields: usize,
+    row_starts: &[*const Cell],
     fi: usize,
     num_rows: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
     // Keep small column payloads on the committing thread.
     if num_rows <= 1024 {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_cells_serial(row_starts, fi, num_rows, buf);
     }
     static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
         std::sync::OnceLock::new();
@@ -1266,7 +1262,6 @@ pub(super) fn append_sparse_cells_parallel(
                         };
                         let res = append_sparse_cells_range(
                             slice,
-                            job.num_fields,
                             job.fi,
                             job.start_row,
                             job.end_row,
@@ -1293,14 +1288,14 @@ pub(super) fn append_sparse_cells_parallel(
     });
 
     let Ok(mut guard) = mutex.try_lock() else {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_cells_serial(row_starts, fi, num_rows, buf);
     };
     let Some(pool) = guard.as_mut() else {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_cells_serial(row_starts, fi, num_rows, buf);
     };
     let total_ways = (pool.workers.len() + 1).min(num_rows.div_ceil(128)).max(1);
     if total_ways <= 1 {
-        return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
+        return append_sparse_cells_serial(row_starts, fi, num_rows, buf);
     }
 
     let chunk_size = num_rows.div_ceil(total_ways);
@@ -1341,9 +1336,8 @@ pub(super) fn append_sparse_cells_parallel(
         let work_buf = drain_guard.reusable_bufs.pop().unwrap_or_default();
         let job = SparseEncodeJob {
             chunk_idx,
-            cells_ptr: cells.as_ptr() as usize,
-            cells_len: cells.len(),
-            num_fields,
+            cells_ptr: row_starts.as_ptr() as usize,
+            cells_len: row_starts.len(),
             fi,
             start_row,
             end_row,
@@ -1364,7 +1358,7 @@ pub(super) fn append_sparse_cells_parallel(
         }
     }
 
-    let first_res = append_sparse_cells_range(cells, num_fields, fi, 0, first_end, buf);
+    let first_res = append_sparse_cells_range(row_starts, fi, 0, first_end, buf);
 
     while drain_guard.pending > 0 {
         drain_guard.pending -= 1;
@@ -1396,7 +1390,7 @@ pub(super) fn append_sparse_cells_parallel(
     drop(drain_guard);
 
     if out_res.is_ok() && fallback_start < num_rows {
-        append_sparse_cells_range(cells, num_fields, fi, fallback_start, num_rows, buf)?;
+        append_sparse_cells_range(row_starts, fi, fallback_start, num_rows, buf)?;
     }
     out_res
 }
@@ -1459,22 +1453,22 @@ pub(crate) fn encode_insert_rows_direct_ext(
     }
 
     CELL_PTR_SCRATCH.with(|scratch| {
-        let mut cells = scratch.borrow_mut();
-        cells.clear();
-        cells.reserve(rows.len() * num_fields);
+        let mut row_starts = scratch.borrow_mut();
+        row_starts.clear();
+        row_starts.reserve(rows.len());
         if uniform_keys {
             for r in rows {
                 if r.len() != num_fields {
                     return None;
                 }
-                cells.extend(r.values().map(|c| c as *const Cell));
+                row_starts.push(r.values().as_slice().as_ptr());
             }
         } else {
             for r in rows {
                 if r.len() != num_fields || !r.keys().eq(first.keys()) {
                     return None;
                 }
-                cells.extend(r.values().map(|c| c as *const Cell));
+                row_starts.push(r.values().as_slice().as_ptr());
             }
         }
 
@@ -1503,7 +1497,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                 DirectColType::Text => {
                     buf.push(1);
                     for ri in 0..rows.len() {
-                        if let Some(s) = unsafe { (*cells[ri * num_fields + fi]).text() } {
+                        if let Some(s) = unsafe { (*row_starts[ri].add(fi)).text() } {
                             put_str(buf, s);
                         } else {
                             return None;
@@ -1513,7 +1507,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                 DirectColType::Int => {
                     buf.push(2);
                     for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
+                        match unsafe { &*row_starts[ri].add(fi) } {
                             Cell::Int(x) => buf.extend_from_slice(&x.to_le_bytes()),
                             _ => return None,
                         }
@@ -1522,7 +1516,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                 DirectColType::Float => {
                     buf.push(3);
                     for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
+                        match unsafe { &*row_starts[ri].add(fi) } {
                             Cell::Float(x) => buf.extend_from_slice(&x.to_le_bytes()),
                             _ => return None,
                         }
@@ -1531,7 +1525,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                 DirectColType::Bool => {
                     buf.push(4);
                     for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
+                        match unsafe { &*row_starts[ri].add(fi) } {
                             Cell::Bool(x) => buf.push(u8::from(*x)),
                             _ => return None,
                         }
@@ -1540,7 +1534,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                 DirectColType::Time => {
                     buf.push(5);
                     for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
+                        match unsafe { &*row_starts[ri].add(fi) } {
                             Cell::Time(x) => buf.extend_from_slice(&x.to_le_bytes()),
                             _ => return None,
                         }
@@ -1551,7 +1545,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                     let mut has_empty = false;
                     let mut first_emb: Option<&[f32]> = None;
                     for ri in 0..rows.len() {
-                        match unsafe { &*cells[ri * num_fields + fi] } {
+                        match unsafe { &*row_starts[ri].add(fi) } {
                             Cell::Vec(emb) => {
                                 if ri == 0 {
                                     first_emb = Some(emb.as_ref());
@@ -1583,7 +1577,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                         let mark = buf.len();
                         buf.push(7);
                         let payload_start = buf.len();
-                        if append_sparse_cells_parallel(&cells, num_fields, fi, rows.len(), buf)
+                        if append_sparse_cells_parallel(&row_starts, fi, rows.len(), buf)
                             .is_err()
                         {
                             buf.truncate(mark);
@@ -1598,7 +1592,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                                 .checked_mul(std::mem::size_of::<Option<Vec<f32>>>())?;
                             let mut next_decoded = sparse_decoded_bytes.checked_add(storage)?;
                             for ri in 0..rows.len() {
-                                if let Cell::Vec(emb) = unsafe { &*cells[ri * num_fields + fi] } {
+                                if let Cell::Vec(emb) = unsafe { &*row_starts[ri].add(fi) } {
                                     let bytes = emb.len().checked_mul(4)?;
                                     next_decoded = next_decoded
                                         .checked_add(bytes)
@@ -1608,7 +1602,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                             sparse_decoded_bytes = next_decoded;
                             sparse_codec = true;
                             let vectors = (0..rows.len()).map(|ri| {
-                                match unsafe { &*cells[ri * num_fields + fi] } {
+                                match unsafe { &*row_starts[ri].add(fi) } {
                                     Cell::Vec(emb) => Some(emb.as_ref()),
                                     _ => None,
                                 }
@@ -1621,7 +1615,7 @@ pub(crate) fn encode_insert_rows_direct_ext(
                     if !wrote_sparse {
                         buf.push(6);
                         for ri in 0..rows.len() {
-                            match unsafe { &*cells[ri * num_fields + fi] } {
+                            match unsafe { &*row_starts[ri].add(fi) } {
                                 Cell::Vec(emb) if !emb.is_empty() => {
                                     buf.extend_from_slice(&(emb.len() as u32).to_le_bytes());
                                     #[cfg(target_endian = "little")]
