@@ -1,7 +1,7 @@
 name: SQLite WAL FULL with verified Lin recovery
 on:
   push:
-    branches: [codex/qualify-worker-shapes]
+    branches: [codex/linux-wal-reserve-tail]
 permissions:
   contents: read
 jobs:
@@ -57,7 +57,7 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git worktree add --detach "$RUNNER_TEMP/base" 3b967b4c5b641ab9691d3daeccaf9dfe55d51dbd
+          git worktree add --detach "$RUNNER_TEMP/base" 1e6880ca6
           cp tools/peer-worker/src/main.rs "$RUNNER_TEMP/base/tools/peer-worker/src/main.rs"
           (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
           sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt

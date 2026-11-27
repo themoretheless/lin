@@ -475,7 +475,10 @@ fn reserve_wal_space_inner(log: &File, additional: usize, empty_only: bool) -> u
             return allocated;
         };
         let target_end = rounded.min(required.saturating_add(CHUNK));
-        let Ok(len) = libc::off_t::try_from(target_end) else {
+        let Ok(offset) = libc::off_t::try_from(metadata.len()) else {
+            return allocated;
+        };
+        let Ok(len) = libc::off_t::try_from(target_end - metadata.len()) else {
             return allocated;
         };
         if len <= 0 {
@@ -483,7 +486,7 @@ fn reserve_wal_space_inner(log: &File, additional: usize, empty_only: bool) -> u
         }
         // Preallocate physical extents on ext4/xfs without advancing st_size, so fdatasync
         // avoids block-allocation metadata updates while preserving exact WAL EOF framing.
-        let rc = unsafe { libc::fallocate(log.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len) };
+        let rc = unsafe { libc::fallocate(log.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, offset, len) };
         if rc == 0 {
             allocated.max(target_end)
         } else {
