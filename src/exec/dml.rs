@@ -988,10 +988,15 @@ impl Db {
             build_insert_rows(records, now, needs_embed, hashing_dim);
         // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
-        let needs_id = records.is_empty()
-            || records
-                .iter()
-                .any(|r| !r.fields.iter().any(|(k, _)| k == "id"));
+        let id_position = records.first().and_then(|record| {
+            record.fields.iter().position(|(key, _)| key == "id")
+        });
+        let needs_id = id_position.is_none_or(|position| {
+            records.iter().skip(1).any(|record| {
+                !record.fields.get(position).is_some_and(|(key, _)| key == "id")
+                    && !record.fields.iter().any(|(key, _)| key == "id")
+            })
+        });
         self.insert_bulk_built(
             collection,
             built,
