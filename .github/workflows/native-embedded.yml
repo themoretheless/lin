@@ -22,6 +22,8 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96.0"
@@ -40,15 +42,17 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
-          for binary in lin-peer-worker embedded-native; do
-            cargo rustc --locked --release -p lin-peer-worker --bin "$binary" -- "${link[@]}"
-          done
+          git show d03a29320938d06b05acb94df9b37b83f8c71c0f:src/exec/mod.rs > src/exec/mod.rs
+          cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
+          cp target/release/embedded-native target/release/typed-baseline
+          git restore src/exec/mod.rs
+          cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          python scripts/native-embedded-pairs.py
+          python scripts/typed-wal-triplets.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            embedded-results.json
+            typed-wal-triplets.json
