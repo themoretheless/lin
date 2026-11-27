@@ -5,6 +5,9 @@ mkdir "$scratch/build-profiles" "$scratch/training"
 control=fe271712731a6df8c8949ffc0a47339c529ee182
 git fetch --depth=1 origin "$control"
 git worktree add --detach "$scratch/control" "$control"
+# Keep the engine at main and run the identical durable/recovery harness on both.
+cp tools/peer-worker/src/main.rs "$scratch/control/tools/peer-worker/src/main.rs"
+cmp tools/peer-worker/src/main.rs "$scratch/control/tools/peer-worker/src/main.rs"
 (cd "$scratch/control" && scripts/build-linux-release.sh)
 cp "$scratch/control/target/release/lin-peer-worker" "$RUNNER_TEMP/thin-worker"
 RUSTFLAGS="-Cprofile-generate=$scratch/build-profiles" scripts/build-linux-release.sh
