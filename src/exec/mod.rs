@@ -5024,9 +5024,11 @@ impl Db {
         if self.store.is_disk_backed(collection) || self.cold_program_packs.is_some() {
             return Ok(None);
         }
+        let begin = std::time::Instant::now();
         let Some(has_null) = self.check_batch_types(collection, batch)? else {
             return Ok(None);
         };
+        let checked = std::time::Instant::now();
         let needs_embed = self.embedder.is_some()
             && self
                 .catalog
@@ -5060,13 +5062,17 @@ impl Db {
             };
             (rows, shape)
         };
+        let built = std::time::Instant::now();
         let n = rows.len();
         let prepared = self.prepare_stmts_checked(vec![Stmt::InsertRows {
             collection: collection.to_string(),
             rows: n,
         }])?;
         self.pending_insert_rows = Some((rows, shape));
+        let staged = std::time::Instant::now();
         let result = self.run_prepared_ext(&prepared, false);
+        let ended = std::time::Instant::now();
+        eprintln!("stages_ns {n} {} {} {} {}", (checked-begin).as_nanos(), (built-checked).as_nanos(), (staged-built).as_nanos(), (ended-staged).as_nanos());
         // Never leave rows staged for a later statement, whatever happened.
         self.pending_insert_rows = None;
         Ok(Some(result?.done))
