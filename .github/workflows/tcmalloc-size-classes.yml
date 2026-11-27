@@ -1,7 +1,7 @@
 name: Measure allocator size classes for INSERT
 on:
   push:
-    branches: [codex/profile-tcmalloc-size-classes]
+    branches: [codex/profile-allocator-touch]
 permissions:
   contents: read
 jobs:
@@ -25,17 +25,28 @@ jobs:
           cat > measure.cpp <<'CPP'
           #include <cstdio>
           #include <cstdlib>
-          #include <malloc.h>
-          int main() {
-              const size_t sizes[] = {216, 3072, 3088};
-              for (size_t size : sizes) {
-                  void* p = malloc(size);
-                  if (!p) return 1;
-                  const size_t usable = malloc_usable_size(p);
-                  if (usable < size) return 2;
-                  std::printf("requested=%zu usable=%zu\n", size, usable);
-                  free(p);
+          #include <cstring>
+          #include <chrono>
+          #include <sys/resource.h>
+          #include <vector>
+          using Clock = std::chrono::steady_clock;
+          int main(int argc, char** argv) {
+              if (argc != 2) return 1;
+              size_t size = std::strtoul(argv[1], nullptr, 10);
+              std::vector<void*> live(100000);
+              rusage before{}, after{};
+              getrusage(RUSAGE_SELF, &before);
+              auto start = Clock::now();
+              for (auto& p : live) {
+                  p = std::malloc(size);
+                  if (!p) return 2;
+                  std::memset(p, 42, 3072);
+                  asm volatile("" : : "r"(p) : "memory");
               }
+              auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
+              getrusage(RUSAGE_SELF, &after);
+              std::printf("%zu %lld %ld %ld\n",size,(long long)ns,after.ru_maxrss,after.ru_minflt-before.ru_minflt);
+              for (auto p : live) std::free(p);
           }
           CPP
           c++ measure.cpp "${link[@]}" -o measure
@@ -44,4 +55,12 @@ jobs:
             grep -E ' [TW] (tc_malloc|malloc_usable_size|malloc)$' symbols
             grep -Eq ' [TW] tc_malloc$' symbols
           fi
-          ./measure
+          for i in {1..12}; do
+            sizes=(3072 3088)
+            if ((i % 2 == 0)); then sizes=(3088 3072); fi
+            for size in "${sizes[@]}"; do ./measure "$size"; done
+          done | tee measurements.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memory-${{ matrix.runner }}
+          path: measurements.txt
