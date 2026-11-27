@@ -433,3 +433,18 @@ Intel(R) Xeon(R) 6975P-C, PostgreSQL 16.16. Каждый из шести пор�
 | Intel(R) Xeon(R) 6975P-C | mysql | 100000 | 222.076 | 956.364 | 12/12 |
 
 [PostgreSQL](https://github.com/themoretheless/lin/actions/runs/46048621898) · [MySQL и MongoDB](https://github.com/themoretheless/lin/actions/runs/46048771905)
+
+### Нативные Rust-бенчмарки на main: одноимённые сценарии
+
+Артефакт CI для 3b967b4c5, Linux x64. Сопоставлены только одинаковые имена сценариев с суффиксом lin и sqlite либо duckdb. Метрика — медиана wall ns/op из исходных наблюдений. Один процесс, 8 наблюдений на сценарий. Числа относятся к этой сборке cargo bench; модель CPU и привязка TCMalloc в артефакте не подтверждены.
+
+| Набор | Движок | Побед Lin | Сравнений |
+|---|---|---:|---:|
+| ci | sqlite | 16 | 16 |
+| ci | duckdb | 16 | 16 |
+| ci-mutations | sqlite | 13 | 14 |
+| ci-mutations | duckdb | 2 | 2 |
+
+compare/cold_update_1row_10k/lin против sqlite: 0.756344 и 0.670971 мс.
+
+[Нативный прогон и исходные наблюдения](https://github.com/themoretheless/lin/actions/runs/46033077242)
