@@ -6074,3 +6074,45 @@ fn declared_column_mirror_matches_row_pipeline() {
     decl.declare_columns("ev", &[]).unwrap();
     check(&mut plain, &mut decl, "undeclared");
 }
+
+#[test]
+fn concurrent_bulk_insert_encoder_start_recovers_each_database() {
+    let writers = 4;
+    let ready = Barrier::new(writers);
+    thread::scope(|scope| {
+        for writer in 0..writers {
+            let ready = &ready;
+            scope.spawn(move || {
+                let dir = tmp();
+                let recovered_dir = tmp();
+                let mut db = Db::open_with(&dir, lin::OpenOpts {
+                    sync: lin::SyncMode::Full, cold: false,
+                }).unwrap();
+                let rows: Vec<_> = (0..1000).map(|i| format!(
+                    r#"{{id:"{writer}-{i}",uri:"test://{writer}/{i}",title:"title {i}",body:"body {i}"}}"#
+                )).collect();
+                let insert = db.prepare(&format!("insert docs [{}]", rows.join(","))).unwrap();
+                ready.wait();
+                assert_eq!(insert.run(&mut db).unwrap().done.n, 1000);
+                let wal = lin::persist::log_path(&dir);
+                assert!(fs::metadata(&wal).unwrap().len() > 0);
+                fs::copy(wal, lin::persist::log_path(&recovered_dir)).unwrap();
+                let head = lin::persist::head_path(&dir);
+                if head.exists() {
+                    fs::copy(head, lin::persist::head_path(&recovered_dir)).unwrap();
+                }
+                let restored = Db::open(&recovered_dir).unwrap();
+                let actual = restored.store.collection("docs");
+                assert_eq!(actual.len(), 1000);
+                assert_eq!(actual, db.store.collection("docs"));
+                for (i, row) in actual.iter().enumerate() {
+                    assert_eq!(text(row, "id"), format!("{writer}-{i}"));
+                }
+                drop(restored);
+                drop(db);
+                fs::remove_dir_all(dir).unwrap();
+                fs::remove_dir_all(recovered_dir).unwrap();
+            });
+        }
+    });
+}
