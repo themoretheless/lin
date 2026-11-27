@@ -2645,6 +2645,7 @@ fn large_grouped_aggregates_match_reference() {
 #[test]
 fn bulk_docs_point_lookup_uses_each_rows_actual_fields() {
     let mut db = Db::empty();
+    db.run("index docs [title]").unwrap();
     let records: Vec<_> = (0..512)
         .map(|i| {
             let extra = if i % 2 == 0 { r#"layer:"wiki""# } else { r#"wing:"sys""# };
@@ -2658,4 +2659,9 @@ fn bulk_docs_point_lookup_uses_each_rows_actual_fields() {
         let row = db.store.point_get_docs_id_title(&id).unwrap();
         assert_eq!(text(&row, "title"), format!("title-{i}"));
     }
+    let by_title = db.run(r#"docs | title == "title-1" | take all"#).unwrap();
+    assert_eq!(ids(&by_title), ["d-1"]);
+    db.store.rebuild_row_maps_collection("docs");
+    let rebuilt = db.store.point_get_docs_id_title("d-1").unwrap();
+    assert_eq!(text(&rebuilt, "title"), "title-1");
 }
