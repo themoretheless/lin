@@ -223,3 +223,8 @@ pub fn run(src: &str) -> Result<Handle, Error> {
 
 #[doc(hidden)]
 pub static PROFILE_ROW_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+std::thread_local! {
+    #[doc(hidden)]
+    pub static PROFILE_EMBED_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}

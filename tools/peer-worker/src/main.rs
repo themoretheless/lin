@@ -11,9 +11,13 @@ struct CountingAllocator;
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 static COUNTS: [AtomicU64; 8193] = [const { AtomicU64::new(0) }; 8193];
+static EMBED_3088: AtomicU64 = AtomicU64::new(0);
 static LARGE_BYTES: AtomicU64 = AtomicU64::new(0);
 fn record_request(size: usize) {
     if lin::PROFILE_ROW_BUILD.load(Ordering::Relaxed) {
+        if size == 3088 && lin::PROFILE_EMBED_CALL.try_with(|active| active.get()).unwrap_or(false) {
+            EMBED_3088.fetch_add(1, Ordering::Relaxed);
+        }
         COUNTS[size.min(8192)].fetch_add(1, Ordering::Relaxed);
         if size >= 8192 {
             LARGE_BYTES.fetch_add(size as u64, Ordering::Relaxed);
@@ -158,6 +162,7 @@ fn measure_insert(
             affected
         };
         timings.push(start.elapsed().as_nanos() as f64);
+        eprintln!("embed_calls_3088 {}", EMBED_3088.swap(0, Ordering::Relaxed));
         for (size, count) in COUNTS.iter().enumerate() {
             let requests = count.swap(0, Ordering::Relaxed);
             if requests != 0 {

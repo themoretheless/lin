@@ -2783,7 +2783,12 @@ fn build_batch_shape_rows_into(
                     }
                 };
                 if all_embedded && t_str.or(b_str).or(s_str).is_some_and(|s| !s.is_empty()) {
-                    Some(batch.embed_parts([t_str, b_str, s_str]))
+                    crate::PROFILE_EMBED_CALL.with(|active| {
+                        active.set(true);
+                        let result = batch.embed_parts([t_str, b_str, s_str]);
+                        active.set(false);
+                        Some(result)
+                    })
                 } else {
                     all_embedded = false;
                     None
