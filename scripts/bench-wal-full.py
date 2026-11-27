@@ -31,7 +31,10 @@ def run_lin(worker, directory, rows, profile=False):
         frames = [line.split() for line in measured.splitlines() if line.startswith("frame_cost ")]
         if len(frames) != 1 or frames[0][-1] != "Full":
             raise ValueError(f"Unexpected measured WAL frames: {frames}")
+        phases = dict((key, int(value)) for _, key, value in (line.split() for line in measured.splitlines() if line.startswith("insert_phase ")))
+        if len(phases) != 4: raise ValueError(f"missing phases: {phases}")
         frame = dict(zip(("bytes", "write_ns", "sync_ns"), map(int, frames[0][1:4])))
+        frame["phases"] = phases
     if not (len(result.get("reopen_ns", [])) == 1 and result["reopen_ns"][0] > 0
             and any(Path(directory).iterdir())):
         raise ValueError("Lin worker did not confirm a durable database reopen")

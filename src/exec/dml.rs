@@ -984,9 +984,11 @@ impl Db {
         } else {
             None
         };
-        let (built, all_uniform, all_embedded) =
+        let build_clock = std::time::Instant::now();
+            let (built, all_uniform, all_embedded) =
             build_insert_rows(records, now, needs_embed, hashing_dim);
-        // Any record without an explicit id gets a generated one, wherever it sits in the
+        eprintln!("insert_phase build {}", build_clock.elapsed().as_nanos());
+            // Any record without an explicit id gets a generated one, wherever it sits in the
         // batch (deciding from the first record left later id-less rows without an id).
         let needs_id = records.is_empty()
             || records
@@ -1190,6 +1192,7 @@ impl Db {
             #[cfg(test)]
             PREENCODE_TEST_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let shared = Arc::new(std::mem::take(&mut built));
+            let submit_clock = std::time::Instant::now();
             let task = crate::persist::start_insert_encoding(
                 self.persist.as_mut().unwrap(),
                 generation,
@@ -1200,7 +1203,11 @@ impl Db {
                 bytes,
                 mode,
             );
+            eprintln!("insert_phase submit_pool {}", submit_clock.elapsed().as_nanos());
+            let maint_clock = std::time::Instant::now();
             let maintenance = self.maintain_insert_slab(collection, start, &shared);
+            eprintln!("insert_phase maintenance_pool {}", maint_clock.elapsed().as_nanos());
+            let wait_clock = std::time::Instant::now();
             let staged = match task {
                 Ok(reply) => reply.recv().unwrap_or_else(|_| {
                     crate::persist::prepare_insert_columns_ext(
@@ -1219,6 +1226,7 @@ impl Db {
                     job.encode()
                 }
             };
+            eprintln!("insert_phase wait_pool {}", wait_clock.elapsed().as_nanos());
             built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
             maintenance?;
             Some(staged)
@@ -1232,7 +1240,8 @@ impl Db {
                 .unwrap_or_default();
             let built_ref: &[Row] = &built;
             let (maint_res, direct_res) = std::thread::scope(|s| {
-                let enc_handle = s.spawn(move || {
+                let submit_clock = std::time::Instant::now();
+            let enc_handle = s.spawn(move || {
                     let res = crate::persist::encode_insert_rows_direct_ext(
                         generation,
                         next_id,
@@ -1243,9 +1252,14 @@ impl Db {
                     );
                     (res, encode_buf)
                 });
-                let maint = self.maintain_insert_slab(collection, start, built_ref);
-                let (res, buf) = enc_handle.join().unwrap_or((None, Vec::new()));
-                (maint, (res, buf))
+                eprintln!("insert_phase submit_scoped {}", submit_clock.elapsed().as_nanos());
+            let maint_clock = std::time::Instant::now();
+            let maint = self.maintain_insert_slab(collection, start, built_ref);
+                eprintln!("insert_phase maintenance_scoped {}", maint_clock.elapsed().as_nanos());
+            let wait_clock = std::time::Instant::now();
+            let (res, buf) = enc_handle.join().unwrap_or((None, Vec::new()));
+                eprintln!("insert_phase wait_scoped {}", wait_clock.elapsed().as_nanos());
+            (maint, (res, buf))
             });
             if let Some(p) = self.persist.as_mut() {
                 p.encode_buf = direct_res.1;
