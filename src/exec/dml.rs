@@ -2051,7 +2051,10 @@ fn build_batch_shape_rows_into(
     let mut all_same = true;
     let mut all_embedded = !needs_embed || can_inline_embed;
     let mut process_rows = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
-        for (slot_out, record) in out.iter_mut().zip(records) {
+        let mut samples = 0;
+        let mut elapsed = [0u128; 3];
+        for (index, (slot_out, record)) in out.iter_mut().zip(records).enumerate() {
+            let clock = (index % 31 == 7).then(std::time::Instant::now);
             let same_shape = record.fields.len() == first.fields.len()
                 && record
                     .fields
@@ -2066,6 +2069,7 @@ fn build_batch_shape_rows_into(
                 slot_out.write(record_row(record, now));
                 continue;
             }
+            let shape_ns = clock.map(|t| t.elapsed().as_nanos());
             let mut emb_vec = if let Some(batch) = embed_batch.as_deref_mut() {
                 let t_opt = title_idx.map(|i| &record.fields[i].1);
                 let b_opt = body_idx.map(|i| &record.fields[i].1);
@@ -2103,6 +2107,7 @@ fn build_batch_shape_rows_into(
             } else {
                 None
             };
+            let embed_end = clock.map(|t| t.elapsed().as_nanos());
             let mut row = template.clone();
             for (cell, slot) in row.values_mut().zip(&slots) {
                 match slot {
@@ -2128,7 +2133,14 @@ fn build_batch_shape_rows_into(
                 }
             }
             slot_out.write(row);
+            if let (Some(t), Some(shape), Some(embed)) = (clock, shape_ns, embed_end) {
+                elapsed[0] += shape;
+                elapsed[1] += embed - shape;
+                elapsed[2] += t.elapsed().as_nanos() - embed;
+                samples += 1;
+            }
         }
+        eprintln!("row_samples {samples} {} {} {}", elapsed[0], elapsed[1], elapsed[2]);
     };
     if let Some(dim) = hashing_dim.filter(|_| can_inline_embed) {
         crate::embed::with_hashing_scratch(dim, |batch| process_rows(Some(batch)));

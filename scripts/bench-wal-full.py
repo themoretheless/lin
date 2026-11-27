@@ -35,6 +35,10 @@ def run_lin(worker, directory, rows, profile=False):
         if len(phases) != 4: raise ValueError(f"missing phases: {phases}")
         frame = dict(zip(("bytes", "write_ns", "sync_ns"), map(int, frames[0][1:4])))
         frame["phases"] = phases
+        frame["row_samples"] = [list(map(int, line.split()[1:])) for line in measured.splitlines()
+                                if line.startswith("row_samples ")]
+        if sum(r[0] for r in frame["row_samples"]) < len(rows) // 40:
+            raise ValueError("Incomplete sampled rows")
     if not (len(result.get("reopen_ns", [])) == 1 and result["reopen_ns"][0] > 0
             and any(Path(directory).iterdir())):
         raise ValueError("Lin worker did not confirm a durable database reopen")
