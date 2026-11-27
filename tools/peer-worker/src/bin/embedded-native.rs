@@ -117,18 +117,24 @@ fn main() -> Result<()> {
                     .collect::<std::result::Result<Vec<Doc>, _>>()?;
                 assert_eq!(got, expected);
             }
-            "sqlite" => {
+            "sqlite" | "sqlite-memory" => {
                 let path = std::path::Path::new(&args[4]).join(format!("db-{sample}"));
-                let mut db = rusqlite::Connection::open(&path)?;
-                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-                assert_eq!(
-                    db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
-                    "wal"
-                );
-                assert_eq!(
-                    db.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?,
-                    2
-                );
+                let durable = args[1] == "sqlite";
+                let mut db = if durable {
+                    let db = rusqlite::Connection::open(&path)?;
+                    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+                    assert_eq!(
+                        db.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?,
+                        "wal"
+                    );
+                    assert_eq!(
+                        db.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?,
+                        2
+                    );
+                    db
+                } else {
+                    rusqlite::Connection::open_in_memory()?
+                };
                 db.execute_batch(DDL)?;
                 db.prepare_cached("INSERT INTO docs VALUES(?,?,?,?,?,?)")?;
                 start = Instant::now();
@@ -141,8 +147,10 @@ fn main() -> Result<()> {
                 }
                 tx.commit()?;
                 elapsed = start.elapsed();
-                drop(db);
-                let db = rusqlite::Connection::open(path)?;
+                if durable {
+                    drop(db);
+                    db = rusqlite::Connection::open(path)?;
+                }
                 let got = db
                     .prepare(READ)?
                     .query_map([], |r| {

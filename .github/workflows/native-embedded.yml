@@ -42,17 +42,13 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
-          git show d03a29320938d06b05acb94df9b37b83f8c71c0f:src/exec/mod.rs > src/exec/mod.rs
-          cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
-          cp target/release/embedded-native target/release/typed-baseline
-          git restore src/exec/mod.rs
           cargo rustc --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          python scripts/typed-wal-triplets.py
+          python scripts/typed-storage-modes.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            typed-wal-triplets.json
+            typed-storage-modes.json
