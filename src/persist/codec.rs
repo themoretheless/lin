@@ -1231,7 +1231,8 @@ pub(super) fn append_sparse_cells_parallel(
     num_rows: usize,
     buf: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    if num_rows < 512 {
+    // Keep small column payloads on the committing thread.
+    if num_rows <= 1024 {
         return append_sparse_cells_serial(cells, num_fields, fi, num_rows, buf);
     }
     static POOL: std::sync::OnceLock<std::sync::Mutex<Option<SparseEncodePool>>> =
