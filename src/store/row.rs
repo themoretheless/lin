@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 use super::Cell;
 
 /// Cells stored inline before spilling to the heap.
-type Cells = SmallVec<[Cell; 4]>;
+type Cells = SmallVec<[Cell; 2]>;
 
 /// Shapes kept in the transition cache. Past this, new key sets still work but are not
 /// shared (arbitrary user-supplied keys must not grow the cache without bound).
@@ -443,7 +443,12 @@ impl Row {
 
     #[inline]
     pub fn into_values(self) -> smallvec::IntoIter<[Cell; 4]> {
-        self.cells.into_iter()
+        let cells = if self.cells.spilled() {
+            SmallVec::<[Cell; 4]>::from_vec(self.cells.into_vec())
+        } else {
+            self.cells.into_iter().collect()
+        };
+        cells.into_iter()
     }
 
     #[inline]
@@ -510,7 +515,7 @@ impl ExactSizeIterator for IterMut<'_> {}
 pub struct IntoIter {
     shape: Option<Arc<Shape>>,
     pos: usize,
-    cells: smallvec::IntoIter<[Cell; 4]>,
+    cells: smallvec::IntoIter<[Cell; 2]>,
 }
 
 impl Iterator for IntoIter {
