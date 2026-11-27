@@ -1,7 +1,7 @@
 name: SQLite WAL FULL with verified Lin recovery
 on:
   push:
-    branches: [codex/wal-large-lz4-trial]
+    branches: [codex/wal-shared-shape-check]
 permissions:
   contents: read
 jobs:
@@ -57,7 +57,7 @@ jobs:
           fi
           git rev-parse HEAD > provenance.txt
           sha256sum target/release/lin-peer-worker >> provenance.txt
-          git worktree add --detach "$RUNNER_TEMP/base" 2960abb85
+          git worktree add --detach "$RUNNER_TEMP/base" e2b3ffc6b
           (cd "$RUNNER_TEMP/base" && scripts/build-linux-release.sh)
           sha256sum "$RUNNER_TEMP/base/target/release/lin-peer-worker" >> provenance.txt
           python3 scripts/bench-wal-full.py target/release/lin-peer-worker wal-full.json --control "$RUNNER_TEMP/base/target/release/lin-peer-worker" | tee summary.txt

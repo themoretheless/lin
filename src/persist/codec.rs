@@ -2135,10 +2135,11 @@ pub(crate) fn insert_cols_lossless(rows: &[crate::store::Row]) -> bool {
     if kinds.contains(&0) {
         return false;
     }
-    rows[1..].iter().all(|r| {
-        r.len() == first.len()
-            && r.keys().eq(first.keys())
-            && r.values().zip(&kinds).all(|(c, k)| kind(c) == *k)
+    rows[1..].iter().all(|row| {
+        let shared_shape = first.shape().zip(row.shape())
+            .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b));
+        (shared_shape || (row.len() == first.len() && row.keys().eq(first.keys())))
+            && row.values().zip(&kinds).all(|(cell, expected)| kind(cell) == *expected)
     })
 }
 
