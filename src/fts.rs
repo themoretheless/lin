@@ -6,7 +6,7 @@
 //! them and only rebuilds missing / mismatched collections. WAL replay then
 //! updates postings incrementally.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use std::fs::{self, File};
 use std::io::Read;
@@ -20,10 +20,72 @@ use crate::store::{Cell, Row};
 
 pub const FTS_DIR: &str = "fts";
 pub const FTS_MAGIC: [u8; 4] = *b"LIN\x05";
+/// Tokenizer version stamp (`2`: contextual `str::to_lowercase` + combining mark preservation).
+pub const TOKENIZER_VERSION: u32 = 2;
 /// 2: tokens lowercased with `str::to_lowercase` (contextual: a word-final capital sigma
 /// becomes `ς`), matching the query side; version-1 files are rebuilt.
 const FTS_VERSION: u8 = 2;
 const FTS_CRC_MAGIC: [u8; 4] = *b"LCRC";
+
+/// Configurable lexical tokenizer options for [`inspect_tokens`] (`LIN-0897`..`LIN-0904`, `LIN-0912`).
+#[derive(Debug, Clone)]
+pub struct TokenizerConfig {
+    pub min_token_bytes: usize,
+    pub max_token_bytes: usize,
+    pub max_tokens_per_doc: usize,
+    pub stopwords: Option<FxHashSet<String>>,
+    pub ascii_stem_s_ing_ed: bool,
+}
+
+impl Default for TokenizerConfig {
+    fn default() -> Self {
+        Self {
+            min_token_bytes: 1,
+            max_token_bytes: 256,
+            max_tokens_per_doc: 65_536,
+            stopwords: None,
+            ascii_stem_s_ing_ed: false,
+        }
+    }
+}
+
+/// Emitted token with UTF-8 byte offsets `[byte_start, byte_end)` and 0-based stream position (`LIN-0909`, `LIN-0917`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenSpan {
+    pub token: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub position: usize,
+}
+
+/// Vocabulary size, posting cardinality, and pending delta-compaction debt (`LIN-0918`, `LIN-0989`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FtsVocabularyStats {
+    pub unique_terms: usize,
+    pub vocabulary_bytes: usize,
+    pub total_base_postings: usize,
+    pub pending_add_terms: usize,
+    pub pending_del_terms: usize,
+    pub compaction_debt_entries: usize,
+    pub max_posting_len: usize,
+}
+
+/// Structural invariant verification report for an [`FtsIndex`] (`LIN-0990`, `LIN-0991`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FtsInvariantReport {
+    pub valid: bool,
+    pub unsorted_base_terms: usize,
+    pub overlap_add_del_terms: usize,
+    pub out_of_bounds_postings: usize,
+}
+
+/// Exact posting-by-posting comparison between a live [`FtsIndex`] and a fresh rebuild (`LIN-0992`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FtsRebuildDiff {
+    pub identical: bool,
+    pub only_in_live: Vec<(String, Vec<usize>)>,
+    pub only_in_rebuilt: Vec<(String, Vec<usize>)>,
+}
 
 /// Pending entries folded back into a term's base list. A removal from a sorted
 /// list costs a memmove over the whole list, which for a corpus-wide token is
@@ -860,6 +922,208 @@ impl FtsIndex {
             },
         ))
     }
+
+    /// Summarize vocabulary size, posting lengths, and pending delta debt (`LIN-0918`, `LIN-0989`).
+    pub fn vocabulary_stats(&self) -> FtsVocabularyStats {
+        let mut unique_terms = self.inner.postings.len();
+        let mut vocabulary_bytes: usize = self.inner.postings.keys().map(|k| k.len()).sum();
+        let mut total_base_postings = 0usize;
+        let mut max_posting_len = 0usize;
+        for list in self.inner.postings.values() {
+            total_base_postings += list.len();
+            if list.len() > max_posting_len {
+                max_posting_len = list.len();
+            }
+        }
+        for (tok, list) in &self.inner.adds {
+            if !self.inner.postings.contains_key(tok.as_ref()) && !list.is_empty() {
+                unique_terms += 1;
+                vocabulary_bytes += tok.len();
+                if list.len() > max_posting_len {
+                    max_posting_len = list.len();
+                }
+            }
+        }
+        let pending_add_terms = self.inner.adds.len();
+        let pending_del_terms = self.inner.dels.len();
+        let add_entries: usize = self.inner.adds.values().map(|v| v.len()).sum();
+        let del_entries: usize = self.inner.dels.values().map(|v| v.len()).sum();
+        FtsVocabularyStats {
+            unique_terms,
+            vocabulary_bytes,
+            total_base_postings,
+            pending_add_terms,
+            pending_del_terms,
+            compaction_debt_entries: add_entries + del_entries,
+            max_posting_len,
+        }
+    }
+
+    /// Verify sorted base lists, disjoint `adds`/`dels` sets, and optional row-index bounds (`LIN-0990`, `LIN-0991`).
+    pub fn check_invariants(&self, row_limit: Option<usize>) -> FtsInvariantReport {
+        let mut unsorted_base_terms = 0usize;
+        let mut overlap_add_del_terms = 0usize;
+        let mut out_of_bounds_postings = 0usize;
+
+        for list in self.inner.postings.values() {
+            if list.is_empty() || list.windows(2).any(|w| w[0] >= w[1]) {
+                unsorted_base_terms += 1;
+            }
+        }
+
+        for (tok, add_list) in &self.inner.adds {
+            if let Some(del_list) = self.inner.dels.get(tok.as_ref()) {
+                let (mut i, mut j) = (0, 0);
+                let mut overlaps = false;
+                while i < add_list.len() && j < del_list.len() {
+                    match add_list[i].cmp(&del_list[j]) {
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                        std::cmp::Ordering::Equal => {
+                            overlaps = true;
+                            break;
+                        }
+                    }
+                }
+                if overlaps {
+                    overlap_add_del_terms += 1;
+                }
+            }
+        }
+
+        if let Some(limit) = row_limit {
+            let mut terms: Vec<&str> = self
+                .inner
+                .postings
+                .keys()
+                .chain(self.inner.adds.keys())
+                .map(AsRef::as_ref)
+                .collect();
+            terms.sort_unstable();
+            terms.dedup();
+            for term in terms {
+                if let Some(live) = self.matches_cow(term) {
+                    let pos = live.partition_point(|&idx| idx < limit);
+                    out_of_bounds_postings += live.len() - pos;
+                }
+            }
+        }
+
+        let valid = unsorted_base_terms == 0
+            && overlap_add_del_terms == 0
+            && out_of_bounds_postings == 0;
+        FtsInvariantReport {
+            valid,
+            unsorted_base_terms,
+            overlap_add_del_terms,
+            out_of_bounds_postings,
+        }
+    }
+
+    /// Compare live effective postings against a clean rebuild over `rows` (`LIN-0992`).
+    pub fn diff_against_rebuild(&self, rows: &[Row]) -> FtsRebuildDiff {
+        let rebuilt = Self::build(rows, &self.fields);
+        let mut all_terms: Vec<&str> = self
+            .inner
+            .postings
+            .keys()
+            .chain(self.inner.adds.keys())
+            .chain(rebuilt.inner.postings.keys())
+            .map(AsRef::as_ref)
+            .collect();
+        all_terms.sort_unstable();
+        all_terms.dedup();
+
+        let mut only_in_live = Vec::new();
+        let mut only_in_rebuilt = Vec::new();
+        for term in all_terms {
+            let live = self.matches_cow(term);
+            let live_slice = live.as_deref().unwrap_or(&[]);
+            let reb = rebuilt.matches_cow(term);
+            let reb_slice = reb.as_deref().unwrap_or(&[]);
+            if live_slice == reb_slice {
+                continue;
+            }
+            let diff_live = sorted_diff(live_slice, reb_slice);
+            if !diff_live.is_empty() {
+                only_in_live.push((term.to_string(), diff_live));
+            }
+            let diff_reb = sorted_diff(reb_slice, live_slice);
+            if !diff_reb.is_empty() {
+                only_in_rebuilt.push((term.to_string(), diff_reb));
+            }
+        }
+        FtsRebuildDiff {
+            identical: only_in_live.is_empty() && only_in_rebuilt.is_empty(),
+            only_in_live,
+            only_in_rebuilt,
+        }
+    }
+
+    /// Build an [`FtsIndex`] enforcing a hard vocabulary byte ceiling and reporting progress (`LIN-0910`, `LIN-0919`).
+    pub fn build_with_limits(
+        fields: &[String],
+        rows: &[Row],
+        max_vocab_bytes: usize,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Self, Error> {
+        let total = rows.len();
+        let mut idx = Self::empty(fields);
+        if total == 0 {
+            on_progress(0, 0);
+            return Ok(idx);
+        }
+        let inner = Arc::make_mut(&mut idx.inner);
+        inner.postings.reserve(total);
+        let mut vocab_bytes = 0usize;
+        let mut scratch = String::with_capacity(256);
+        let step = (total / 16).clamp(1, 256);
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            for slot in &mut idx.slots {
+                if let Some(text) = slot.get(row).and_then(Cell::text) {
+                    let lowered = lowercased(text, &mut scratch);
+                    let mut limit_err: Option<Error> = None;
+                    for_each_word(lowered, |tok| {
+                        if limit_err.is_some() {
+                            return;
+                        }
+                        if let Some(list) = inner.postings.get_mut(tok) {
+                            if let Some(&last) = list.last() {
+                                if last == row_idx {
+                                    return;
+                                }
+                                if last < row_idx {
+                                    list.push(row_idx);
+                                    return;
+                                }
+                            }
+                            if let Err(pos) = list.binary_search(&row_idx) {
+                                list.insert(pos, row_idx);
+                            }
+                        } else {
+                            let next_bytes = vocab_bytes.saturating_add(tok.len());
+                            if next_bytes > max_vocab_bytes {
+                                limit_err = Some(Error::resource_limit(format!(
+                                    "FTS vocabulary bytes {next_bytes} exceeds max_vocab_bytes {max_vocab_bytes}"
+                                )));
+                                return;
+                            }
+                            vocab_bytes = next_bytes;
+                            inner.postings.insert(Arc::from(tok), smallvec![row_idx]);
+                        }
+                    });
+                    if let Some(err) = limit_err {
+                        return Err(err);
+                    }
+                }
+            }
+            if (row_idx + 1) % step == 0 || row_idx + 1 == total {
+                on_progress(row_idx + 1, total);
+            }
+        }
+        Ok(idx)
+    }
 }
 
 fn read_u32(b: &[u8], i: &mut usize) -> Result<u32, Error> {
@@ -907,6 +1171,205 @@ pub fn tokenize(text: &str) -> Vec<String> {
     let lowered = lowercased(text, &mut scratch);
     let mut out = Vec::new();
     for_each_word(lowered, |t| out.push(t.to_string()));
+    out
+}
+
+#[inline]
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{0591}'..='\u{05C7}'
+            | '\u{0610}'..='\u{061A}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+#[inline]
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || is_combining_mark(c)
+}
+
+#[inline]
+fn stem_ascii_suffix_in_place(tok: &mut String) {
+    if !tok.is_ascii() {
+        return;
+    }
+    if let Some(stem) = tok.strip_suffix("ing") {
+        if stem.len() >= 3 {
+            let new_len = stem.len();
+            tok.truncate(new_len);
+            let bytes = tok.as_bytes();
+            if bytes.len() >= 4
+                && bytes[bytes.len() - 1] == bytes[bytes.len() - 2]
+                && !matches!(bytes[bytes.len() - 1], b'l' | b's' | b'z')
+            {
+                tok.pop();
+            }
+        }
+    } else if let Some(stem) = tok.strip_suffix("ed") {
+        if stem.len() >= 3 {
+            let new_len = stem.len();
+            tok.truncate(new_len);
+        }
+    } else if let Some(stem) = tok.strip_suffix('s')
+        && !stem.ends_with('s')
+        && stem.len() >= 3
+    {
+        let new_len = stem.len();
+        tok.truncate(new_len);
+    }
+}
+
+/// Tokenize `text` with full span offsets, contextual Unicode lowercasing (Greek final `ς`),
+/// combining-mark retention, stopword filtering, optional ASCII suffix stemming, and token caps
+/// (`LIN-0897`..`LIN-0904`, `LIN-0909`, `LIN-0912`, `LIN-0917`).
+pub fn inspect_tokens(text: &str, cfg: &TokenizerConfig) -> Vec<TokenSpan> {
+    if text.is_empty() || cfg.max_tokens_per_doc == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut span_start: Option<usize> = None;
+
+    let emit_span = |start: usize, end: usize, out: &mut Vec<TokenSpan>| -> bool {
+        let raw = &text[start..end];
+        let mut tok = raw.to_lowercase();
+        if let Some(ref sw) = cfg.stopwords
+            && sw.contains(tok.as_str())
+        {
+            return true;
+        }
+        if cfg.ascii_stem_s_ing_ed {
+            stem_ascii_suffix_in_place(&mut tok);
+            if let Some(ref sw) = cfg.stopwords
+                && sw.contains(tok.as_str())
+            {
+                return true;
+            }
+        }
+        if tok.len() < cfg.min_token_bytes
+            || (cfg.max_token_bytes > 0 && tok.len() > cfg.max_token_bytes)
+        {
+            return true;
+        }
+        let position = out.len();
+        out.push(TokenSpan {
+            token: tok,
+            byte_start: start,
+            byte_end: end,
+            position,
+        });
+        out.len() < cfg.max_tokens_per_doc
+    };
+
+    for (idx, ch) in text.char_indices() {
+        if is_token_char(ch) {
+            if span_start.is_none() {
+                span_start = Some(idx);
+            }
+        } else if let Some(start) = span_start.take()
+            && !emit_span(start, idx, &mut out)
+        {
+            return out;
+        }
+    }
+    if let Some(start) = span_start {
+        let _ = emit_span(start, text.len(), &mut out);
+    }
+    out
+}
+
+#[inline]
+fn gallop_lower_bound(slice: &[usize], start: usize, target: usize) -> usize {
+    if start >= slice.len() || slice[start] >= target {
+        return start;
+    }
+    let mut lo = start;
+    let mut step = 1usize;
+    let mut hi = (start + step).min(slice.len());
+    while hi < slice.len() && slice[hi] < target {
+        lo = hi;
+        step = step.saturating_mul(2);
+        hi = start.saturating_add(step).min(slice.len());
+    }
+    let bound = (hi + 1).min(slice.len());
+    lo + slice[lo..bound].partition_point(|&x| x < target)
+}
+
+/// Shortest-list-first sorted posting intersection using exponential galloping search (`LIN-0925`, `LIN-0926`).
+pub fn intersect_postings_galloping(lists: &[&[usize]]) -> Vec<usize> {
+    if lists.is_empty() || lists.iter().any(|l| l.is_empty()) {
+        return Vec::new();
+    }
+    if lists.len() == 1 {
+        let mut single = lists[0].to_vec();
+        single.dedup();
+        return single;
+    }
+    let mut ordered: SmallVec<[&[usize]; 8]> = lists.iter().copied().collect();
+    ordered.sort_unstable_by_key(|s| s.len());
+
+    let head = ordered[0];
+    let rest = &ordered[1..];
+    let mut cursors: SmallVec<[usize; 8]> = smallvec![0usize; rest.len()];
+    let mut out = Vec::with_capacity(head.len());
+
+    let mut i0 = 0usize;
+    'outer: while i0 < head.len() {
+        let mut candidate = head[i0];
+        let mut matched_all = true;
+        for (r_idx, &other) in rest.iter().enumerate() {
+            let pos = gallop_lower_bound(other, cursors[r_idx], candidate);
+            cursors[r_idx] = pos;
+            if pos >= other.len() {
+                break 'outer;
+            }
+            if other[pos] > candidate {
+                candidate = other[pos];
+                matched_all = false;
+                break;
+            }
+        }
+        if matched_all {
+            if out.last() != Some(&candidate) {
+                out.push(candidate);
+            }
+            i0 += 1;
+            while i0 < head.len() && head[i0] == candidate {
+                i0 += 1;
+            }
+            for (r_idx, &other) in rest.iter().enumerate() {
+                while cursors[r_idx] < other.len() && other[cursors[r_idx]] == candidate {
+                    cursors[r_idx] += 1;
+                }
+            }
+        } else {
+            i0 = gallop_lower_bound(head, i0 + 1, candidate);
+        }
+    }
+    out
+}
+
+fn sorted_diff(a: &[usize], b: &[usize]) -> Vec<usize> {
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    let mut out = Vec::new();
+    let mut j = 0usize;
+    for &x in a {
+        while j < b.len() && b[j] < x {
+            j += 1;
+        }
+        if j < b.len() && b[j] == x {
+            continue;
+        }
+        out.push(x);
+    }
     out
 }
 

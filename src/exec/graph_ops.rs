@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -5,10 +7,38 @@ use smallvec::SmallVec;
 
 use crate::ast::MatchHop;
 use crate::error::Error;
+pub use crate::store::edges::{GraphConsistencyReport, GraphDegreeStats};
 use crate::store::row::FieldSlot;
-use crate::store::{Cell, Row, RowShape, row_text};
+use crate::store::{Cell, Row, RowShape, Store, row_text};
 
 use super::Db;
+
+/// Resource limits for bounded shortest-path graph traversals (`LIN-1222`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphPathBudget {
+    pub max_depth: usize,
+    pub max_frontier_nodes: usize,
+    pub max_frontier_bytes: usize,
+}
+
+impl Default for GraphPathBudget {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            max_frontier_nodes: 100_000,
+            max_frontier_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// Traversal counters and reconstructed shortest path (`LIN-1220`, `LIN-1239`).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct GraphTraversalExplanation {
+    pub visited_nodes: usize,
+    pub expanded_edges: usize,
+    pub max_frontier_len: usize,
+    pub path: Vec<Cell>,
+}
 
 #[inline]
 fn edge_shape() -> &'static Arc<RowShape> {
@@ -748,4 +778,332 @@ impl Db {
         }
         None
     }
+
+    /// Summarize edge degrees across all relations or one specific relation (`LIN-1237`).
+    pub fn graph_degree_stats(&self, rel: Option<&str>) -> GraphDegreeStats {
+        self.store.graph_degree_stats(rel)
+    }
+
+    /// Verify forward/reverse adjacency symmetry and node existence (`LIN-1238`).
+    pub fn inspect_graph_consistency(&self) -> GraphConsistencyReport {
+        self.store.inspect_graph_consistency()
+    }
+
+    /// Unweighted shortest path (BFS) resolving reverse relations via the catalog (`LIN-1215`).
+    pub fn shortest_unweighted_path(
+        &self,
+        rel: &str,
+        start: &str,
+        goal: &str,
+        budget: GraphPathBudget,
+        allow_node: &dyn Fn(&str) -> bool,
+        allow_edge: &dyn Fn(&str, &str) -> bool,
+    ) -> Result<Option<GraphTraversalExplanation>, Error> {
+        let (edge_rel, reverse) = match self.catalog.rel(rel) {
+            Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+            _ => (rel, false),
+        };
+        shortest_unweighted_path(
+            &self.store,
+            edge_rel,
+            start,
+            goal,
+            reverse,
+            budget,
+            allow_node,
+            allow_edge,
+        )
+    }
+
+    /// Weighted shortest path (Dijkstra) resolving reverse relations via the catalog (`LIN-1216`).
+    pub fn shortest_weighted_path(
+        &self,
+        rel: &str,
+        start: &str,
+        goal: &str,
+        budget: GraphPathBudget,
+        allow_node: &dyn Fn(&str) -> bool,
+        edge_weight: &dyn Fn(&str, &str) -> Option<f64>,
+    ) -> Result<Option<(f64, GraphTraversalExplanation)>, Error> {
+        let (edge_rel, reverse) = match self.catalog.rel(rel) {
+            Some(r) if let Some(of) = &r.reverse_of => (of.as_str(), true),
+            _ => (rel, false),
+        };
+        shortest_weighted_path(
+            &self.store,
+            edge_rel,
+            start,
+            goal,
+            reverse,
+            budget,
+            allow_node,
+            edge_weight,
+        )
+    }
+}
+
+#[inline]
+fn frontier_entry_bytes(node: &str) -> usize {
+    node.len().saturating_add(32)
+}
+
+fn sorted_neighbors(store: &Store, rel: &str, node: &str, reverse: bool) -> Vec<String> {
+    let mut nbrs = Vec::new();
+    store.for_each_neighbor(rel, node, reverse, |dst| {
+        nbrs.push(dst.to_owned());
+    });
+    nbrs.sort_unstable();
+    nbrs.dedup();
+    nbrs
+}
+
+fn reconstruct_cell_path(parent: &FxHashMap<String, String>, start: &str, goal: &str) -> Vec<Cell> {
+    let mut rev_nodes: Vec<&str> = vec![goal];
+    let mut cur = goal;
+    while cur != start {
+        let Some(prev) = parent.get(cur) else {
+            break;
+        };
+        rev_nodes.push(prev.as_str());
+        cur = prev.as_str();
+    }
+    rev_nodes
+        .into_iter()
+        .rev()
+        .map(Cell::from_text)
+        .collect()
+}
+
+/// Unweighted shortest-path BFS with node/edge filters and frontier node/byte caps
+/// (`LIN-1215`, `LIN-1217`, `LIN-1218`, `LIN-1220`, `LIN-1222`, `LIN-1228`, `LIN-1239`).
+#[allow(clippy::too_many_arguments)]
+pub fn shortest_unweighted_path(
+    store: &Store,
+    rel: &str,
+    start: &str,
+    goal: &str,
+    reverse: bool,
+    budget: GraphPathBudget,
+    allow_node: &dyn Fn(&str) -> bool,
+    allow_edge: &dyn Fn(&str, &str) -> bool,
+) -> Result<Option<GraphTraversalExplanation>, Error> {
+    if !allow_node(start) || !allow_node(goal) {
+        return Ok(None);
+    }
+    let init_bytes = frontier_entry_bytes(start);
+    if budget.max_frontier_nodes == 0 || init_bytes > budget.max_frontier_bytes {
+        return Err(Error::resource_limit(format!(
+            "graph BFS frontier exceeded budget at seed (max_nodes={}, max_bytes={})",
+            budget.max_frontier_nodes, budget.max_frontier_bytes
+        )));
+    }
+    if start == goal {
+        return Ok(Some(GraphTraversalExplanation {
+            visited_nodes: 1,
+            expanded_edges: 0,
+            max_frontier_len: 1,
+            path: vec![Cell::from_text(start)],
+        }));
+    }
+
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut visited: FxHashSet<String> = FxHashSet::default();
+    let mut parent: FxHashMap<String, String> = FxHashMap::default();
+
+    visited.insert(start.to_owned());
+    queue.push_back((start.to_owned(), 0));
+    let mut frontier_bytes = init_bytes;
+    let mut max_frontier_len = 1usize;
+    let mut expanded_edges = 0usize;
+
+    while let Some((curr, depth)) = queue.pop_front() {
+        frontier_bytes = frontier_bytes.saturating_sub(frontier_entry_bytes(&curr));
+        if depth >= budget.max_depth {
+            continue;
+        }
+        for dst in sorted_neighbors(store, rel, &curr, reverse) {
+            expanded_edges += 1;
+            if !allow_node(&dst) || !allow_edge(&curr, &dst) {
+                continue;
+            }
+            if !visited.insert(dst.clone()) {
+                continue;
+            }
+            parent.insert(dst.clone(), curr.clone());
+            if dst == goal {
+                let path = reconstruct_cell_path(&parent, start, goal);
+                return Ok(Some(GraphTraversalExplanation {
+                    visited_nodes: visited.len(),
+                    expanded_edges,
+                    max_frontier_len: max_frontier_len.max(queue.len() + 1),
+                    path,
+                }));
+            }
+            let entry_b = frontier_entry_bytes(&dst);
+            let next_len = queue.len() + 1;
+            let next_bytes = frontier_bytes.saturating_add(entry_b);
+            if next_len > budget.max_frontier_nodes || next_bytes > budget.max_frontier_bytes {
+                return Err(Error::resource_limit(format!(
+                    "graph BFS frontier exceeded budget (nodes={next_len}/{}, bytes={next_bytes}/{})",
+                    budget.max_frontier_nodes, budget.max_frontier_bytes
+                )));
+            }
+            frontier_bytes = next_bytes;
+            queue.push_back((dst, depth + 1));
+            if queue.len() > max_frontier_len {
+                max_frontier_len = queue.len();
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[derive(Clone, Debug)]
+struct WeightedState {
+    cost: f64,
+    hops: usize,
+    node: String,
+}
+
+impl PartialEq for WeightedState {
+    fn eq(&self, other: &Self) -> bool {
+        self.cost.to_bits() == other.cost.to_bits()
+            && self.hops == other.hops
+            && self.node == other.node
+    }
+}
+
+impl Eq for WeightedState {}
+
+impl PartialOrd for WeightedState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WeightedState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| other.hops.cmp(&self.hops))
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+
+/// Non-negative weighted shortest-path Dijkstra with node/edge predicates and frontier caps
+/// (`LIN-1216`..`LIN-1222`, `LIN-1228`, `LIN-1239`).
+#[allow(clippy::too_many_arguments)]
+pub fn shortest_weighted_path(
+    store: &Store,
+    rel: &str,
+    start: &str,
+    goal: &str,
+    reverse: bool,
+    budget: GraphPathBudget,
+    allow_node: &dyn Fn(&str) -> bool,
+    edge_weight: &dyn Fn(&str, &str) -> Option<f64>,
+) -> Result<Option<(f64, GraphTraversalExplanation)>, Error> {
+    if !allow_node(start) || !allow_node(goal) {
+        return Ok(None);
+    }
+    let init_bytes = frontier_entry_bytes(start);
+    if budget.max_frontier_nodes == 0 || init_bytes > budget.max_frontier_bytes {
+        return Err(Error::resource_limit(format!(
+            "graph Dijkstra frontier exceeded budget at seed (max_nodes={}, max_bytes={})",
+            budget.max_frontier_nodes, budget.max_frontier_bytes
+        )));
+    }
+    if start == goal {
+        return Ok(Some((
+            0.0,
+            GraphTraversalExplanation {
+                visited_nodes: 1,
+                expanded_edges: 0,
+                max_frontier_len: 1,
+                path: vec![Cell::from_text(start)],
+            },
+        )));
+    }
+
+    let mut heap: BinaryHeap<WeightedState> = BinaryHeap::new();
+    let mut best_cost: FxHashMap<String, f64> = FxHashMap::default();
+    let mut settled: FxHashSet<String> = FxHashSet::default();
+    let mut parent: FxHashMap<String, String> = FxHashMap::default();
+
+    best_cost.insert(start.to_owned(), 0.0);
+    heap.push(WeightedState {
+        cost: 0.0,
+        hops: 0,
+        node: start.to_owned(),
+    });
+    let mut frontier_bytes = init_bytes;
+    let mut max_frontier_len = 1usize;
+    let mut expanded_edges = 0usize;
+
+    while let Some(WeightedState { cost, hops, node }) = heap.pop() {
+        frontier_bytes = frontier_bytes.saturating_sub(frontier_entry_bytes(&node));
+        if !settled.insert(node.clone()) {
+            continue;
+        }
+        if node == goal {
+            let path = reconstruct_cell_path(&parent, start, goal);
+            return Ok(Some((
+                cost,
+                GraphTraversalExplanation {
+                    visited_nodes: settled.len(),
+                    expanded_edges,
+                    max_frontier_len,
+                    path,
+                },
+            )));
+        }
+        if hops >= budget.max_depth {
+            continue;
+        }
+        for dst in sorted_neighbors(store, rel, &node, reverse) {
+            expanded_edges += 1;
+            if settled.contains(&dst) || !allow_node(&dst) {
+                continue;
+            }
+            let Some(w) = edge_weight(&node, &dst) else {
+                continue;
+            };
+            if !w.is_finite() || w < 0.0 {
+                return Err(Error::runtime(format!(
+                    "dijkstra edge weight on ({node} -> {dst}) must be finite and >= 0.0, got {w}"
+                )));
+            }
+            let next_cost = cost + w;
+            let improve = match best_cost.get(&dst) {
+                None => true,
+                Some(&prev) => next_cost < prev,
+            };
+            if improve {
+                let entry_b = frontier_entry_bytes(&dst);
+                let next_len = heap.len() + 1;
+                let next_bytes = frontier_bytes.saturating_add(entry_b);
+                if next_len > budget.max_frontier_nodes || next_bytes > budget.max_frontier_bytes {
+                    return Err(Error::resource_limit(format!(
+                        "graph Dijkstra frontier exceeded budget (nodes={next_len}/{}, bytes={next_bytes}/{})",
+                        budget.max_frontier_nodes, budget.max_frontier_bytes
+                    )));
+                }
+                best_cost.insert(dst.clone(), next_cost);
+                parent.insert(dst.clone(), node.clone());
+                frontier_bytes = next_bytes;
+                heap.push(WeightedState {
+                    cost: next_cost,
+                    hops: hops + 1,
+                    node: dst,
+                });
+                if heap.len() > max_frontier_len {
+                    max_frontier_len = heap.len();
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }

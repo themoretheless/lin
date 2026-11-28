@@ -46,6 +46,40 @@ pub struct HotCacheStats {
     pub sec_query_misses: u64,
 }
 
+/// Categorized cause for removing entries from [`HotTierCache`] (`LIN-1267`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EvictionReason {
+    CapacityBytes,
+    ExplicitPurge,
+    SegmentInvalidated,
+}
+
+/// Memory residency, budget utilization, working-set estimate, and eviction breakdown for [`HotTierCache`]
+/// (`LIN-1265`..`LIN-1268`, `LIN-1275`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ColdResidencyReport {
+    pub resident_entries: usize,
+    pub resident_bytes: usize,
+    pub budget_bytes: usize,
+    pub utilization_ratio: f64,
+    pub estimated_working_set_bytes: usize,
+    pub evictions_by_capacity: u64,
+    pub evictions_by_purge: u64,
+    pub evictions_by_invalidation: u64,
+}
+
+impl ColdResidencyReport {
+    /// Look up the eviction counter corresponding to `reason`.
+    #[inline]
+    pub fn evictions_for(&self, reason: EvictionReason) -> u64 {
+        match reason {
+            EvictionReason::CapacityBytes => self.evictions_by_capacity,
+            EvictionReason::ExplicitPurge => self.evictions_by_purge,
+            EvictionReason::SegmentInvalidated => self.evictions_by_invalidation,
+        }
+    }
+}
+
 const HOT_ROW_SHARDS: usize = 16;
 const LRU_NONE: u32 = u32::MAX;
 
@@ -71,6 +105,9 @@ struct HotRowShard {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: u64,
+    evictions_by_purge: u64,
+    evictions_by_invalidation: u64,
+    evicted_capacity_bytes: usize,
 }
 
 impl Default for HotRowShard {
@@ -86,6 +123,9 @@ impl Default for HotRowShard {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: 0,
+            evictions_by_purge: 0,
+            evictions_by_invalidation: 0,
+            evicted_capacity_bytes: 0,
         }
     }
 }
@@ -201,11 +241,17 @@ impl HotRowShard {
                         break;
                     }
                     let next_v = self.slots[victim as usize].next;
+                    let vbytes = self.slots[next_v as usize].approx_bytes;
                     self.remove_slot(next_v);
                     self.evictions += 1;
+                    self.evicted_capacity_bytes =
+                        self.evicted_capacity_bytes.saturating_add(vbytes);
                 } else {
+                    let vbytes = self.slots[victim as usize].approx_bytes;
                     self.remove_slot(victim);
                     self.evictions += 1;
+                    self.evicted_capacity_bytes =
+                        self.evicted_capacity_bytes.saturating_add(vbytes);
                 }
             }
             let s = &mut self.slots[existing_idx as usize];
@@ -223,8 +269,10 @@ impl HotRowShard {
             && self.head != LRU_NONE
         {
             let victim = self.head;
+            let vbytes = self.slots[victim as usize].approx_bytes;
             self.remove_slot(victim);
             self.evictions += 1;
+            self.evicted_capacity_bytes = self.evicted_capacity_bytes.saturating_add(vbytes);
         }
 
         let slot = HotRowSlot {
@@ -253,9 +301,23 @@ impl HotRowShard {
     }
 
     #[inline]
+    fn evict_one_lru(&mut self) -> bool {
+        if self.head == LRU_NONE {
+            return false;
+        }
+        let victim = self.head;
+        let vbytes = self.slots[victim as usize].approx_bytes;
+        self.remove_slot(victim);
+        self.evictions += 1;
+        self.evicted_capacity_bytes = self.evicted_capacity_bytes.saturating_add(vbytes);
+        true
+    }
+
+    #[inline]
     fn invalidate(&mut self, hash: u64, table: &str, id: &str) -> bool {
         if let Some(idx) = self.find_slot(hash, table, id) {
             self.remove_slot(idx);
+            self.evictions_by_invalidation += 1;
             true
         } else {
             false
@@ -276,11 +338,14 @@ impl HotRowShard {
         for idx in to_remove {
             self.remove_slot(idx);
         }
+        self.evictions_by_invalidation += n as u64;
         n
     }
 
     fn clear(&mut self) -> usize {
         let prev = self.live_rows;
+        self.evictions_by_purge += prev as u64;
+        self.evicted_capacity_bytes = 0;
         self.slots.clear();
         self.free.clear();
         self.by_hash.clear();
@@ -373,14 +438,67 @@ impl HotTierCache {
 
     #[inline]
     pub(super) fn put_row(&self, table: &str, id: &str, row: Arc<Row>) {
-        if !self.cfg.enabled {
+        if !self.cfg.enabled || self.cfg.max_bytes == 0 || self.cfg.max_rows == 0 {
             return;
         }
-        let max_bytes = (self.cfg.max_bytes / HOT_ROW_SHARDS).max(64 * 1024);
-        let max_rows = (self.cfg.max_rows / HOT_ROW_SHARDS).max(64);
         let approx = estimate_row_bytes(table, id, &row);
+        if approx > self.cfg.max_bytes {
+            return;
+        }
+        let small_budget =
+            self.cfg.max_bytes < HOT_ROW_SHARDS * 64 * 1024 || self.cfg.max_rows < HOT_ROW_SHARDS * 64;
+        let (max_bytes, max_rows) = if small_budget {
+            (self.cfg.max_bytes, self.cfg.max_rows)
+        } else {
+            (
+                self.cfg.max_bytes / HOT_ROW_SHARDS,
+                self.cfg.max_rows / HOT_ROW_SHARDS,
+            )
+        };
         let h = Self::hash_table_id(table, id);
         let idx = ((h >> 32) as usize ^ (h as usize)) & (HOT_ROW_SHARDS - 1);
+        if small_budget {
+            // Enforce exact global row and byte caps across shards when configured with a tight budget.
+            loop {
+                let mut cur_bytes = 0usize;
+                let mut cur_rows = 0usize;
+                let mut existing_bytes = 0usize;
+                for (si, s) in self.row_shards.iter().enumerate() {
+                    if let Ok(g) = s.read() {
+                        cur_bytes += g.used_bytes;
+                        cur_rows += g.live_rows;
+                        if si == idx
+                            && let Some(slot_i) = g.find_slot(h, table, id)
+                        {
+                            existing_bytes = g.slots[slot_i as usize].approx_bytes;
+                        }
+                    }
+                }
+                let net_bytes = cur_bytes.saturating_sub(existing_bytes) + approx;
+                let net_rows = if existing_bytes > 0 {
+                    cur_rows
+                } else {
+                    cur_rows + 1
+                };
+                if net_bytes <= self.cfg.max_bytes && net_rows <= self.cfg.max_rows {
+                    break;
+                }
+                let mut evicted_any = false;
+                for offset in 1..=HOT_ROW_SHARDS {
+                    let cand_shard = (idx + offset) & (HOT_ROW_SHARDS - 1);
+                    if let Ok(mut g) = self.row_shards[cand_shard].write()
+                        && g.evict_one_lru()
+                    {
+                        self.total_live_rows.fetch_sub(1, Ordering::Release);
+                        evicted_any = true;
+                        break;
+                    }
+                }
+                if !evicted_any {
+                    break;
+                }
+            }
+        }
         if let Ok(mut shard) = self.row_shards[idx].write() {
             let delta = shard.insert(h, table, id, row, approx, max_bytes, max_rows);
             if delta > 0 {
@@ -614,6 +732,81 @@ impl HotTierCache {
         }
         st
     }
+
+    /// Public L1 row insertion entry point.
+    #[inline]
+    pub fn put(&self, table: &str, id: &str, row: Arc<Row>) {
+        self.put_row(table, id, row);
+    }
+
+    /// Public L1 row lookup entry point.
+    #[inline]
+    pub fn get(&self, table: &str, id: &str) -> Option<Arc<Row>> {
+        self.get_row(table, id)
+    }
+
+    /// Public point invalidation entry point (`EvictionReason::SegmentInvalidated`).
+    #[inline]
+    pub fn invalidate(&self, table: &str, id: &str) {
+        self.invalidate_row(table, id);
+    }
+
+    /// Public table/segment invalidation entry point (`EvictionReason::SegmentInvalidated`).
+    pub fn invalidate_segment_table(&self, table: &str) {
+        self.invalidate_table(table);
+    }
+
+    /// Return eviction count for a specific [`EvictionReason`] (`LIN-1267`).
+    pub fn eviction_count(&self, reason: EvictionReason) -> u64 {
+        self.residency_report().evictions_for(reason)
+    }
+
+    /// Snapshot L1 residency, budget utilization, working-set pressure, and eviction causes
+    /// (`LIN-1265`..`LIN-1268`, `LIN-1275`).
+    pub fn residency_report(&self) -> ColdResidencyReport {
+        let mut resident_entries = 0usize;
+        let mut resident_bytes = 0usize;
+        let mut evicted_cap_bytes = 0usize;
+        let mut evictions_by_capacity = 0u64;
+        let mut evictions_by_purge = 0u64;
+        let mut evictions_by_invalidation = 0u64;
+
+        for s in &self.row_shards {
+            if let Ok(g) = s.read() {
+                resident_entries += g.live_rows;
+                resident_bytes += g.used_bytes;
+                evicted_cap_bytes = evicted_cap_bytes.saturating_add(g.evicted_capacity_bytes);
+                evictions_by_capacity += g.evictions;
+                evictions_by_purge += g.evictions_by_purge;
+                evictions_by_invalidation += g.evictions_by_invalidation;
+            }
+        }
+        let budget_bytes = self.cfg.max_bytes;
+        let utilization_ratio = if budget_bytes > 0 {
+            resident_bytes as f64 / budget_bytes as f64
+        } else {
+            0.0
+        };
+        let estimated_working_set_bytes = resident_bytes.saturating_add(evicted_cap_bytes);
+
+        ColdResidencyReport {
+            resident_entries,
+            resident_bytes,
+            budget_bytes,
+            utilization_ratio,
+            estimated_working_set_bytes,
+            evictions_by_capacity,
+            evictions_by_purge,
+            evictions_by_invalidation,
+        }
+    }
+
+    /// Purge all resident L1 entries (`EvictionReason::ExplicitPurge`) and return the updated
+    /// [`ColdResidencyReport`] (`LIN-1268`, `LIN-1275`).
+    pub fn purge_and_inspect(&self) -> ColdResidencyReport {
+        self.clear_all();
+        self.residency_report()
+    }
 }
 
 #[inline]
@@ -629,4 +822,33 @@ fn estimate_row_bytes(table: &str, id: &str, row: &Row) -> usize {
         };
     }
     b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eviction_reasons_and_residency_report_track_all_causes() {
+        let cache = HotTierCache::new(HotCacheConfig {
+            enabled: true,
+            max_bytes: 1024,
+            max_rows: 2,
+            max_vec_queries: 4,
+        });
+        for i in 0..4 {
+            let r = Arc::new(Row::from([
+                ("id", Cell::from_text(&format!("r{i}"))),
+                ("body", Cell::from_text("payload")),
+            ]));
+            cache.put("docs", &format!("r{i}"), r);
+        }
+        assert!(cache.eviction_count(EvictionReason::CapacityBytes) >= 2);
+        cache.invalidate("docs", "r3");
+        assert_eq!(cache.eviction_count(EvictionReason::SegmentInvalidated), 1);
+        let after = cache.purge_and_inspect();
+        assert_eq!(after.resident_entries, 0);
+        assert_eq!(after.resident_bytes, 0);
+        assert_eq!(after.evictions_for(EvictionReason::ExplicitPurge), 1);
+    }
 }

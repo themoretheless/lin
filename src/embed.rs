@@ -1226,7 +1226,118 @@ pub struct HnswGraph<T> {
     m: usize,
     m0: usize,
     ef_construction: usize,
+    ef_search: usize,
+    seed: u64,
+    max_visited_nodes: Option<usize>,
+    dim: Option<usize>,
     ml: f64,
+}
+
+/// Configurable construction and traversal parameters for [`HnswIndex`] (`LIN-1053`..`LIN-1056`, `LIN-1076`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HnswConfig {
+    pub m: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+    pub seed: u64,
+    pub max_visited_nodes: Option<usize>,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 64,
+            seed: 0,
+            max_visited_nodes: None,
+        }
+    }
+}
+
+/// Per-query HNSW traversal counters (`LIN-1075`, `LIN-1076`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct HnswSearchStats {
+    pub visited_nodes: usize,
+    pub distance_evals: usize,
+    pub candidate_expansions: usize,
+}
+
+/// Structural reachability report for an HNSW graph (`LIN-1074`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct HnswConnectivityReport {
+    pub total_nodes: usize,
+    pub reachable_from_entry: usize,
+    pub disconnected_nodes: usize,
+    pub max_layer: usize,
+}
+
+/// Vector similarity / closeness metric (`LIN-1097`..`LIN-1099`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub enum DistanceMetric {
+    #[default]
+    Cosine,
+    DotProduct,
+    EuclideanL2,
+}
+
+impl DistanceMetric {
+    /// Compute monotonic similarity score between `a` and `b` (higher means closer/more similar).
+    /// Returns `0.0` for empty, dimension-mismatched, or non-finite inputs.
+    #[inline]
+    pub fn score(self, a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        match self {
+            DistanceMetric::Cosine => cosine(a, b) as f32,
+            DistanceMetric::DotProduct => {
+                let mut sum = 0.0f64;
+                for (&x, &y) in a.iter().zip(b.iter()) {
+                    if !x.is_finite() || !y.is_finite() {
+                        return 0.0;
+                    }
+                    sum += (x as f64) * (y as f64);
+                }
+                if sum.is_finite() { sum as f32 } else { 0.0 }
+            }
+            DistanceMetric::EuclideanL2 => {
+                let mut sq = 0.0f64;
+                for (&x, &y) in a.iter().zip(b.iter()) {
+                    if !x.is_finite() || !y.is_finite() {
+                        return 0.0;
+                    }
+                    let d = (x as f64) - (y as f64);
+                    sq += d * d;
+                }
+                if !sq.is_finite() {
+                    return 0.0;
+                }
+                (1.0 / (1.0 + sq.sqrt())) as f32
+            }
+        }
+    }
+
+    /// Raw Euclidean L2 distance `sqrt(sum((a[i] - b[i])^2))`, or `f32::INFINITY` on invalid input.
+    #[inline]
+    pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return f32::INFINITY;
+        }
+        let mut sq = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            if !x.is_finite() || !y.is_finite() {
+                return f32::INFINITY;
+            }
+            let d = (x as f64) - (y as f64);
+            sq += d * d;
+        }
+        if sq.is_finite() {
+            sq.sqrt() as f32
+        } else {
+            f32::INFINITY
+        }
+    }
 }
 
 /// Hierarchical Navigable Small World (HNSW) index for approximate nearest neighbor search.
@@ -1258,7 +1369,86 @@ impl<T: HnswScalar> HnswGraph<T> {
             m,
             m0,
             ef_construction,
+            ef_search: ef_construction,
+            seed: 0,
+            max_visited_nodes: None,
+            dim: None,
             ml,
+        }
+    }
+
+    /// Construct an HNSW graph with explicit [`HnswConfig`] and nominal dimension (`LIN-1053`..`LIN-1056`).
+    pub fn with_config(dim: usize, cfg: HnswConfig) -> Self {
+        let m = cfg.m.max(2);
+        let m0 = m * 2;
+        let ef_construction = cfg.ef_construction.max(m);
+        let ef_search = cfg.ef_search.max(1);
+        let ml = 1.0 / (m.max(2) as f64).ln();
+        Self {
+            nodes: Vec::new(),
+            id_to_idx: FxHashMap::default(),
+            enter_point: None,
+            max_level: 0,
+            m,
+            m0,
+            ef_construction,
+            ef_search,
+            seed: cfg.seed,
+            max_visited_nodes: cfg.max_visited_nodes,
+            dim: (dim > 0).then_some(dim),
+            ml,
+        }
+    }
+
+    /// Inspect entry-point reachability and layer connectivity (`LIN-1074`).
+    pub fn inspect_connectivity(&self) -> HnswConnectivityReport {
+        let total_nodes = self.id_to_idx.len();
+        if total_nodes == 0 {
+            return HnswConnectivityReport::default();
+        }
+        let max_layer = self
+            .nodes
+            .iter()
+            .filter(|n| n.id != usize::MAX)
+            .map(|n| n.neighbors.len().saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+
+        let Some(ep) = self.enter_point else {
+            return HnswConnectivityReport {
+                total_nodes,
+                reachable_from_entry: 0,
+                disconnected_nodes: total_nodes,
+                max_layer,
+            };
+        };
+
+        let mut seen = vec![false; self.nodes.len()];
+        let mut queue = std::collections::VecDeque::new();
+        seen[ep] = true;
+        queue.push_back(ep);
+        let mut reachable_from_entry = 0usize;
+
+        while let Some(curr) = queue.pop_front() {
+            let node = &self.nodes[curr];
+            if node.id != usize::MAX {
+                reachable_from_entry += 1;
+            }
+            for level_nbrs in &node.neighbors {
+                for &nbr in level_nbrs {
+                    if nbr < seen.len() && !seen[nbr] {
+                        seen[nbr] = true;
+                        queue.push_back(nbr);
+                    }
+                }
+            }
+        }
+
+        HnswConnectivityReport {
+            total_nodes,
+            reachable_from_entry,
+            disconnected_nodes: total_nodes.saturating_sub(reachable_from_entry),
+            max_layer,
         }
     }
 
@@ -1324,9 +1514,17 @@ impl<T: HnswScalar> HnswGraph<T> {
     }
 
     fn random_level(&self, id: usize) -> usize {
-        let mut h = FxHasher::default();
-        id.hash(&mut h);
-        let raw = h.finish() & 0x000f_ffff_ffff_ffff;
+        let raw_hash = if self.seed == 0 {
+            let mut h = FxHasher::default();
+            id.hash(&mut h);
+            h.finish()
+        } else {
+            let mut z = self.seed.wrapping_add((id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let raw = raw_hash & 0x000f_ffff_ffff_ffff;
         let r = ((raw as f64) + 1.0) / ((0x0010_0000_0000_0000u64) as f64);
         let r = r.clamp(1e-9, 1.0);
         (-r.ln() * self.ml).floor() as usize
@@ -1584,6 +1782,142 @@ impl HnswGraph<f32> {
         self.search_raw(query, k, ef_search)
     }
 
+    /// Search for `k` approximate nearest neighbors with detailed traversal telemetry and optional
+    /// `ef_search` / `max_visited_nodes` caps (`LIN-1075`, `LIN-1076`).
+    /// Returns `(Vec<(id, score)>, HnswSearchStats)`.
+    pub fn search_with_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_override: Option<usize>,
+        max_visited: Option<usize>,
+    ) -> (Vec<(usize, f32)>, HnswSearchStats) {
+        if k == 0
+            || self.is_empty()
+            || query.is_empty()
+            || self.dim.is_some_and(|d| query.len() != d)
+        {
+            return (Vec::new(), HnswSearchStats::default());
+        }
+        let visit_cap = max_visited.or(self.max_visited_nodes).unwrap_or(usize::MAX);
+        if visit_cap == 0 {
+            return (Vec::new(), HnswSearchStats::default());
+        }
+        let Some(mut curr) = self.enter_point else {
+            return (Vec::new(), HnswSearchStats::default());
+        };
+        let q_norm = l2_norm_f64(query);
+        if q_norm == 0.0 {
+            return (Vec::new(), HnswSearchStats::default());
+        }
+
+        let ef = ef_override.unwrap_or(self.ef_search).max(k).max(1);
+        let mut stats = HnswSearchStats::default();
+
+        // Greedy search on upper layers `max_level..=1`.
+        if self.max_level >= 1 {
+            let mut upper_seen = rustc_hash::FxHashSet::default();
+            upper_seen.insert(curr);
+            stats.visited_nodes += 1;
+            let mut curr_sim = cosine_with_q_norm(query, q_norm, &self.nodes[curr].vector);
+            stats.distance_evals += 1;
+
+            'upper: for level in (1..=self.max_level).rev() {
+                loop {
+                    if stats.visited_nodes >= visit_cap {
+                        break 'upper;
+                    }
+                    let mut changed = false;
+                    stats.candidate_expansions += 1;
+                    if level < self.nodes[curr].neighbors.len() {
+                        for &nbr in &self.nodes[curr].neighbors[level] {
+                            if stats.visited_nodes >= visit_cap {
+                                break 'upper;
+                            }
+                            if upper_seen.insert(nbr) {
+                                stats.visited_nodes += 1;
+                            }
+                            let sim = cosine_with_q_norm(query, q_norm, &self.nodes[nbr].vector);
+                            stats.distance_evals += 1;
+                            if sim > curr_sim {
+                                curr_sim = sim;
+                                curr = nbr;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Layer-0 bounded beam search.
+        let candidates = HNSW_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.prepare(self.nodes.len());
+
+            if stats.visited_nodes < visit_cap || self.max_level >= 1 {
+                if scratch.visit(curr) && self.max_level == 0 {
+                    stats.visited_nodes += 1;
+                }
+                let sim = cosine_with_q_norm(query, q_norm, &self.nodes[curr].vector);
+                stats.distance_evals += 1;
+                scratch.candidates.push(MaxSimNode { sim, idx: curr });
+                scratch.w.push(MinSimNode { sim, idx: curr });
+            }
+
+            while let Some(c) = scratch.candidates.pop() {
+                let worst_in_w = scratch.w.peek().map(|d| d.sim).unwrap_or(f64::NEG_INFINITY);
+                if (c.sim < worst_in_w && scratch.w.len() >= ef) || stats.visited_nodes >= visit_cap
+                {
+                    break;
+                }
+                stats.candidate_expansions += 1;
+                if let Some(level0) = self.nodes[c.idx].neighbors.first() {
+                    for &nbr in level0 {
+                        if stats.visited_nodes >= visit_cap {
+                            break;
+                        }
+                        if scratch.visit(nbr) {
+                            stats.visited_nodes += 1;
+                            let sim = cosine_with_q_norm(query, q_norm, &self.nodes[nbr].vector);
+                            stats.distance_evals += 1;
+                            let worst_in_w =
+                                scratch.w.peek().map(|x| x.sim).unwrap_or(f64::NEG_INFINITY);
+                            if sim > worst_in_w || scratch.w.len() < ef {
+                                scratch.candidates.push(MaxSimNode { sim, idx: nbr });
+                                scratch.w.push(MinSimNode { sim, idx: nbr });
+                                if scratch.w.len() > ef {
+                                    scratch.w.pop();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            scratch
+                .w
+                .drain()
+                .map(|n| (self.nodes[n.idx].id, n.sim as f32))
+                .filter(|&(id, s)| id != usize::MAX && s > 0.0)
+                .collect::<Vec<_>>()
+        });
+
+        let mut results = candidates;
+        let cmp_hit = |a: &(usize, f32), b: &(usize, f32)| {
+            b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+        };
+        if results.len() > k {
+            results.select_nth_unstable_by(k - 1, cmp_hit);
+            results.truncate(k);
+        }
+        results.sort_unstable_by(cmp_hit);
+        (results, stats)
+    }
+
     /// Convert this `f32` HNSW index into a compact SQ8-quantized HNSW index.
     ///
     /// Preserves graph topology while reducing vector storage by 75%.
@@ -1605,6 +1939,10 @@ impl HnswGraph<f32> {
             m: self.m,
             m0: self.m0,
             ef_construction: self.ef_construction,
+            ef_search: self.ef_search,
+            seed: self.seed,
+            max_visited_nodes: self.max_visited_nodes,
+            dim: self.dim,
             ml: self.ml,
         }
     }
@@ -1629,6 +1967,10 @@ impl HnswGraph<f32> {
             m: self.m,
             m0: self.m0,
             ef_construction: self.ef_construction,
+            ef_search: self.ef_search,
+            seed: self.seed,
+            max_visited_nodes: self.max_visited_nodes,
+            dim: self.dim,
             ml: self.ml,
         }
     }
@@ -2388,6 +2730,291 @@ pub(crate) fn row_embed_text(row: &crate::store::Row) -> std::borrow::Cow<'_, st
         RowEmbedText::Empty => std::borrow::Cow::Borrowed(""),
         RowEmbedText::Borrowed(s) => std::borrow::Cow::Borrowed(s),
         RowEmbedText::Appended => std::borrow::Cow::Owned(buf),
+    }
+}
+
+/// Assembled document text and token statistics inspected prior to embedding (`LIN-1033`, `LIN-1035`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct EmbedTextInspection {
+    pub assembled_text: String,
+    pub byte_len: usize,
+    pub token_count: usize,
+}
+
+/// Inspect the exact assembled embedding text, UTF-8 byte length, and word count for `row`
+/// (`LIN-1033`, `LIN-1035`).
+pub fn inspect_row_embed_text(row: &crate::store::Row) -> EmbedTextInspection {
+    let assembled_text = row_embed_text(row).into_owned();
+    let byte_len = assembled_text.len();
+    let mut scratch = String::new();
+    let lowered = crate::fts::lowercased(&assembled_text, &mut scratch);
+    let mut token_count = 0usize;
+    crate::fts::for_each_word(lowered, |_| {
+        token_count += 1;
+    });
+    EmbedTextInspection {
+        assembled_text,
+        byte_len,
+        token_count,
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
+}
+
+/// Panic-isolating, resource-bounded, dimension-validating wrapper around an [`Embedder`]
+/// (`LIN-1029`..`LIN-1032`, `LIN-1037`, `LIN-1038`, `LIN-1113`).
+#[derive(Debug, Clone)]
+pub struct SafeEmbedderWrapper<E> {
+    pub inner: E,
+    pub max_text_bytes: usize,
+    pub max_batch_output_bytes: usize,
+}
+
+impl<E> SafeEmbedderWrapper<E> {
+    pub fn new(inner: E, max_text_bytes: usize, max_batch_output_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_text_bytes,
+            max_batch_output_bytes,
+        }
+    }
+
+    pub fn with_defaults(inner: E) -> Self {
+        Self::new(inner, 1024 * 1024, 64 * 1024 * 1024)
+    }
+
+    pub fn inner(&self) -> &E {
+        &self.inner
+    }
+}
+
+impl<E: Embedder> SafeEmbedderWrapper<E> {
+    fn validate_vec(&self, vec: &[f32]) -> Result<usize, crate::error::Error> {
+        let expected_dim = self.inner.dim();
+        if vec.len() != expected_dim {
+            return Err(crate::error::Error::incompatible_model(format!(
+                "embedder '{}' dimension mismatch: expected {}, got {}",
+                self.inner.id(),
+                expected_dim,
+                vec.len()
+            )));
+        }
+        if !vec.iter().all(|x| x.is_finite()) {
+            return Err(crate::error::Error::corrupt(format!(
+                "embedder '{}' produced non-finite float values",
+                self.inner.id()
+            )));
+        }
+        Ok(vec.len().saturating_mul(std::mem::size_of::<f32>()))
+    }
+
+    /// Embed a single text with byte-limit enforcement, panic isolation, and output validation.
+    pub fn try_embed(&self, text: &str) -> Result<Arc<[f32]>, crate::error::Error> {
+        if text.len() > self.max_text_bytes {
+            return Err(crate::error::Error::resource_limit(format!(
+                "embed input length {} exceeds max_text_bytes {}",
+                text.len(),
+                self.max_text_bytes
+            )));
+        }
+        let nominal_bytes = self.inner.dim().saturating_mul(std::mem::size_of::<f32>());
+        if nominal_bytes > self.max_batch_output_bytes {
+            return Err(crate::error::Error::resource_limit(format!(
+                "embed output bytes {nominal_bytes} exceeds max_batch_output_bytes {}",
+                self.max_batch_output_bytes
+            )));
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.embed(text)));
+        let vec = match res {
+            Ok(v) => v,
+            Err(payload) => {
+                let msg = panic_payload_message(payload);
+                return Err(crate::error::Error::runtime(format!(
+                    "embedder '{}' panicked: {msg}",
+                    self.inner.id()
+                )));
+            }
+        };
+        let actual_bytes = self.validate_vec(&vec)?;
+        if actual_bytes > self.max_batch_output_bytes {
+            return Err(crate::error::Error::resource_limit(format!(
+                "embed output bytes {actual_bytes} exceeds max_batch_output_bytes {}",
+                self.max_batch_output_bytes
+            )));
+        }
+        Ok(vec)
+    }
+
+    /// Embed a batch of texts, enforcing input/output budgets, catching panics, and verifying
+    /// `output.len() == texts.len()` and exact per-vector dimensions.
+    pub fn try_embed_batch(&self, texts: &[&str]) -> Result<Vec<Arc<[f32]>>, crate::error::Error> {
+        for (i, text) in texts.iter().enumerate() {
+            if text.len() > self.max_text_bytes {
+                return Err(crate::error::Error::resource_limit(format!(
+                    "embed batch item {i} length {} exceeds max_text_bytes {}",
+                    text.len(),
+                    self.max_text_bytes
+                )));
+            }
+        }
+        let nominal_total = texts
+            .len()
+            .saturating_mul(self.inner.dim())
+            .saturating_mul(std::mem::size_of::<f32>());
+        if nominal_total > self.max_batch_output_bytes {
+            return Err(crate::error::Error::resource_limit(format!(
+                "embed batch output {nominal_total} bytes exceeds max_batch_output_bytes {}",
+                self.max_batch_output_bytes
+            )));
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.embed_batch(texts)
+        }));
+        let out = match res {
+            Ok(v) => v,
+            Err(payload) => {
+                let msg = panic_payload_message(payload);
+                return Err(crate::error::Error::runtime(format!(
+                    "embedder '{}' panicked in batch: {msg}",
+                    self.inner.id()
+                )));
+            }
+        };
+        if out.len() != texts.len() {
+            return Err(crate::error::Error::runtime(format!(
+                "embedder '{}' batch length mismatch: expected {}, got {}",
+                self.inner.id(),
+                texts.len(),
+                out.len()
+            )));
+        }
+        let mut total_bytes = 0usize;
+        for vec in &out {
+            total_bytes = total_bytes.saturating_add(self.validate_vec(vec)?);
+            if total_bytes > self.max_batch_output_bytes {
+                return Err(crate::error::Error::resource_limit(format!(
+                    "embed batch output {total_bytes} bytes exceeds max_batch_output_bytes {}",
+                    self.max_batch_output_bytes
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Embed a batch of rows safely via [`Self::try_embed_batch`].
+    pub fn try_embed_rows(
+        &self,
+        rows: &[&crate::store::Row],
+    ) -> Result<Vec<Arc<[f32]>>, crate::error::Error> {
+        let texts: Vec<_> = rows.iter().map(|r| row_embed_text(r)).collect();
+        let refs: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
+        self.try_embed_batch(&refs)
+    }
+}
+
+impl<E: Embedder> Embedder for SafeEmbedderWrapper<E> {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn embed(&self, text: &str) -> Arc<[f32]> {
+        self.try_embed(text)
+            .unwrap_or_else(|_| Arc::from(vec![0.0f32; self.inner.dim()]))
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Arc<[f32]>> {
+        match self.try_embed_batch(texts) {
+            Ok(v) => v,
+            Err(_) => {
+                let fallback: Arc<[f32]> = Arc::from(vec![0.0f32; self.inner.dim()]);
+                texts
+                    .iter()
+                    .map(|t| self.try_embed(t).unwrap_or_else(|_| Arc::clone(&fallback)))
+                    .collect()
+            }
+        }
+    }
+
+    fn hashing_dim(&self) -> Option<usize> {
+        self.inner.hashing_dim()
+    }
+}
+
+/// Per-query vector similarity breakdown (`LIN-1104`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VectorSearchExplanation {
+    pub metric: DistanceMetric,
+    pub score: f32,
+    pub query_norm: f32,
+    pub doc_norm: f32,
+    pub top_contributing_dims: Vec<(usize, f32)>,
+}
+
+/// Explain similarity score, L2 norms, and top contributing dimensions between `query` and `doc`
+/// (`LIN-1104`).
+pub fn explain_vector_similarity(
+    query: &[f32],
+    doc: &[f32],
+    metric: DistanceMetric,
+) -> VectorSearchExplanation {
+    let query_norm = l2_norm_f64(query) as f32;
+    let doc_norm = l2_norm_f64(doc) as f32;
+    let score = metric.score(query, doc);
+
+    let mut top_contributing_dims = Vec::new();
+    if query.len() == doc.len()
+        && !query.is_empty()
+        && query.iter().all(|x| x.is_finite())
+        && doc.iter().all(|x| x.is_finite())
+    {
+        let denom = (query_norm as f64) * (doc_norm as f64);
+        for i in 0..query.len() {
+            let q = query[i] as f64;
+            let d = doc[i] as f64;
+            let contrib = match metric {
+                DistanceMetric::Cosine => {
+                    if denom > 1e-18 {
+                        ((q * d) / denom) as f32
+                    } else {
+                        0.0
+                    }
+                }
+                DistanceMetric::DotProduct => (q * d) as f32,
+                DistanceMetric::EuclideanL2 => {
+                    if q == 0.0 && d == 0.0 {
+                        continue;
+                    }
+                    let diff = q - d;
+                    (-(diff * diff)) as f32
+                }
+            };
+            if matches!(metric, DistanceMetric::EuclideanL2) || contrib > 0.0 {
+                top_contributing_dims.push((i, contrib));
+            }
+        }
+        top_contributing_dims
+            .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_contributing_dims.truncate(8);
+    }
+
+    VectorSearchExplanation {
+        metric,
+        score,
+        query_norm,
+        doc_norm,
+        top_contributing_dims,
     }
 }
 

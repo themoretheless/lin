@@ -22,6 +22,28 @@ pub struct Edge {
     pub to: String,
 }
 
+/// Degree and fanout summary across stored graph edges (`LIN-1237`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct GraphDegreeStats {
+    pub edge_count: usize,
+    pub distinct_sources: usize,
+    pub distinct_targets: usize,
+    pub max_out_degree: usize,
+    pub max_in_degree: usize,
+    pub avg_out_degree: f64,
+}
+
+/// Forward/reverse adjacency symmetry and endpoint existence report (`LIN-1238`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GraphConsistencyReport {
+    pub valid: bool,
+    pub forward_edges: usize,
+    pub reverse_edges: usize,
+    pub forward_reverse_mismatches: usize,
+    pub dangling_sources: usize,
+    pub dangling_targets: usize,
+}
+
 pub(super) type FactKey = (Arc<str>, Arc<str>, Arc<str>);
 pub(crate) type AdjacencyMap = FxHashMap<Arc<str>, FxHashMap<Arc<str>, Vec<Arc<str>>>>;
 
@@ -583,5 +605,200 @@ impl Store {
         self.edges
             .retain(|e| !(e.rel == rel && e.from == from && e.to == to));
         true
+    }
+
+    /// Compute graph degree statistics across all edges (`rel = None`) or a single relation (`LIN-1237`).
+    pub fn graph_degree_stats(&self, rel: Option<&str>) -> GraphDegreeStats {
+        if let Some(target_rel) = rel
+            && self.edge_keys.len() == self.edges.len()
+        {
+            let (edge_count, distinct_sources, max_out_degree) =
+                if let Some(out_map) = self.edges_out.get(target_rel) {
+                    let mut count = 0usize;
+                    let mut sources = 0usize;
+                    let mut max_out = 0usize;
+                    for list in out_map.values() {
+                        if !list.is_empty() {
+                            sources += 1;
+                            count += list.len();
+                            max_out = max_out.max(list.len());
+                        }
+                    }
+                    (count, sources, max_out)
+                } else {
+                    (0, 0, 0)
+                };
+            let (distinct_targets, max_in_degree) =
+                if let Some(in_map) = self.edges_in.get(target_rel) {
+                    let mut targets = 0usize;
+                    let mut max_in = 0usize;
+                    for list in in_map.values() {
+                        if !list.is_empty() {
+                            targets += 1;
+                            max_in = max_in.max(list.len());
+                        }
+                    }
+                    (targets, max_in)
+                } else {
+                    (0, 0)
+                };
+            let avg_out_degree = if distinct_sources > 0 {
+                edge_count as f64 / distinct_sources as f64
+            } else {
+                0.0
+            };
+            return GraphDegreeStats {
+                edge_count,
+                distinct_sources,
+                distinct_targets,
+                max_out_degree,
+                max_in_degree,
+                avg_out_degree,
+            };
+        }
+
+        let mut out_deg: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut in_deg: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut edge_count = 0usize;
+        for e in &self.edges {
+            if rel.is_some_and(|r| e.rel != r) {
+                continue;
+            }
+            edge_count += 1;
+            *out_deg.entry(e.from.as_str()).or_default() += 1;
+            *in_deg.entry(e.to.as_str()).or_default() += 1;
+        }
+        let distinct_sources = out_deg.len();
+        let distinct_targets = in_deg.len();
+        let max_out_degree = out_deg.values().copied().max().unwrap_or(0);
+        let max_in_degree = in_deg.values().copied().max().unwrap_or(0);
+        let avg_out_degree = if distinct_sources > 0 {
+            edge_count as f64 / distinct_sources as f64
+        } else {
+            0.0
+        };
+        GraphDegreeStats {
+            edge_count,
+            distinct_sources,
+            distinct_targets,
+            max_out_degree,
+            max_in_degree,
+            avg_out_degree,
+        }
+    }
+
+    fn node_exists_any(&self, key: &str) -> bool {
+        if self.docs_by_uri.contains_key(key) {
+            return true;
+        }
+        for map in self.by_id.values() {
+            if map.contains_key(key) {
+                return true;
+            }
+        }
+        for (col_name, rows) in self.collections.iter() {
+            if !self.by_id.contains_key(col_name) {
+                for r in rows {
+                    if super::value::row_text(r, "id") == Some(key)
+                        || super::value::row_text(r, "uri") == Some(key)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(ref tier) = self.disk {
+            for table in tier.tables.keys() {
+                if self.disk_point_row(table, "id", key).is_some()
+                    || (table == "docs" && self.disk_point_row(table, "uri", key).is_some())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Inspect forward (`edges_out`) vs reverse (`edges_in`) symmetry and dangling endpoints (`LIN-1238`).
+    pub fn inspect_graph_consistency(&self) -> GraphConsistencyReport {
+        self.inspect_graph_consistency_with(&|_rel, node, _is_target| self.node_exists_any(node))
+    }
+
+    /// Inspect graph consistency using a custom `(rel, node_key, is_target) -> exists` resolver (`LIN-1238`).
+    pub fn inspect_graph_consistency_with(
+        &self,
+        node_exists: &dyn Fn(&str, &str, bool) -> bool,
+    ) -> GraphConsistencyReport {
+        let mut forward_edges = 0usize;
+        let mut reverse_edges = 0usize;
+        let mut forward_reverse_mismatches = 0usize;
+        let mut dangling_sources = 0usize;
+        let mut dangling_targets = 0usize;
+
+        for (rel, by_src) in &self.edges_out {
+            let in_by_dst = self.edges_in.get(rel.as_ref());
+            for (src, dst_list) in by_src {
+                for dst in dst_list {
+                    forward_edges += 1;
+                    let mirrored = in_by_dst
+                        .and_then(|m| m.get(dst.as_ref()))
+                        .is_some_and(|srcs| srcs.iter().any(|s| s.as_ref() == src.as_ref()));
+                    if !mirrored {
+                        forward_reverse_mismatches += 1;
+                    }
+                }
+            }
+        }
+
+        for (rel, by_dst) in &self.edges_in {
+            let out_by_src = self.edges_out.get(rel.as_ref());
+            for (dst, src_list) in by_dst {
+                for src in src_list {
+                    reverse_edges += 1;
+                    let mirrored = out_by_src
+                        .and_then(|m| m.get(src.as_ref()))
+                        .is_some_and(|dsts| dsts.iter().any(|d| d.as_ref() == dst.as_ref()));
+                    if !mirrored {
+                        forward_reverse_mismatches += 1;
+                    }
+                }
+            }
+        }
+
+        for e in &self.edges {
+            let in_fwd = self
+                .edges_out
+                .get(e.rel.as_str())
+                .and_then(|m| m.get(e.from.as_str()))
+                .is_some_and(|v| v.iter().any(|d| d.as_ref() == e.to.as_str()));
+            if !in_fwd {
+                forward_reverse_mismatches += 1;
+            }
+            if !node_exists(e.rel.as_str(), e.from.as_str(), false) {
+                dangling_sources += 1;
+            }
+            if !node_exists(e.rel.as_str(), e.to.as_str(), true) {
+                dangling_targets += 1;
+            }
+        }
+
+        if self.edge_keys.len() != self.edges.len() {
+            forward_reverse_mismatches += self.edge_keys.len().abs_diff(self.edges.len());
+        }
+
+        let valid = forward_edges == self.edges.len()
+            && reverse_edges == self.edges.len()
+            && forward_reverse_mismatches == 0
+            && dangling_sources == 0
+            && dangling_targets == 0;
+
+        GraphConsistencyReport {
+            valid,
+            forward_edges,
+            reverse_edges,
+            forward_reverse_mismatches,
+            dangling_sources,
+            dangling_targets,
+        }
     }
 }

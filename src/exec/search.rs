@@ -1192,3 +1192,252 @@ fn embed_rows_slice_with(emb: &dyn embed::Embedder, rows: &mut [Row]) {
         }
     }
 }
+
+/// Field-boosted BM25-style lexical score explanation with matched terms and highlight spans
+/// (`LIN-0933`, `LIN-0934`, `LIN-0937`, `LIN-0939`, `LIN-0949`, `LIN-0950`).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct LexScoreExplanation {
+    pub total_score: f64,
+    pub matched_terms: Vec<(String, f64)>,
+    pub highlight_spans: Vec<(usize, usize)>,
+}
+
+/// Match ordered or proximity-slop phrases over `text`, returning UTF-8 `(byte_start, byte_end)`
+/// spans in `text` (`LIN-0933`, `LIN-0934`).
+pub fn match_phrase_positions(
+    text: &str,
+    phrase_tokens: &[&str],
+    max_slop: usize,
+) -> Vec<(usize, usize)> {
+    if text.is_empty() || phrase_tokens.is_empty() {
+        return Vec::new();
+    }
+    let cfg = crate::fts::TokenizerConfig::default();
+    let doc_tokens = crate::fts::inspect_tokens(text, &cfg);
+    if doc_tokens.len() < phrase_tokens.len() {
+        return Vec::new();
+    }
+    let mut norm_phrase: Vec<String> = Vec::with_capacity(phrase_tokens.len());
+    for &pt in phrase_tokens {
+        let mut sub = crate::fts::inspect_tokens(pt, &cfg);
+        if sub.is_empty() {
+            let trimmed = pt.trim().to_lowercase();
+            if trimmed.is_empty() {
+                return Vec::new();
+            }
+            norm_phrase.push(trimmed);
+        } else {
+            for s in sub.drain(..) {
+                norm_phrase.push(s.token);
+            }
+        }
+    }
+    if norm_phrase.is_empty() || doc_tokens.len() < norm_phrase.len() {
+        return Vec::new();
+    }
+    if norm_phrase.len() == 1 {
+        return doc_tokens
+            .iter()
+            .filter(|t| t.token == norm_phrase[0])
+            .map(|t| (t.byte_start, t.byte_end))
+            .collect();
+    }
+
+    let m = norm_phrase.len();
+    let mut positions_per_term: Vec<Vec<usize>> = Vec::with_capacity(m);
+    for q in &norm_phrase {
+        let idxs: Vec<usize> = doc_tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, t)| (t.token == *q).then_some(idx))
+            .collect();
+        if idxs.is_empty() {
+            return Vec::new();
+        }
+        positions_per_term.push(idxs);
+    }
+
+    fn best_chain(
+        step: usize,
+        prev_idx: usize,
+        acc_slop: usize,
+        max_slop: usize,
+        chosen: &mut Vec<usize>,
+        positions: &[Vec<usize>],
+        best: &mut Option<(usize, usize, usize)>,
+        doc_tokens: &[crate::fts::TokenSpan],
+    ) {
+        if step == positions.len() {
+            let min_i = *chosen.iter().min().unwrap();
+            let max_i = *chosen.iter().max().unwrap();
+            let cand = (
+                acc_slop,
+                doc_tokens[min_i].byte_start,
+                doc_tokens[max_i].byte_end,
+            );
+            let better = match *best {
+                None => true,
+                Some((bs, bstart, bend)) => {
+                    cand.0 < bs || (cand.0 == bs && (cand.2 - cand.1) < (bend - bstart))
+                }
+            };
+            if better {
+                *best = Some(cand);
+            }
+            return;
+        }
+        for &next_idx in &positions[step] {
+            if chosen.contains(&next_idx) {
+                continue;
+            }
+            let delta = (next_idx as isize - prev_idx as isize - 1).unsigned_abs();
+            let next_slop = acc_slop.saturating_add(delta);
+            if next_slop > max_slop {
+                continue;
+            }
+            chosen.push(next_idx);
+            best_chain(
+                step + 1,
+                next_idx,
+                next_slop,
+                max_slop,
+                chosen,
+                positions,
+                best,
+                doc_tokens,
+            );
+            chosen.pop();
+        }
+    }
+
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut chosen = Vec::with_capacity(m);
+    for &i0 in &positions_per_term[0] {
+        chosen.clear();
+        chosen.push(i0);
+        let mut best: Option<(usize, usize, usize)> = None;
+        best_chain(
+            1,
+            i0,
+            0,
+            max_slop,
+            &mut chosen,
+            &positions_per_term,
+            &mut best,
+            &doc_tokens,
+        );
+        if let Some((_, bstart, bend)) = best
+            && out.last() != Some(&(bstart, bend))
+        {
+            out.push((bstart, bend));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Explain BM25-style field-weighted lexical scoring and collect highlight byte spans
+/// (`LIN-0937`, `LIN-0939`, `LIN-0949`, `LIN-0950`).
+pub fn explain_lex_score(
+    row: &Row,
+    field_weights: &[(&str, f64)],
+    query: &str,
+) -> LexScoreExplanation {
+    const DEFAULT_WEIGHTS: &[(&str, f64)] = &[("title", 3.0), ("snippet", 2.0), ("body", 1.0)];
+    const BM25_K1: f64 = 1.2;
+    const BM25_B: f64 = 0.75;
+    const NOMINAL_AVGDL: f64 = 32.0;
+
+    let weights = if field_weights.is_empty() {
+        DEFAULT_WEIGHTS
+    } else {
+        field_weights
+    };
+
+    let cfg = crate::fts::TokenizerConfig::default();
+    let mut q_terms: Vec<(String, bool)> = Vec::new();
+    for raw in query.split_whitespace() {
+        if let Some(prefix) = raw.strip_suffix('*') {
+            let p_spans = crate::fts::inspect_tokens(prefix, &cfg);
+            if let Some(last) = p_spans.last()
+                && !q_terms.iter().any(|(t, w)| *w && t == &last.token)
+            {
+                q_terms.push((last.token.clone(), true));
+            }
+        } else {
+            for sp in crate::fts::inspect_tokens(raw, &cfg) {
+                if !q_terms.iter().any(|(t, w)| !*w && t == &sp.token) {
+                    q_terms.push((sp.token, false));
+                }
+            }
+        }
+    }
+    if q_terms.is_empty() {
+        return LexScoreExplanation::default();
+    }
+
+    let mut term_scores = vec![0.0f64; q_terms.len()];
+    let mut highlight_spans: Vec<(usize, usize)> = Vec::new();
+    let mut field_base_offset = 0usize;
+    let mut any_field_seen = false;
+
+    for &(field, weight) in weights {
+        let Some(text) = row_text(row, field) else {
+            continue;
+        };
+        if any_field_seen {
+            field_base_offset += 1;
+        }
+        any_field_seen = true;
+        if weight > 0.0 && weight.is_finite() && !text.is_empty() {
+            let doc_spans = crate::fts::inspect_tokens(text, &cfg);
+            if !doc_spans.is_empty() {
+                let dl = doc_spans.len() as f64;
+                let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (dl / NOMINAL_AVGDL));
+                for (q_idx, (q_tok, is_prefix)) in q_terms.iter().enumerate() {
+                    let mut tf = 0usize;
+                    for sp in &doc_spans {
+                        let matched = if *is_prefix {
+                            sp.token.starts_with(q_tok.as_str())
+                        } else {
+                            sp.token == *q_tok
+                        };
+                        if matched {
+                            tf += 1;
+                            highlight_spans.push((
+                                field_base_offset + sp.byte_start,
+                                field_base_offset + sp.byte_end,
+                            ));
+                        }
+                    }
+                    if tf > 0 {
+                        let tf_f = tf as f64;
+                        let bm25_tf = (tf_f * (BM25_K1 + 1.0)) / (tf_f + norm);
+                        term_scores[q_idx] += weight * bm25_tf;
+                    }
+                }
+            }
+        }
+        field_base_offset += text.len();
+    }
+
+    highlight_spans.sort_unstable();
+    highlight_spans.dedup();
+
+    let mut matched_terms = Vec::new();
+    let mut total_score = 0.0f64;
+    for ((tok, is_prefix), score) in q_terms.into_iter().zip(term_scores) {
+        if score > 0.0 {
+            let label = if is_prefix { format!("{tok}*") } else { tok };
+            matched_terms.push((label, score));
+            total_score += score;
+        }
+    }
+
+    LexScoreExplanation {
+        total_score,
+        matched_terms,
+        highlight_spans,
+    }
+}

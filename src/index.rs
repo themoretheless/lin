@@ -196,6 +196,29 @@ pub struct IndexUse {
     pub opposite_bound: Option<(CmpOp, Value)>,
 }
 
+/// Fanout and cardinality distribution metrics for a [`LiveIndex`] (`LIN-0390`, `LIN-0431`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IndexFanoutStats {
+    pub distinct_keys: usize,
+    pub total_postings: usize,
+    pub max_posting_len: usize,
+    pub avg_fanout: f64,
+    pub p95_posting_len: usize,
+    pub selectivity_estimate: f64,
+}
+
+/// Forward/reverse invariant inspection report for a [`LiveIndex`] (`LIN-0391`..`LIN-0396`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct IndexConsistencyReport {
+    pub valid: bool,
+    pub forward_postings: usize,
+    pub reverse_entries: usize,
+    pub unsorted_lists: usize,
+    pub duplicate_positions: usize,
+    pub forward_reverse_mismatches: usize,
+    pub out_of_bounds_positions: usize,
+}
+
 /// Posting list - either SmallVec<[usize; 2]> (standard) or BitSet (for low-cardinality columns)
 #[derive(Debug, Clone, PartialEq)]
 pub enum PostingList {
@@ -216,10 +239,21 @@ impl PostingList {
     pub fn insert(&mut self, pos: usize) {
         match self {
             PostingList::Standard(vec) => {
+                if let Some(&last) = vec.last() {
+                    if pos == last {
+                        return;
+                    }
+                    if pos < last {
+                        if let Err(idx) = vec.binary_search(&pos) {
+                            vec.insert(idx, pos);
+                        }
+                        return;
+                    }
+                }
                 // Checked at power-of-two lengths only: scanning for the maximum on every
                 // insert made a sparse list quadratic to build.
                 if vec.len() >= 32 && vec.len().is_power_of_two() {
-                    let max_pos = vec.iter().copied().max().unwrap_or(0).max(pos);
+                    let max_pos = vec.last().copied().unwrap_or(0).max(pos);
                     if max_pos <= vec.len().saturating_mul(64) {
                         let mut set = BitSet::from_positions(vec, max_pos);
                         set.insert(pos);
@@ -268,63 +302,52 @@ impl PostingList {
 
     #[inline]
     pub fn replace(&mut self, from: usize, to: usize) {
-        if let PostingList::Standard(vec) = self {
-            if let Some(last_elem) = vec.last_mut()
-                && *last_elem == from
-            {
-                *last_elem = to;
-                return;
-            }
-            if let Some(first_elem) = vec.first_mut()
-                && *first_elem == from
-            {
-                *first_elem = to;
-                return;
-            }
-            if let Some(p) = vec.iter().take(64).position(|&x| x == from) {
-                vec[p] = to;
-                return;
-            }
+        if from == to {
+            return;
         }
         if let Some(set) = self.promote_to_bitmap() {
-            set.replace(from, to);
+            if set.contains(from) {
+                set.replace(from, to);
+            }
             return;
         }
         match self {
             PostingList::Standard(vec) => {
-                if vec.len() > 64
-                    && let Some(rel) = vec[64..].iter().position(|&x| x == from)
-                {
-                    vec[64 + rel] = to;
+                let removed = if vec.last() == Some(&from) {
+                    vec.pop();
+                    true
+                } else if let Ok(p) = vec.binary_search(&from) {
+                    vec.remove(p);
+                    true
+                } else if let Some(p) = vec.iter().position(|&x| x == from) {
+                    vec.remove(p);
+                    true
                 } else {
-                    vec.push(to);
+                    false
+                };
+                if removed {
+                    if vec.last().is_none_or(|&last| to > last) {
+                        vec.push(to);
+                    } else if let Err(ins) = vec.binary_search(&to) {
+                        vec.insert(ins, to);
+                    }
                 }
             }
             PostingList::Bitmap(set) => {
-                set.replace(from, to);
+                if set.contains(from) {
+                    set.replace(from, to);
+                }
             }
         }
     }
 
     #[inline]
     pub fn remove(&mut self, pos: usize) {
-        if let PostingList::Standard(vec) = self {
-            if let Some(last_elem) = vec.last()
-                && *last_elem == pos
-            {
-                vec.pop();
-                return;
-            }
-            if let Some(first_elem) = vec.first()
-                && *first_elem == pos
-            {
-                vec.swap_remove(0);
-                return;
-            }
-            if let Some(p) = vec.iter().take(64).position(|&x| x == pos) {
-                vec.swap_remove(p);
-                return;
-            }
+        if let PostingList::Standard(vec) = self
+            && vec.last() == Some(&pos)
+        {
+            vec.pop();
+            return;
         }
         if let Some(set) = self.promote_to_bitmap() {
             set.remove(pos);
@@ -332,10 +355,10 @@ impl PostingList {
         }
         match self {
             PostingList::Standard(vec) => {
-                if vec.len() > 64
-                    && let Some(rel) = vec[64..].iter().position(|&x| x == pos)
-                {
-                    vec.swap_remove(64 + rel);
+                if let Ok(p) = vec.binary_search(&pos) {
+                    vec.remove(p);
+                } else if let Some(p) = vec.iter().position(|&x| x == pos) {
+                    vec.remove(p);
                 }
             }
             PostingList::Bitmap(set) => set.remove(pos),
@@ -1778,6 +1801,187 @@ impl LiveIndex {
         uses.par_iter()
             .map(|use_| self.seek_idxs(use_, now))
             .collect()
+    }
+
+    /// Compute fanout and posting-length distribution statistics (`LIN-0390`, `LIN-0431`).
+    pub fn fanout_stats(&self) -> IndexFanoutStats {
+        let distinct_keys = self.forward.len();
+        if distinct_keys == 0 {
+            return IndexFanoutStats::default();
+        }
+        let mut lens: Vec<usize> = Vec::with_capacity(distinct_keys);
+        let mut total_postings = 0usize;
+        let mut max_posting_len = 0usize;
+        for list in self.forward.values() {
+            let c = list.count();
+            lens.push(c);
+            total_postings += c;
+            if c > max_posting_len {
+                max_posting_len = c;
+            }
+        }
+        lens.sort_unstable();
+        let p95_idx = (distinct_keys.saturating_mul(95).div_ceil(100))
+            .saturating_sub(1)
+            .min(distinct_keys - 1);
+        let p95_posting_len = lens[p95_idx];
+        let avg_fanout = total_postings as f64 / distinct_keys as f64;
+        let selectivity_estimate = if total_postings > 0 {
+            avg_fanout / total_postings as f64
+        } else {
+            0.0
+        };
+        IndexFanoutStats {
+            distinct_keys,
+            total_postings,
+            max_posting_len,
+            avg_fanout,
+            p95_posting_len,
+            selectivity_estimate,
+        }
+    }
+
+    /// Inspect forward B-Tree posting lists and reverse map invariants (`LIN-0391`..`LIN-0396`).
+    pub fn inspect_consistency(&self, collection_len: usize) -> IndexConsistencyReport {
+        let mut forward_postings = 0usize;
+        let reverse_entries = self.reverse.len();
+        let mut unsorted_lists = 0usize;
+        let mut duplicate_positions = 0usize;
+        let mut forward_reverse_mismatches = 0usize;
+        let mut out_of_bounds_positions = 0usize;
+        let mut empty_lists = 0usize;
+        let mut unique_violations = 0usize;
+
+        let mut seen_global = rustc_hash::FxHashSet::with_capacity_and_hasher(
+            reverse_entries.max(self.forward.len()),
+            Default::default(),
+        );
+
+        for (key, list) in self.forward.iter() {
+            let c = list.count();
+            if c == 0 {
+                empty_lists += 1;
+            }
+            if self.def.unique && c > 1 {
+                unique_violations += c - 1;
+            }
+            match list {
+                PostingList::Standard(vec) => {
+                    forward_postings += vec.len();
+                    if vec.windows(2).any(|w| w[0] > w[1]) {
+                        unsorted_lists += 1;
+                    }
+                    let mut seen_local =
+                        rustc_hash::FxHashSet::with_capacity_and_hasher(vec.len(), Default::default());
+                    for &pos in vec.iter() {
+                        if pos >= collection_len {
+                            out_of_bounds_positions += 1;
+                        }
+                        if !seen_local.insert(pos) || !seen_global.insert(pos) {
+                            duplicate_positions += 1;
+                        }
+                        if self.use_reverse && self.reverse.get(&pos) != Some(key) {
+                            forward_reverse_mismatches += 1;
+                        }
+                    }
+                }
+                PostingList::Bitmap(set) => {
+                    let actual_ones: usize =
+                        set.bits.iter().map(|w| w.count_ones() as usize).sum();
+                    if actual_ones != set.len {
+                        forward_reverse_mismatches += 1;
+                    }
+                    forward_postings += actual_ones;
+                    set.for_each(|pos| {
+                        if pos >= collection_len {
+                            out_of_bounds_positions += 1;
+                        }
+                        if !seen_global.insert(pos) {
+                            duplicate_positions += 1;
+                        }
+                        if self.use_reverse && self.reverse.get(&pos) != Some(key) {
+                            forward_reverse_mismatches += 1;
+                        }
+                    });
+                }
+            }
+        }
+
+        if self.use_reverse {
+            for (&pos, rkey) in &self.reverse {
+                if pos >= collection_len && !seen_global.contains(&pos) {
+                    out_of_bounds_positions += 1;
+                }
+                let in_forward = match self.forward.get(rkey) {
+                    Some(PostingList::Standard(vec)) => vec.contains(&pos),
+                    Some(PostingList::Bitmap(set)) => set.contains(pos),
+                    None => false,
+                };
+                if !in_forward {
+                    forward_reverse_mismatches += 1;
+                }
+            }
+        } else if !self.reverse.is_empty() {
+            forward_reverse_mismatches += self.reverse.len();
+        }
+
+        let valid = unsorted_lists == 0
+            && duplicate_positions == 0
+            && forward_reverse_mismatches == 0
+            && out_of_bounds_positions == 0
+            && empty_lists == 0
+            && unique_violations == 0;
+
+        IndexConsistencyReport {
+            valid,
+            forward_postings,
+            reverse_entries,
+            unsorted_lists,
+            duplicate_positions,
+            forward_reverse_mismatches,
+            out_of_bounds_positions,
+        }
+    }
+
+    /// Rebuild a [`LiveIndex`] from `rows` with progress reporting and cooperative cancellation (`LIN-0393`..`LIN-0396`).
+    pub fn rebuild_with_progress(
+        def: &IndexDef,
+        rows: &[Row],
+        on_progress: &mut dyn FnMut(usize, usize),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, crate::error::Error> {
+        if is_cancelled() {
+            return Err(crate::error::Error::canceled("index rebuild canceled"));
+        }
+        let total = rows.len();
+        let mut idx = Self::new(def.clone());
+        if total == 0 {
+            on_progress(0, 0);
+            return Ok(idx);
+        }
+        idx.reverse.reserve(total);
+        let step = (total / 16).clamp(1, 256);
+        let mut done = 0usize;
+        while done < total {
+            if is_cancelled() {
+                return Err(crate::error::Error::canceled("index rebuild canceled"));
+            }
+            let end = (done + step).min(total);
+            for (i, row) in rows[done..end].iter().enumerate() {
+                idx.insert_at_new(done + i, row).map_err(|msg| {
+                    crate::error::Error::runtime(msg)
+                        .with_code(crate::error::ErrorCode::UniqueViolation)
+                })?;
+            }
+            done = end;
+            on_progress(done, total);
+        }
+        if is_cancelled() {
+            return Err(crate::error::Error::canceled("index rebuild canceled"));
+        }
+        #[cfg(feature = "parallel")]
+        idx.build_bloom_filter();
+        Ok(idx)
     }
 }
 

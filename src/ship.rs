@@ -65,6 +65,157 @@ pub struct ShipReplicaStatus {
     pub last_pull_ms: i64,
 }
 
+/// Structured handshake & replication transport failure categories (`LIN-1385`..`LIN-1388`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum HandshakeFailureCategory {
+    InvalidMagic,
+    UnsupportedProtocolVersion,
+    AuthRejected,
+    TlsError,
+    IoTimeout,
+    GenerationDiverged,
+}
+
+impl HandshakeFailureCategory {
+    /// Inspect 4-byte wire magic (`LIN\x06` / `LIN\x07` valid; `LIN<other>` unsupported version; else invalid magic).
+    #[inline]
+    pub fn inspect_magic(magic: [u8; 4]) -> Result<u8, Self> {
+        match magic {
+            PROTO_MAGIC => Ok(6),
+            PROTO_MAGIC_V7 => Ok(7),
+            [b'L', b'I', b'N', ver] => {
+                let _ = ver;
+                Err(Self::UnsupportedProtocolVersion)
+            }
+            _ => Err(Self::InvalidMagic),
+        }
+    }
+
+    /// Classify a replication / handshake [`Error`] into a structured [`HandshakeFailureCategory`].
+    pub fn from_error(err: &Error) -> Option<Self> {
+        classify_handshake_failure(err)
+    }
+}
+
+/// Classify a WAL shipping / replication [`Error`] into [`HandshakeFailureCategory`] (`LIN-1385`..`LIN-1388`).
+pub fn classify_handshake_failure(err: &Error) -> Option<HandshakeFailureCategory> {
+    let msg = err.message.to_ascii_lowercase();
+    if msg.contains("unsupported protocol version")
+        || msg.contains("unknown v7 status")
+        || err.details.as_ref().and_then(|d| d.code) == Some(crate::error::ErrorCode::UnsupportedFormat)
+    {
+        return Some(HandshakeFailureCategory::UnsupportedProtocolVersion);
+    }
+    if msg.contains("bad protocol magic") || msg.contains("invalid magic") {
+        return Some(HandshakeFailureCategory::InvalidMagic);
+    }
+    if msg.contains("bad token")
+        || msg.contains("token too long")
+        || msg.contains("unauthorized")
+        || err.details.as_ref().and_then(|d| d.code)
+            == Some(crate::error::ErrorCode::PermissionDenied)
+    {
+        return Some(HandshakeFailureCategory::AuthRejected);
+    }
+    if msg.contains("tls")
+        || msg.contains("certificate")
+        || msg.contains("private key")
+        || msg.contains("rustls")
+        || msg.contains("handshake")
+    {
+        return Some(HandshakeFailureCategory::TlsError);
+    }
+    if msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("would block")
+        || err.details.as_ref().and_then(|d| d.code)
+            == Some(crate::error::ErrorCode::DeadlineExceeded)
+    {
+        return Some(HandshakeFailureCategory::IoTimeout);
+    }
+    if msg.contains("replica lag")
+        || msg.contains("exceeds max_lag_gens")
+        || msg.contains("compacted wal")
+        || msg.contains("stale generation")
+        || msg.contains("generation diverged")
+        || msg.contains("split-brain")
+    {
+        return Some(HandshakeFailureCategory::GenerationDiverged);
+    }
+    None
+}
+
+/// Follower/primary replication lag, retry counters, and catch-up ETA bounds (`LIN-1424`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReplicationTelemetry {
+    pub lag_bytes: u64,
+    pub lag_ms: u64,
+    pub reconnect_attempts: u64,
+    pub auth_failures: u64,
+    pub transport_failures: u64,
+    pub catchup_eta_ms_bounds: Option<(u64, u64)>,
+}
+
+impl ReplicationTelemetry {
+    /// Compute `(min_eta_ms, max_eta_ms)` given `lag_bytes` and observed `[min_bps, max_bps]` throughput.
+    pub fn compute_catchup_eta_bounds(
+        lag_bytes: u64,
+        min_bytes_per_sec: u64,
+        max_bytes_per_sec: u64,
+    ) -> Option<(u64, u64)> {
+        if lag_bytes == 0 {
+            return Some((0, 0));
+        }
+        if min_bytes_per_sec == 0 || max_bytes_per_sec == 0 {
+            return None;
+        }
+        let lo_bps = min_bytes_per_sec.min(max_bytes_per_sec) as u128;
+        let hi_bps = min_bytes_per_sec.max(max_bytes_per_sec) as u128;
+        let min_ms = ((lag_bytes as u128) * 1000).div_ceil(hi_bps) as u64;
+        let max_ms = ((lag_bytes as u128) * 1000).div_ceil(lo_bps) as u64;
+        Some((min_ms, max_ms))
+    }
+
+    pub fn with_throughput_bounds(mut self, min_bps: u64, max_bps: u64) -> Self {
+        self.catchup_eta_ms_bounds =
+            Self::compute_catchup_eta_bounds(self.lag_bytes, min_bps, max_bps);
+        self
+    }
+}
+
+///Fenced follower-to-primary promotion receipt (`LIN-1430`..`LIN-1432`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromotionFenceReceipt {
+    pub promoted_epoch: u64,
+    pub fenced_generation: u64,
+    pub previous_role_was_follower: bool,
+}
+
+/// Verify that a follower promoting to primary has caught up to at least `min_required_gen`
+/// and advance the fencing epoch monotonically (`LIN-1430`..`LIN-1432`).
+pub fn verify_promotion_fence(
+    local_gen: u64,
+    min_required_gen: u64,
+    current_epoch: u64,
+) -> Result<PromotionFenceReceipt, Error> {
+    if local_gen < min_required_gen {
+        return Err(Error::runtime(format!(
+            "wal ship: stale generation in promotion fence (local_gen={local_gen} < min_required_gen={min_required_gen}); split-brain promotion rejected"
+        ))
+        .with_code(crate::error::ErrorCode::CasMismatch));
+    }
+    let Some(promoted_epoch) = current_epoch.checked_add(1) else {
+        return Err(Error::runtime(
+            "wal ship: promotion fence epoch overflow at u64::MAX",
+        ));
+    };
+    Ok(PromotionFenceReceipt {
+        promoted_epoch,
+        fenced_generation: local_gen,
+        previous_role_was_follower: true,
+    })
+}
+
 /// Push-wakeup and replica-lag coordinator for standalone [`serve_dir_live`] WAL fanout.
 #[derive(Default)]
 pub struct ShipWalHub {
@@ -72,6 +223,11 @@ pub struct ShipWalHub {
     gen_cv: std::sync::Condvar,
     max_lag_gens: std::sync::atomic::AtomicU64,
     replicas: std::sync::Mutex<std::collections::BTreeMap<String, ShipReplicaStatus>>,
+    lag_bytes: std::sync::atomic::AtomicU64,
+    lag_ms: std::sync::atomic::AtomicU64,
+    reconnect_attempts: std::sync::atomic::AtomicU64,
+    auth_failures: std::sync::atomic::AtomicU64,
+    transport_failures: std::sync::atomic::AtomicU64,
 }
 
 impl ShipWalHub {
@@ -113,6 +269,42 @@ impl ShipWalHub {
             .lock()
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Record a connection/handshake error against hub telemetry counters.
+    pub fn record_failure(&self, err: &Error) {
+        self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+        match classify_handshake_failure(err) {
+            Some(HandshakeFailureCategory::AuthRejected) => {
+                self.auth_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.transport_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Update observed byte/time replication lag on this hub.
+    pub fn record_lag(&self, lag_bytes: u64, lag_ms: u64) {
+        self.lag_bytes.store(lag_bytes, Ordering::Relaxed);
+        self.lag_ms.store(lag_ms, Ordering::Relaxed);
+    }
+
+    /// Snapshot structured [`ReplicationTelemetry`] (`LIN-1424`).
+    pub fn telemetry(&self) -> ReplicationTelemetry {
+        let lag_bytes = self.lag_bytes.load(Ordering::Relaxed);
+        ReplicationTelemetry {
+            lag_bytes,
+            lag_ms: self.lag_ms.load(Ordering::Relaxed),
+            reconnect_attempts: self.reconnect_attempts.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            transport_failures: self.transport_failures.load(Ordering::Relaxed),
+            catchup_eta_ms_bounds: ReplicationTelemetry::compute_catchup_eta_bounds(
+                lag_bytes,
+                10 * 1024 * 1024,
+                100 * 1024 * 1024,
+            ),
+        }
     }
 
     fn record_pull(
@@ -622,10 +814,17 @@ struct ShipHello {
 fn read_hello_any<R: Read>(r: &mut R) -> Result<ShipHello, Error> {
     let mut hdr6 = [0u8; 6];
     r.read_exact(&mut hdr6).map_err(io_err)?;
-    let v7 = match [hdr6[0], hdr6[1], hdr6[2], hdr6[3]] {
-        PROTO_MAGIC => false,
-        PROTO_MAGIC_V7 => true,
-        _ => {
+    let v7 = match HandshakeFailureCategory::inspect_magic([hdr6[0], hdr6[1], hdr6[2], hdr6[3]]) {
+        Ok(6) => false,
+        Ok(7) => true,
+        Ok(_) => unreachable!(),
+        Err(HandshakeFailureCategory::UnsupportedProtocolVersion) => {
+            return Err(Error::unsupported_format(format!(
+                "wal ship: bad protocol magic: unsupported protocol version {} (need LIN\\x06 or LIN\\x07)",
+                hdr6[3]
+            )));
+        }
+        Err(_) => {
             return Err(Error::runtime(
                 "wal ship: bad protocol magic (need LIN\\x06 or LIN\\x07)",
             ));
