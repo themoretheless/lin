@@ -1414,6 +1414,7 @@ impl Db {
         let uniform_keys = all_uniform && !needs_id;
         // The pre-encoded record is the compact columnar one; rows it cannot represent
         // exactly (missing fields, mixed types) are logged row by row after the insert.
+        let indexes_and_wal_started = std::time::Instant::now();
         let staged = if allow_preencode
             && (512..=16384).contains(&n)
             && edges.is_empty()
@@ -1548,6 +1549,7 @@ impl Db {
             self.maintain_insert_slab(collection, start, &built)?;
             None
         };
+        eprintln!("stage indexes_and_wal {}", indexes_and_wal_started.elapsed().as_nanos());
         self.store
             .update_col_count(collection, built.len() as isize);
         let want_rows = caller_wants_rows && built.len() <= 128;

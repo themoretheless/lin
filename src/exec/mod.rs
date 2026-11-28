@@ -5037,6 +5037,7 @@ impl Db {
             None
         };
         let now = now_ms();
+        let rows_started = std::time::Instant::now();
         let (rows, shape) = if !has_null
             && let Some(built) = dml::build_batch_insert_rows(batch, needs_embed, hashing_dim, now)
         {
@@ -5059,6 +5060,7 @@ impl Db {
             };
             (rows, shape)
         };
+        eprintln!("stage rows {}", rows_started.elapsed().as_nanos());
         let n = rows.len();
         let prepared = self.prepare_stmts_checked(vec![Stmt::InsertRows {
             collection: collection.to_string(),

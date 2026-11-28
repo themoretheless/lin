@@ -570,7 +570,9 @@ pub fn append_batch_records(
     }
 
     if sync == SyncMode::Full {
+        let sync_started = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!("stage sync {}", sync_started.elapsed().as_nanos());
     }
 
     Ok(())
@@ -751,7 +753,9 @@ pub(super) fn write_in_place_frame_buf(
     }
     log.write_all(framed).map_err(io_err)?;
     if sync == SyncMode::Full {
+        let sync_started = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!("stage sync {}", sync_started.elapsed().as_nanos());
     }
     *log_bytes += framed.len() as u64;
     Ok(())
@@ -796,7 +800,9 @@ pub(crate) fn write_frame_precomputed(
     write_frame_bytes(log, codec, payload, checksum, len as u32, *log_bytes).map_err(io_err)?;
 
     if sync == SyncMode::Full {
+        let sync_started = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!("stage sync {}", sync_started.elapsed().as_nanos());
     }
     *log_bytes += 8 + len as u64;
     Ok(())
@@ -1507,7 +1513,9 @@ pub(crate) fn append_validated_frames(
     }
     log.write_all(frames).map_err(io_err)?;
     if sync == SyncMode::Full {
+        let sync_started = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!("stage sync {}", sync_started.elapsed().as_nanos());
     }
     *log_bytes += frames.len() as u64;
     Ok(())
@@ -1529,7 +1537,9 @@ pub(crate) fn append_validated_frame_slices(
     }
     write_all_vectored(log, slices).map_err(io_err)?;
     if sync == SyncMode::Full {
+        let sync_started = std::time::Instant::now();
         durable_sync(log).map_err(io_err)?;
+        eprintln!("stage sync {}", sync_started.elapsed().as_nanos());
     }
     *log_bytes += total_len as u64;
     Ok(())
