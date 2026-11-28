@@ -5888,6 +5888,569 @@ pub(crate) fn sort_positions_top_k(keys: &[Cell], desc: bool, top_k: Option<usiz
     decorated.into_iter().map(|(_, i)| i).collect()
 }
 
+/// Output cardinality and build-side memory ceiling for explicit join operators (`D21`: `LIN-0821`..`LIN-0824`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinBudget {
+    pub max_output_rows: usize,
+    pub max_build_bytes: usize,
+}
+
+/// Physical join operator family (`D21`: `LIN-0813`..`LIN-0816`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JoinAlgorithmKind {
+    HashJoin,
+    SortMergeJoin,
+    HashSemiJoin,
+    HashAntiJoin,
+}
+
+/// Execution telemetry and skew diagnostics for join operators (`D21`: `LIN-0837`..`LIN-0840`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinDiagnostics {
+    pub algorithm: JoinAlgorithmKind,
+    pub left_rows: usize,
+    pub right_rows: usize,
+    pub output_rows: usize,
+    pub hot_keys: Vec<(String, usize)>,
+    pub build_ns: u64,
+    pub probe_ns: u64,
+}
+
+const EXACT_F64_INT_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+const EXACT_I64_LIMIT_U64: u64 = 1u64 << 53;
+
+/// Cross-numeric-type canonical join key (`D21`: `LIN-0804`, `LIN-0805`).
+///
+/// - `Cell::Null` and `Cell::Float(NaN)` map to `None` (`NULL != NULL` and `NaN != NaN`).
+/// - Integral `Cell::Float(x)` with `|x| <= 2^53` normalizes to `NormalizedJoinKey::Int(x as i64)`
+///   (`-0.0` and `+0.0` both normalize to `Int(0)`), so `Int(42)` and `Float(42.0)` hash and
+///   compare identically without precision loss on large integers outside `[-2^53, 2^53]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NormalizedJoinKey {
+    Int(i64),
+    FloatBits(u64),
+    Bool(bool),
+    Time(i64),
+    Text(crate::store::InlineStr),
+    HeapText(Arc<str>),
+}
+
+impl NormalizedJoinKey {
+    fn display_label(&self) -> String {
+        match self {
+            Self::Int(i) => i.to_string(),
+            Self::FloatBits(b) => f64::from_bits(*b).to_string(),
+            Self::Bool(b) => b.to_string(),
+            Self::Time(t) => format!("time({t})"),
+            Self::Text(s) => s.as_str().to_owned(),
+            Self::HeapText(s) => s.as_ref().to_owned(),
+        }
+    }
+
+    fn approx_bytes(&self) -> usize {
+        match self {
+            Self::HeapText(s) => 40 + s.len(),
+            _ => 32,
+        }
+    }
+}
+
+/// Normalize a scalar [`Cell`] into a canonical equi-join key (`None` for `Null`, `NaN`, or `Vec`).
+#[inline]
+pub fn normalize_join_key(cell: &Cell) -> Option<NormalizedJoinKey> {
+    match cell {
+        Cell::Null | Cell::Vec(_) => None,
+        Cell::Int(i) => Some(NormalizedJoinKey::Int(*i)),
+        Cell::Float(f) => {
+            if f.is_nan() {
+                return None;
+            }
+            if f.is_finite()
+                && f.fract() == 0.0
+                && (-EXACT_F64_INT_LIMIT..=EXACT_F64_INT_LIMIT).contains(f)
+            {
+                return Some(NormalizedJoinKey::Int(*f as i64));
+            }
+            let norm = if *f == 0.0 { 0.0f64 } else { *f };
+            Some(NormalizedJoinKey::FloatBits(norm.to_bits()))
+        }
+        Cell::Bool(b) => Some(NormalizedJoinKey::Bool(*b)),
+        Cell::Time(t) => Some(NormalizedJoinKey::Time(*t)),
+        Cell::SmallText(s) => Some(NormalizedJoinKey::Text(*s)),
+        Cell::Text(arc) => {
+            if let Some(inline) = crate::store::InlineStr::try_new(arc.as_ref()) {
+                Some(NormalizedJoinKey::Text(inline))
+            } else {
+                Some(NormalizedJoinKey::HeapText(Arc::clone(arc)))
+            }
+        }
+    }
+}
+
+/// Test equi-join equality between two cells under cross-numeric normalization (`LIN-0804`).
+#[inline]
+pub fn join_cells_match(left: &Cell, right: &Cell) -> bool {
+    match (normalize_join_key(left), normalize_join_key(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Strict total order over [`NormalizedJoinKey`] consistent with [`crate::eval::cmp_sort`] and
+/// exact `Int`/`Float` equality within `[-2^53, 2^53]`.
+fn cmp_normalized_join_keys(a: &NormalizedJoinKey, b: &NormalizedJoinKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn rank(k: &NormalizedJoinKey) -> u8 {
+        match k {
+            NormalizedJoinKey::Bool(_) => 1,
+            NormalizedJoinKey::Int(_) | NormalizedJoinKey::FloatBits(_) => 2,
+            NormalizedJoinKey::Time(_) => 3,
+            NormalizedJoinKey::Text(_) | NormalizedJoinKey::HeapText(_) => 4,
+        }
+    }
+    let ra = rank(a);
+    let rb = rank(b);
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (a, b) {
+        (NormalizedJoinKey::Bool(x), NormalizedJoinKey::Bool(y)) => x.cmp(y),
+        (NormalizedJoinKey::Time(x), NormalizedJoinKey::Time(y)) => x.cmp(y),
+        (NormalizedJoinKey::Int(x), NormalizedJoinKey::Int(y)) => x.cmp(y),
+        (NormalizedJoinKey::FloatBits(xb), NormalizedJoinKey::FloatBits(yb)) => {
+            let xf = f64::from_bits(*xb);
+            let yf = f64::from_bits(*yb);
+            xf.partial_cmp(&yf).unwrap_or(Ordering::Equal)
+        }
+        (NormalizedJoinKey::Int(x), NormalizedJoinKey::FloatBits(yb)) => {
+            let yf = f64::from_bits(*yb);
+            match super::eval::cmp_int_float(*x, yf) {
+                Ordering::Equal if x.unsigned_abs() > EXACT_I64_LIMIT_U64 => Ordering::Less,
+                other => other,
+            }
+        }
+        (NormalizedJoinKey::FloatBits(xb), NormalizedJoinKey::Int(y)) => {
+            let xf = f64::from_bits(*xb);
+            match super::eval::cmp_int_float(*y, xf).reverse() {
+                Ordering::Equal if y.unsigned_abs() > EXACT_I64_LIMIT_U64 => Ordering::Greater,
+                other => other,
+            }
+        }
+        _ => {
+            let sa = match a {
+                NormalizedJoinKey::Text(s) => s.as_str(),
+                NormalizedJoinKey::HeapText(s) => s.as_ref(),
+                _ => "",
+            };
+            let sb = match b {
+                NormalizedJoinKey::Text(s) => s.as_str(),
+                NormalizedJoinKey::HeapText(s) => s.as_ref(),
+                _ => "",
+            };
+            sa.cmp(sb)
+        }
+    }
+}
+
+fn summarize_hot_keys(counts: impl Iterator<Item = (NormalizedJoinKey, usize)>) -> Vec<(String, usize)> {
+    let mut hot: Vec<(String, usize)> = counts
+        .filter(|(_, c)| *c > 1)
+        .map(|(k, c)| (k.display_label(), c))
+        .collect();
+    hot.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    hot.truncate(8);
+    hot
+}
+
+/// Equi-join using a normalized hash table (`D21`: `LIN-0804`, `LIN-0805`, `LIN-0821`..`LIN-0840`).
+pub fn hash_join_rows(
+    left: &[Row],
+    right: &[Row],
+    left_key: &str,
+    right_key: &str,
+    right_prefix: &str,
+    budget: &JoinBudget,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<(Vec<Row>, JoinDiagnostics), Error> {
+    let build_start = std::time::Instant::now();
+    let mut r_slot = crate::store::row::FieldSlot::new(right_key);
+    let mut map: FxHashMap<NormalizedJoinKey, smallvec::SmallVec<[usize; 2]>> =
+        FxHashMap::default();
+    let mut build_bytes = 0usize;
+
+    for (r_idx, r_row) in right.iter().enumerate() {
+        if (r_idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled("hash join cancelled during build phase"));
+        }
+        let Some(key) = r_slot.get(r_row).and_then(normalize_join_key) else {
+            continue;
+        };
+        let row_est = crate::store::row_byte_size(r_row);
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                build_bytes = build_bytes.saturating_add(8 + row_est);
+                if build_bytes > budget.max_build_bytes {
+                    return Err(Error::resource_limit(format!(
+                        "hash join build_bytes {build_bytes} exceeds max_build_bytes {}",
+                        budget.max_build_bytes
+                    )));
+                }
+                e.get_mut().push(r_idx);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                build_bytes = build_bytes.saturating_add(e.key().approx_bytes() + 24 + row_est);
+                if build_bytes > budget.max_build_bytes {
+                    return Err(Error::resource_limit(format!(
+                        "hash join build_bytes {build_bytes} exceeds max_build_bytes {}",
+                        budget.max_build_bytes
+                    )));
+                }
+                e.insert(smallvec::smallvec![r_idx]);
+            }
+        }
+    }
+    let build_ns = build_start.elapsed().as_nanos() as u64;
+
+    let probe_start = std::time::Instant::now();
+    let mut l_slot = crate::store::row::FieldSlot::new(left_key);
+    let mut merger = JoinRowMerger::new(right_prefix);
+    let mut out = Vec::new();
+
+    for (l_idx, l_row) in left.iter().enumerate() {
+        if (l_idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled("hash join cancelled during probe phase"));
+        }
+        let Some(key) = l_slot.get(l_row).and_then(normalize_join_key) else {
+            continue;
+        };
+        let Some(matches) = map.get(&key) else {
+            continue;
+        };
+        for &r_idx in matches {
+            if out.len() + 1 > budget.max_output_rows {
+                return Err(Error::resource_limit(format!(
+                    "hash join output rows {} exceeds max_output_rows {}",
+                    out.len() + 1,
+                    budget.max_output_rows
+                )));
+            }
+            out.push(merger.merge(l_row.clone(), &right[r_idx]));
+        }
+    }
+    let probe_ns = probe_start.elapsed().as_nanos() as u64;
+    let hot_keys = summarize_hot_keys(map.into_iter().map(|(k, v)| (k, v.len())));
+
+    let diag = JoinDiagnostics {
+        algorithm: JoinAlgorithmKind::HashJoin,
+        left_rows: left.len(),
+        right_rows: right.len(),
+        output_rows: out.len(),
+        hot_keys,
+        build_ns,
+        probe_ns,
+    };
+    Ok((out, diag))
+}
+
+/// Sort-merge equi-join over inputs sorted ascending by `(left_key, right_key)` with full
+/// duplicate peer-group handling, cross-numeric `Int`/`Float` matching, budget enforcement,
+/// and cancellation (`D21`: `LIN-0813`, `LIN-0821`..`LIN-0840`).
+pub fn merge_join_sorted_rows(
+    left: &[Row],
+    right: &[Row],
+    left_key: &str,
+    right_key: &str,
+    right_prefix: &str,
+    budget: &JoinBudget,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<(Vec<Row>, JoinDiagnostics), Error> {
+    let build_start = std::time::Instant::now();
+    let mut l_slot = crate::store::row::FieldSlot::new(left_key);
+    let mut r_slot = crate::store::row::FieldSlot::new(right_key);
+
+    let mut l_keys: Vec<Option<NormalizedJoinKey>> = Vec::with_capacity(left.len());
+    let mut prev_l_idx: Option<usize> = None;
+    for (idx, row) in left.iter().enumerate() {
+        if (idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled("sort-merge join cancelled while scanning left keys"));
+        }
+        let k = l_slot.get(row).and_then(normalize_join_key);
+        if let (Some(pi), Some(cur)) = (prev_l_idx, k.as_ref())
+            && let Some(ref p) = l_keys[pi]
+            && cmp_normalized_join_keys(p, cur) == std::cmp::Ordering::Greater
+        {
+            return Err(Error::runtime(
+                "merge_join_sorted_rows: left input is not sorted ascending by join key",
+            ));
+        }
+        if k.is_some() {
+            prev_l_idx = Some(idx);
+        }
+        l_keys.push(k);
+    }
+
+    let mut r_keys: Vec<Option<NormalizedJoinKey>> = Vec::with_capacity(right.len());
+    let mut prev_r_idx: Option<usize> = None;
+    for (idx, row) in right.iter().enumerate() {
+        if (idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled("sort-merge join cancelled while scanning right keys"));
+        }
+        let k = r_slot.get(row).and_then(normalize_join_key);
+        if let (Some(pi), Some(cur)) = (prev_r_idx, k.as_ref())
+            && let Some(ref p) = r_keys[pi]
+            && cmp_normalized_join_keys(p, cur) == std::cmp::Ordering::Greater
+        {
+            return Err(Error::runtime(
+                "merge_join_sorted_rows: right input is not sorted ascending by join key",
+            ));
+        }
+        if k.is_some() {
+            prev_r_idx = Some(idx);
+        }
+        r_keys.push(k);
+    }
+    let build_ns = build_start.elapsed().as_nanos() as u64;
+
+    let probe_start = std::time::Instant::now();
+    let mut merger = JoinRowMerger::new(right_prefix);
+    let mut out = Vec::new();
+    let mut hot_counts: Vec<(NormalizedJoinKey, usize)> = Vec::new();
+
+    let mut li = 0usize;
+    let mut ri = 0usize;
+    while li < left.len() && ri < right.len() {
+        if is_cancelled() {
+            return Err(Error::canceled("sort-merge join cancelled during merge phase"));
+        }
+        let Some(ref lk) = l_keys[li] else {
+            li += 1;
+            continue;
+        };
+        let Some(ref rk) = r_keys[ri] else {
+            ri += 1;
+            continue;
+        };
+        match cmp_normalized_join_keys(lk, rk) {
+            std::cmp::Ordering::Less => {
+                li += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                ri += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let mut l_end = li + 1;
+                while l_end < left.len() {
+                    match &l_keys[l_end] {
+                        Some(next_lk)
+                            if cmp_normalized_join_keys(lk, next_lk)
+                                == std::cmp::Ordering::Equal =>
+                        {
+                            l_end += 1;
+                        }
+                        None => break,
+                        _ => break,
+                    }
+                }
+                let mut r_end = ri + 1;
+                let mut group_build_bytes = crate::store::row_byte_size(&right[ri]);
+                while r_end < right.len() {
+                    match &r_keys[r_end] {
+                        Some(next_rk)
+                            if cmp_normalized_join_keys(rk, next_rk)
+                                == std::cmp::Ordering::Equal =>
+                        {
+                            group_build_bytes = group_build_bytes
+                                .saturating_add(crate::store::row_byte_size(&right[r_end]));
+                            r_end += 1;
+                        }
+                        None => break,
+                        _ => break,
+                    }
+                }
+                if group_build_bytes > budget.max_build_bytes {
+                    return Err(Error::resource_limit(format!(
+                        "sort-merge join peer-group bytes {group_build_bytes} exceeds max_build_bytes {}",
+                        budget.max_build_bytes
+                    )));
+                }
+                let r_group_len = r_end - ri;
+                if r_group_len > 1 {
+                    hot_counts.push((rk.clone(), r_group_len));
+                }
+                for l_pos in li..l_end {
+                    for r_pos in ri..r_end {
+                        if ((out.len()) & 63) == 0 && is_cancelled() {
+                            return Err(Error::canceled(
+                                "sort-merge join cancelled during peer expansion",
+                            ));
+                        }
+                        if out.len() + 1 > budget.max_output_rows {
+                            return Err(Error::resource_limit(format!(
+                                "sort-merge join output rows {} exceeds max_output_rows {}",
+                                out.len() + 1,
+                                budget.max_output_rows
+                            )));
+                        }
+                        out.push(merger.merge(left[l_pos].clone(), &right[r_pos]));
+                    }
+                }
+                li = l_end;
+                ri = r_end;
+            }
+        }
+    }
+    let probe_ns = probe_start.elapsed().as_nanos() as u64;
+    let hot_keys = summarize_hot_keys(hot_counts.into_iter());
+
+    let diag = JoinDiagnostics {
+        algorithm: JoinAlgorithmKind::SortMergeJoin,
+        left_rows: left.len(),
+        right_rows: right.len(),
+        output_rows: out.len(),
+        hot_keys,
+        build_ns,
+        probe_ns,
+    };
+    Ok((out, diag))
+}
+
+fn build_semi_anti_key_counts(
+    right: &[Row],
+    right_key: &str,
+    budget: &JoinBudget,
+    is_cancelled: &mut impl FnMut() -> bool,
+    op_label: &str,
+) -> Result<(FxHashMap<NormalizedJoinKey, usize>, u64), Error> {
+    let start = std::time::Instant::now();
+    let mut r_slot = crate::store::row::FieldSlot::new(right_key);
+    let mut map: FxHashMap<NormalizedJoinKey, usize> = FxHashMap::default();
+    let mut build_bytes = 0usize;
+
+    for (r_idx, r_row) in right.iter().enumerate() {
+        if (r_idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled(format!("{op_label} cancelled during build phase")));
+        }
+        let Some(key) = r_slot.get(r_row).and_then(normalize_join_key) else {
+            continue;
+        };
+        if let Some(cnt) = map.get_mut(&key) {
+            *cnt += 1;
+        } else {
+            build_bytes = build_bytes.saturating_add(key.approx_bytes() + 24);
+            if build_bytes > budget.max_build_bytes {
+                return Err(Error::resource_limit(format!(
+                    "{op_label} build_bytes {build_bytes} exceeds max_build_bytes {}",
+                    budget.max_build_bytes
+                )));
+            }
+            map.insert(key, 1);
+        }
+    }
+    Ok((map, start.elapsed().as_nanos() as u64))
+}
+
+/// Left semi-join (`EXISTS` semantics): emits each `left` row at most once when at least one
+/// `right` row matches under cross-numeric key normalization (`D21`: `LIN-0815`).
+pub fn semi_join_rows(
+    left: &[Row],
+    right: &[Row],
+    left_key: &str,
+    right_key: &str,
+    budget: &JoinBudget,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<(Vec<Row>, JoinDiagnostics), Error> {
+    let (map, build_ns) =
+        build_semi_anti_key_counts(right, right_key, budget, &mut is_cancelled, "semi join")?;
+
+    let probe_start = std::time::Instant::now();
+    let mut l_slot = crate::store::row::FieldSlot::new(left_key);
+    let mut out = Vec::new();
+
+    for (l_idx, l_row) in left.iter().enumerate() {
+        if (l_idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled("semi join cancelled during probe phase"));
+        }
+        let matched = l_slot
+            .get(l_row)
+            .and_then(normalize_join_key)
+            .is_some_and(|k| map.contains_key(&k));
+        if matched {
+            if out.len() + 1 > budget.max_output_rows {
+                return Err(Error::resource_limit(format!(
+                    "semi join output rows {} exceeds max_output_rows {}",
+                    out.len() + 1,
+                    budget.max_output_rows
+                )));
+            }
+            out.push(l_row.clone());
+        }
+    }
+    let probe_ns = probe_start.elapsed().as_nanos() as u64;
+    let hot_keys = summarize_hot_keys(map.into_iter());
+
+    let diag = JoinDiagnostics {
+        algorithm: JoinAlgorithmKind::HashSemiJoin,
+        left_rows: left.len(),
+        right_rows: right.len(),
+        output_rows: out.len(),
+        hot_keys,
+        build_ns,
+        probe_ns,
+    };
+    Ok((out, diag))
+}
+
+/// Left anti-join (`NOT EXISTS` semantics): emits each `left` row that has no matching
+/// `right` row under cross-numeric key normalization (`D21`: `LIN-0816`).
+pub fn anti_join_rows(
+    left: &[Row],
+    right: &[Row],
+    left_key: &str,
+    right_key: &str,
+    budget: &JoinBudget,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<(Vec<Row>, JoinDiagnostics), Error> {
+    let (map, build_ns) =
+        build_semi_anti_key_counts(right, right_key, budget, &mut is_cancelled, "anti join")?;
+
+    let probe_start = std::time::Instant::now();
+    let mut l_slot = crate::store::row::FieldSlot::new(left_key);
+    let mut out = Vec::new();
+
+    for (l_idx, l_row) in left.iter().enumerate() {
+        if (l_idx & 63) == 0 && is_cancelled() {
+            return Err(Error::canceled("anti join cancelled during probe phase"));
+        }
+        let matched = l_slot
+            .get(l_row)
+            .and_then(normalize_join_key)
+            .is_some_and(|k| map.contains_key(&k));
+        if !matched {
+            if out.len() + 1 > budget.max_output_rows {
+                return Err(Error::resource_limit(format!(
+                    "anti join output rows {} exceeds max_output_rows {}",
+                    out.len() + 1,
+                    budget.max_output_rows
+                )));
+            }
+            out.push(l_row.clone());
+        }
+    }
+    let probe_ns = probe_start.elapsed().as_nanos() as u64;
+    let hot_keys = summarize_hot_keys(map.into_iter());
+
+    let diag = JoinDiagnostics {
+        algorithm: JoinAlgorithmKind::HashAntiJoin,
+        left_rows: left.len(),
+        right_rows: right.len(),
+        output_rows: out.len(),
+        hot_keys,
+        build_ns,
+        probe_ns,
+    };
+    Ok((out, diag))
+}
+
 #[cfg(test)]
 mod sort_positions_tests {
     use super::sort_positions_top_k;

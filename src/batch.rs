@@ -80,6 +80,65 @@ impl Validity {
         self.nulls
     }
 
+    /// Logical row length tracked by this validity mask.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when this validity mask has length `0`.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Slice `[range.start .. range.end]` (clamped to `0..self.len`) with an exact
+    /// recomputed `null_count`, avoiding allocation when all sliced values are valid.
+    pub fn slice_range(&self, range: std::ops::Range<usize>) -> Validity {
+        let start = range.start.min(self.len);
+        let end = range.end.min(self.len);
+        if start >= end {
+            return Validity::default();
+        }
+        let n = end - start;
+        if self.nulls == 0 {
+            return Validity::all_valid(n);
+        }
+        let out_words = n.div_ceil(64);
+        let word_shift = start / 64;
+        let bit_shift = start % 64;
+        let mut words = Vec::with_capacity(out_words);
+        if bit_shift == 0 {
+            words.extend_from_slice(&self.words[word_shift..word_shift + out_words]);
+        } else {
+            for w in 0..out_words {
+                let lo = self.words[word_shift + w] >> bit_shift;
+                let hi = self
+                    .words
+                    .get(word_shift + w + 1)
+                    .copied()
+                    .unwrap_or(0)
+                    << (64 - bit_shift);
+                words.push(lo | hi);
+            }
+        }
+        let tail = n % 64;
+        if tail != 0 {
+            words[out_words - 1] &= (1u64 << tail) - 1;
+        }
+        let ones: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+        let nulls = n - ones;
+        if nulls == 0 {
+            Validity::all_valid(n)
+        } else {
+            Validity {
+                words,
+                len: n,
+                nulls,
+            }
+        }
+    }
+
     fn truncate(&mut self, n: usize) {
         if n >= self.len {
             return;
@@ -1203,6 +1262,232 @@ impl Column {
             }
         }
     }
+
+    /// Borrowed zero-allocation view over this column's typed buffer and validity bitmap.
+    #[inline]
+    pub fn as_view(&self) -> ColumnView<'_> {
+        match self {
+            Column::Nulls { n, .. } => ColumnView::Nulls(*n),
+            Column::Int { vals, valid } => ColumnView::Int(vals.as_slice(), valid),
+            Column::Float { vals, valid } => ColumnView::Float(vals.as_slice(), valid),
+            Column::Bool { vals, valid } => ColumnView::Bool(vals.as_slice(), valid),
+            Column::Time { vals, valid } => ColumnView::Time(vals.as_slice(), valid),
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => ColumnView::Text {
+                offsets: offsets.as_slice(),
+                data: data.as_slice(),
+                valid,
+            },
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => ColumnView::Dict {
+                values: values.as_slice(),
+                codes: codes.as_slice(),
+                valid,
+            },
+            Column::Cells(cells) => ColumnView::Mixed(cells.as_slice()),
+        }
+    }
+
+    /// Slice `range` from this column, preserving dense representation, exact `null_count`,
+    /// and sharing `Arc<str>` / `Arc<[f32]>` payloads without deep string copies.
+    pub fn slice_range(&self, range: std::ops::Range<usize>) -> Column {
+        let len = self.len();
+        let start = range.start.min(len);
+        let end = range.end.min(len);
+        let n = end.saturating_sub(start);
+        match self {
+            Column::Nulls { .. } => Column::Nulls { n, cap: n },
+            Column::Int { vals, valid } => Column::Int {
+                vals: if n == 0 { Vec::new() } else { vals[start..end].to_vec() },
+                valid: valid.slice_range(start..end),
+            },
+            Column::Time { vals, valid } => Column::Time {
+                vals: if n == 0 { Vec::new() } else { vals[start..end].to_vec() },
+                valid: valid.slice_range(start..end),
+            },
+            Column::Float { vals, valid } => Column::Float {
+                vals: if n == 0 { Vec::new() } else { vals[start..end].to_vec() },
+                valid: valid.slice_range(start..end),
+            },
+            Column::Bool { vals, valid } => Column::Bool {
+                vals: if n == 0 { Vec::new() } else { vals[start..end].to_vec() },
+                valid: valid.slice_range(start..end),
+            },
+            Column::Text {
+                offsets,
+                data,
+                valid,
+            } => {
+                if n == 0 {
+                    return Column::new_text_with_capacity(0, 0);
+                }
+                let base = offsets[start];
+                let end_byte = offsets[end];
+                let out_offsets: Vec<u32> = offsets[start..=end].iter().map(|&o| o - base).collect();
+                let out_data = data[base as usize..end_byte as usize].to_vec();
+                Column::Text {
+                    offsets: out_offsets,
+                    data: out_data,
+                    valid: valid.slice_range(start..end),
+                }
+            }
+            Column::Dict {
+                values,
+                codes,
+                valid,
+            } => Column::Dict {
+                values: if n == 0 { Vec::new() } else { values.clone() },
+                codes: if n == 0 { Vec::new() } else { codes[start..end].to_vec() },
+                valid: valid.slice_range(start..end),
+            },
+            Column::Cells(cells) => Column::Cells(
+                if n == 0 {
+                    Vec::new()
+                } else {
+                    cells[start..end].iter().map(Cell::clone_for_borrow).collect()
+                },
+            ),
+        }
+    }
+
+    /// Number of null entries in this column.
+    pub fn null_count(&self) -> usize {
+        match self {
+            Column::Nulls { n, .. } => *n,
+            Column::Int { valid, .. }
+            | Column::Time { valid, .. }
+            | Column::Float { valid, .. }
+            | Column::Bool { valid, .. }
+            | Column::Text { valid, .. }
+            | Column::Dict { valid, .. } => valid.null_count(),
+            Column::Cells(c) => c.iter().filter(|v| matches!(v, Cell::Null)).count(),
+        }
+    }
+}
+
+/// Zero-copy borrowed view over a [`Column`] (`D18`: `LIN-0699`).
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnView<'a> {
+    Nulls(usize),
+    Int(&'a [i64], &'a Validity),
+    Float(&'a [f64], &'a Validity),
+    Bool(&'a [bool], &'a Validity),
+    Time(&'a [i64], &'a Validity),
+    Text {
+        offsets: &'a [u32],
+        data: &'a [u8],
+        valid: &'a Validity,
+    },
+    Dict {
+        values: &'a [Arc<str>],
+        codes: &'a [u32],
+        valid: &'a Validity,
+    },
+    Mixed(&'a [Cell]),
+}
+
+impl<'a> ColumnView<'a> {
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            ColumnView::Nulls(n) => *n,
+            ColumnView::Int(v, _) | ColumnView::Time(v, _) => v.len(),
+            ColumnView::Float(v, _) => v.len(),
+            ColumnView::Bool(v, _) => v.len(),
+            ColumnView::Text { valid, .. } | ColumnView::Dict { valid, .. } => valid.len(),
+            ColumnView::Mixed(c) => c.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn null_count(&self) -> usize {
+        match self {
+            ColumnView::Nulls(n) => *n,
+            ColumnView::Int(_, valid)
+            | ColumnView::Float(_, valid)
+            | ColumnView::Bool(_, valid)
+            | ColumnView::Time(_, valid)
+            | ColumnView::Text { valid, .. }
+            | ColumnView::Dict { valid, .. } => valid.null_count(),
+            ColumnView::Mixed(c) => c.iter().filter(|cell| matches!(cell, Cell::Null)).count(),
+        }
+    }
+
+    #[inline]
+    pub fn text_at(&self, i: usize) -> Option<&'a str> {
+        match self {
+            ColumnView::Text {
+                offsets,
+                data,
+                valid,
+            } if valid.is_valid(i) => {
+                let s = *offsets.get(i)? as usize;
+                let e = *offsets.get(i + 1)? as usize;
+                std::str::from_utf8(data.get(s..e)?).ok()
+            }
+            ColumnView::Dict {
+                values,
+                codes,
+                valid,
+            } if valid.is_valid(i) => values.get(*codes.get(i)? as usize).map(Arc::as_ref),
+            ColumnView::Mixed(cells) => cells.get(i).and_then(Cell::text),
+            _ => None,
+        }
+    }
+}
+
+/// Memory and cardinality ceiling for a [`RecordBatch`] (`D18`: `LIN-0700`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchAllocationBudget {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+/// Per-column memory breakdown for diagnostics and budget enforcement (`D18`: `LIN-0713`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMemoryDiagnostics {
+    pub name: String,
+    pub kind: &'static str,
+    pub len: usize,
+    pub null_count: usize,
+    pub payload_bytes: usize,
+    pub validity_bytes: usize,
+}
+
+/// Safe Arrow C Data Interface schema boundary descriptor (`D18`: `LIN-0709`..`LIN-0712`).
+///
+/// Captures the exact Arrow format string, nullability, dictionary ordering, and buffer
+/// ownership/release contract without exposing raw pointer lifetimes or `unsafe` FFI UB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrowSchemaDescriptor {
+    pub name: String,
+    pub format: &'static str,
+    pub nullable: bool,
+    pub dictionary_ordered: bool,
+    pub children: Vec<ArrowSchemaDescriptor>,
+    pub ownership_contract: &'static str,
+}
+
+/// Safe Arrow C Data Interface column export metadata (`D18`: `LIN-0710`..`LIN-0712`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrowColumnExport {
+    pub schema: ArrowSchemaDescriptor,
+    pub length: usize,
+    pub null_count: usize,
+    pub offset: usize,
+    pub buffer_lengths_bytes: Vec<usize>,
+    pub release_required: bool,
 }
 
 fn prefilled<T: Clone>(n: usize, cap: usize, fill: T) -> Vec<T> {
@@ -2831,6 +3116,533 @@ impl RecordBatch {
             names: names.into(),
             cols,
         })
+    }
+
+    /// Logical row count (synonym for [`Self::n`]).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.n()
+    }
+
+    /// Slice `[range.start .. range.end]` across all columns, sharing schema `Arc<[String]>`
+    /// and `Arc`-backed string/dictionary payloads with exact recomputed null counts (`LIN-0689`).
+    pub fn slice(&self, range: std::ops::Range<usize>) -> RecordBatch {
+        let cols = self
+            .cols
+            .iter()
+            .map(|c| c.slice_range(range.clone()))
+            .collect();
+        RecordBatch {
+            names: Arc::clone(&self.names),
+            cols,
+        }
+    }
+
+    /// Concatenate batches that share the exact same column schema, promoting `Int`/`Float`
+    /// mixtures cleanly to dense `Column::Float` (`LIN-0697`).
+    pub fn concat(batches: &[&RecordBatch]) -> Result<RecordBatch, Error> {
+        if batches.is_empty() {
+            return Ok(RecordBatch::empty(Arc::<[String]>::from([])));
+        }
+        let first = batches[0];
+        first.inspect_consistency()?;
+        for (idx, b) in batches.iter().enumerate().skip(1) {
+            b.inspect_consistency()?;
+            if b.names.as_ref() != first.names.as_ref() {
+                return Err(Error::runtime(format!(
+                    "batch concat: schema mismatch at batch {idx} (expected {:?}, got {:?})",
+                    first.names, b.names
+                )));
+            }
+        }
+        let col_count = first.cols.len();
+        let mut out_cols = Vec::with_capacity(col_count);
+        for c_idx in 0..col_count {
+            let refs: Vec<(Option<&Column>, usize)> = batches
+                .iter()
+                .map(|b| (Some(&b.cols[c_idx]), b.n()))
+                .collect();
+            out_cols.push(merge_column_segments(&first.names[c_idx], &refs, false)?);
+        }
+        Ok(RecordBatch {
+            names: Arc::clone(&first.names),
+            cols: out_cols,
+        })
+    }
+
+    /// Reconcile and concatenate heterogeneous batches by aligning missing columns with nulls
+    /// and promoting compatible `Int`/`Float` columns cleanly (`LIN-0698`).
+    pub fn reconcile_schema(batches: &[RecordBatch]) -> Result<RecordBatch, Error> {
+        if batches.is_empty() {
+            return Ok(RecordBatch::empty(Arc::<[String]>::from([])));
+        }
+        let mut unified_names: Vec<String> = Vec::new();
+        for (b_idx, b) in batches.iter().enumerate() {
+            b.inspect_consistency()?;
+            let mut seen_in_batch: BTreeSet<&str> = BTreeSet::new();
+            for nm in b.names.iter() {
+                if !seen_in_batch.insert(nm.as_str()) {
+                    return Err(Error::runtime(format!(
+                        "batch reconcile_schema: duplicate column `{nm}` in batch {b_idx}"
+                    )));
+                }
+                if !unified_names.iter().any(|u| u == nm) {
+                    unified_names.push(nm.clone());
+                }
+            }
+        }
+        let mut out_cols = Vec::with_capacity(unified_names.len());
+        for col_name in &unified_names {
+            let segs: Vec<(Option<&Column>, usize)> = batches
+                .iter()
+                .map(|b| {
+                    let col = b
+                        .names
+                        .iter()
+                        .position(|nm| nm == col_name)
+                        .map(|idx| &b.cols[idx]);
+                    (col, b.n())
+                })
+                .collect();
+            out_cols.push(merge_column_segments(col_name, &segs, true)?);
+        }
+        Ok(RecordBatch {
+            names: unified_names.into(),
+            cols: out_cols,
+        })
+    }
+
+    /// Per-column memory diagnostics (`LIN-0713`).
+    pub fn memory_diagnostics(&self) -> Vec<ColumnMemoryDiagnostics> {
+        self.names
+            .iter()
+            .zip(self.cols.iter())
+            .map(|(name, col)| {
+                let (kind, payload_bytes, validity_bytes) = match col {
+                    Column::Nulls { .. } => ("Nulls", 0, 0),
+                    Column::Int { vals, valid } => {
+                        ("Int", vals.capacity() * 8, valid.words.capacity() * 8)
+                    }
+                    Column::Time { vals, valid } => {
+                        ("Time", vals.capacity() * 8, valid.words.capacity() * 8)
+                    }
+                    Column::Float { vals, valid } => {
+                        ("Float", vals.capacity() * 8, valid.words.capacity() * 8)
+                    }
+                    Column::Bool { vals, valid } => {
+                        ("Bool", vals.capacity(), valid.words.capacity() * 8)
+                    }
+                    Column::Text {
+                        offsets,
+                        data,
+                        valid,
+                    } => (
+                        "Text",
+                        offsets.capacity() * 4 + data.capacity(),
+                        valid.words.capacity() * 8,
+                    ),
+                    Column::Dict {
+                        values,
+                        codes,
+                        valid,
+                    } => (
+                        "Dict",
+                        codes.capacity() * 4
+                            + values.capacity() * std::mem::size_of::<Arc<str>>()
+                            + values.iter().map(|s| s.len()).sum::<usize>(),
+                        valid.words.capacity() * 8,
+                    ),
+                    Column::Cells(c) => {
+                        let extra: usize = c
+                            .iter()
+                            .map(|cell| match cell {
+                                Cell::Text(s) => s.len(),
+                                Cell::Vec(v) => v.len() * 4,
+                                _ => 0,
+                            })
+                            .sum();
+                        ("Mixed", c.capacity() * std::mem::size_of::<Cell>() + extra, 0)
+                    }
+                };
+                ColumnMemoryDiagnostics {
+                    name: name.clone(),
+                    kind,
+                    len: col.len(),
+                    null_count: col.null_count(),
+                    payload_bytes,
+                    validity_bytes,
+                }
+            })
+            .collect()
+    }
+
+    /// Estimated total memory footprint in bytes (`LIN-0700`).
+    #[inline]
+    pub fn estimated_bytes(&self) -> usize {
+        self.byte_size()
+    }
+
+    /// Enforce row and byte allocation budgets (`LIN-0700`).
+    pub fn check_budget(&self, budget: &BatchAllocationBudget) -> Result<(), Error> {
+        let rows = self.n();
+        if rows > budget.max_rows {
+            return Err(Error::resource_limit(format!(
+                "batch row count {rows} exceeds max_rows budget {}",
+                budget.max_rows
+            )));
+        }
+        let bytes = self.estimated_bytes();
+        if bytes > budget.max_bytes {
+            return Err(Error::resource_limit(format!(
+                "batch estimated_bytes {bytes} exceeds max_bytes budget {}",
+                budget.max_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Verify internal structural invariants across schema, column lengths, validity masks,
+    /// text offsets, UTF-8 buffers, and dictionary codes (`LIN-0714`..`LIN-0716`).
+    pub fn inspect_consistency(&self) -> Result<(), Error> {
+        if self.names.len() != self.cols.len() {
+            return Err(Error::corrupt(format!(
+                "batch consistency: names.len() ({}) != cols.len() ({})",
+                self.names.len(),
+                self.cols.len()
+            )));
+        }
+        let expected_len = self.n();
+        for (idx, (name, col)) in self.names.iter().zip(self.cols.iter()).enumerate() {
+            let clen = col.len();
+            if clen != expected_len {
+                return Err(Error::corrupt(format!(
+                    "batch consistency: column {idx} (`{name}`) len {clen} != batch len {expected_len}"
+                )));
+            }
+            match col {
+                Column::Nulls { .. } | Column::Cells(_) => {}
+                Column::Int { vals, valid } | Column::Time { vals, valid } => {
+                    inspect_validity_invariants(name, vals.len(), valid)?;
+                }
+                Column::Float { vals, valid } => {
+                    inspect_validity_invariants(name, vals.len(), valid)?;
+                }
+                Column::Bool { vals, valid } => {
+                    inspect_validity_invariants(name, vals.len(), valid)?;
+                }
+                Column::Text {
+                    offsets,
+                    data,
+                    valid,
+                } => {
+                    inspect_validity_invariants(name, clen, valid)?;
+                    if offsets.len() != clen + 1 {
+                        return Err(Error::corrupt(format!(
+                            "batch consistency: text column `{name}` offsets.len() {} != {}",
+                            offsets.len(),
+                            clen + 1
+                        )));
+                    }
+                    if offsets.first().copied() != Some(0) {
+                        return Err(Error::corrupt(format!(
+                            "batch consistency: text column `{name}` offsets[0] != 0"
+                        )));
+                    }
+                    if offsets.last().copied().unwrap_or(0) as usize != data.len() {
+                        return Err(Error::corrupt(format!(
+                            "batch consistency: text column `{name}` last offset != data.len()"
+                        )));
+                    }
+                    for w in offsets.windows(2) {
+                        if w[0] > w[1] {
+                            return Err(Error::corrupt(format!(
+                                "batch consistency: text column `{name}` non-monotonic offsets {} > {}",
+                                w[0], w[1]
+                            )));
+                        }
+                        if std::str::from_utf8(&data[w[0] as usize..w[1] as usize]).is_err() {
+                            return Err(Error::corrupt(format!(
+                                "batch consistency: text column `{name}` invalid UTF-8 slice"
+                            )));
+                        }
+                    }
+                }
+                Column::Dict {
+                    values,
+                    codes,
+                    valid,
+                } => {
+                    inspect_validity_invariants(name, codes.len(), valid)?;
+                    for (row_i, &code) in codes.iter().enumerate() {
+                        if valid.is_valid(row_i) && (code as usize) >= values.len() {
+                            return Err(Error::corrupt(format!(
+                                "batch consistency: dict column `{name}` row {row_i} code {code} >= dict len {}",
+                                values.len()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Describe this batch's Arrow C Data Interface struct schema and ownership/release contract
+    /// without invoking `unsafe` FFI (`LIN-0709`..`LIN-0712`).
+    pub fn describe_arrow_schema(&self) -> ArrowSchemaDescriptor {
+        let children = self
+            .names
+            .iter()
+            .zip(self.cols.iter())
+            .map(|(name, col)| column_arrow_descriptor(name, col))
+            .collect();
+        ArrowSchemaDescriptor {
+            name: String::new(),
+            format: "+s",
+            nullable: false,
+            dictionary_ordered: false,
+            children,
+            ownership_contract: ARROW_OWNERSHIP_CONTRACT,
+        }
+    }
+
+    /// Produce safe per-column Arrow C Data Interface export metadata (`LIN-0710`..`LIN-0712`).
+    pub fn export_arrow_descriptors(&self) -> Vec<ArrowColumnExport> {
+        self.names
+            .iter()
+            .zip(self.cols.iter())
+            .map(|(name, col)| {
+                let schema = column_arrow_descriptor(name, col);
+                let len = col.len();
+                let null_count = col.null_count();
+                let valid_bytes = if null_count == 0 { 0 } else { len.div_ceil(8) };
+                let buffer_lengths_bytes = match col {
+                    Column::Nulls { .. } => Vec::new(),
+                    Column::Int { .. } | Column::Time { .. } | Column::Float { .. } => {
+                        vec![valid_bytes, len * 8]
+                    }
+                    Column::Bool { .. } => vec![valid_bytes, len.div_ceil(8)],
+                    Column::Text { offsets, data, .. } => {
+                        vec![valid_bytes, offsets.len() * 4, data.len()]
+                    }
+                    Column::Dict { codes, .. } => vec![valid_bytes, codes.len() * 4],
+                    Column::Cells(cells) => vec![cells.len() * std::mem::size_of::<Cell>()],
+                };
+                ArrowColumnExport {
+                    schema,
+                    length: len,
+                    null_count,
+                    offset: 0,
+                    buffer_lengths_bytes,
+                    release_required: len > 0,
+                }
+            })
+            .collect()
+    }
+}
+
+const ARROW_OWNERSHIP_CONTRACT: &str = "Producer pins backing Vec/Arc buffers until consumer invokes ArrowArray.release exactly once; consumer must set release=NULL after call and never mutate exported buffers.";
+
+fn column_arrow_descriptor(name: &str, col: &Column) -> ArrowSchemaDescriptor {
+    let (format, dictionary_ordered) = match col {
+        Column::Nulls { .. } => ("n", false),
+        Column::Int { .. } => ("l", false),
+        Column::Float { .. } => ("g", false),
+        Column::Bool { .. } => ("b", false),
+        Column::Time { .. } => ("tsm:UTC", false),
+        Column::Text { .. } => ("u", false),
+        Column::Dict { .. } => ("I", false),
+        Column::Cells(_) => ("+ud:0,1,2,3,4,5,6", false),
+    };
+    ArrowSchemaDescriptor {
+        name: name.to_owned(),
+        format,
+        nullable: matches!(col, Column::Nulls { .. }) || col.null_count() > 0,
+        dictionary_ordered,
+        children: Vec::new(),
+        ownership_contract: ARROW_OWNERSHIP_CONTRACT,
+    }
+}
+
+fn inspect_validity_invariants(name: &str, col_len: usize, valid: &Validity) -> Result<(), Error> {
+    if valid.len != col_len {
+        return Err(Error::corrupt(format!(
+            "batch consistency: column `{name}` validity len {} != col len {col_len}",
+            valid.len
+        )));
+    }
+    if valid.nulls > valid.len {
+        return Err(Error::corrupt(format!(
+            "batch consistency: column `{name}` validity nulls {} > len {}",
+            valid.nulls, valid.len
+        )));
+    }
+    let expected_words = if valid.nulls == 0 {
+        0
+    } else {
+        valid.len.div_ceil(64)
+    };
+    if valid.words.len() != expected_words {
+        return Err(Error::corrupt(format!(
+            "batch consistency: column `{name}` validity words.len() {} != expected {expected_words}",
+            valid.words.len()
+        )));
+    }
+    if valid.nulls > 0 {
+        let tail = valid.len % 64;
+        if tail != 0 {
+            let last = *valid.words.last().unwrap();
+            let high_mask = !((1u64 << tail) - 1);
+            if (last & high_mask) != 0 {
+                return Err(Error::corrupt(format!(
+                    "batch consistency: column `{name}` validity has set trailing bits beyond len"
+                )));
+            }
+        }
+        let ones: usize = valid.words.iter().map(|w| w.count_ones() as usize).sum();
+        let actual_nulls = valid.len - ones;
+        if actual_nulls != valid.nulls {
+            return Err(Error::corrupt(format!(
+                "batch consistency: column `{name}` validity null_count {} != actual {actual_nulls}",
+                valid.nulls
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn merge_column_segments(
+    col_name: &str,
+    segments: &[(Option<&Column>, usize)],
+    strict_reconcile: bool,
+) -> Result<Column, Error> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Nulls,
+        Int,
+        Float,
+        Bool,
+        Time,
+        Text,
+        Cells,
+    }
+    let classify = |c: &Column| -> Kind {
+        match c {
+            Column::Nulls { .. } => Kind::Nulls,
+            Column::Int { .. } => Kind::Int,
+            Column::Float { .. } => Kind::Float,
+            Column::Bool { .. } => Kind::Bool,
+            Column::Time { .. } => Kind::Time,
+            Column::Text { .. } | Column::Dict { .. } => Kind::Text,
+            Column::Cells(_) => Kind::Cells,
+        }
+    };
+
+    let total_rows: usize = segments.iter().map(|(_, n)| *n).sum();
+    let mut target = Kind::Nulls;
+    for &(col_opt, _) in segments {
+        let Some(col) = col_opt else {
+            continue;
+        };
+        let k = classify(col);
+        if k == Kind::Nulls {
+            continue;
+        }
+        target = match (target, k) {
+            (Kind::Nulls, other) => other,
+            (a, b) if a == b => a,
+            (Kind::Int, Kind::Float) | (Kind::Float, Kind::Int) => Kind::Float,
+            (a, b) => {
+                if strict_reconcile && a != Kind::Cells && b != Kind::Cells {
+                    return Err(Error::runtime(format!(
+                        "batch reconcile_schema: incompatible column types on `{col_name}`"
+                    ))
+                    .with_code(crate::error::ErrorCode::CheckType));
+                }
+                Kind::Cells
+            }
+        };
+    }
+
+    match target {
+        Kind::Nulls => Ok(Column::Nulls {
+            n: total_rows,
+            cap: total_rows,
+        }),
+        Kind::Float => {
+            let mut vals = Vec::with_capacity(total_rows);
+            let mut valid = Validity::default();
+            for &(col_opt, seg_len) in segments {
+                match col_opt {
+                    None | Some(Column::Nulls { .. }) => {
+                        vals.resize(vals.len() + seg_len, 0.0);
+                        valid.extend(&Validity::all_null(seg_len));
+                    }
+                    Some(Column::Float { vals: fv, valid: v }) => {
+                        vals.extend_from_slice(fv);
+                        valid.extend(v);
+                    }
+                    Some(Column::Int { vals: iv, valid: v }) => {
+                        vals.extend(iv.iter().map(|&x| x as f64));
+                        valid.extend(v);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Column::Float { vals, valid })
+        }
+        Kind::Text => {
+            let all_dict = segments.iter().all(|&(c, _)| {
+                matches!(c, None | Some(Column::Nulls { .. }) | Some(Column::Dict { .. }))
+            });
+            if all_dict {
+                let mut out = Column::with_capacity(total_rows);
+                for &(col_opt, seg_len) in segments {
+                    match col_opt {
+                        None => out.extend(Column::Nulls {
+                            n: seg_len,
+                            cap: 0,
+                        }),
+                        Some(col) => out.extend(col.clone()),
+                    }
+                }
+                return Ok(out);
+            }
+            let mut out = Column::new_text_with_capacity(total_rows, total_rows * 8);
+            for &(col_opt, seg_len) in segments {
+                match col_opt {
+                    None | Some(Column::Nulls { .. }) => {
+                        for _ in 0..seg_len {
+                            out.push(Cell::Null);
+                        }
+                    }
+                    Some(col @ Column::Text { .. }) => out.extend(col.clone()),
+                    Some(col @ Column::Dict { .. }) => {
+                        for i in 0..col.len() {
+                            match col.text_at(i) {
+                                Some(s) => out.push(Cell::from_text(s)),
+                                None => out.push(Cell::Null),
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(out)
+        }
+        _ => {
+            let mut out = Column::with_capacity(total_rows);
+            for &(col_opt, seg_len) in segments {
+                match col_opt {
+                    None => out.extend(Column::Nulls {
+                        n: seg_len,
+                        cap: 0,
+                    }),
+                    Some(col) => out.extend(col.clone()),
+                }
+            }
+            Ok(out)
+        }
     }
 }
 

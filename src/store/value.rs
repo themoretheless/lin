@@ -22,8 +22,31 @@ pub fn cell_from_arc_inline(arc: &Arc<str>) -> Cell {
     }
 }
 
+/// Hit/miss and retained-buffer telemetry for the calling thread's row pools
+/// (`D08`, `D09`: `LIN-0321`, `LIN-0322`, `LIN-0351`, `LIN-0352`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowPoolStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub retained_vecs: usize,
+    pub retained_rows: usize,
+    pub retained_bytes_approx: usize,
+}
+
 thread_local! {
     static ORDERS_ROW_POOL: std::cell::RefCell<Vec<Row>> = const { std::cell::RefCell::new(Vec::new()) };
+    static POOL_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static POOL_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn record_pool_hit() {
+    let _ = POOL_HITS.try_with(|c| c.set(c.get() + 1));
+}
+
+#[inline]
+fn record_pool_miss() {
+    let _ = POOL_MISSES.try_with(|c| c.set(c.get() + 1));
 }
 
 #[inline]
@@ -32,8 +55,10 @@ pub fn acquire_orders_row() -> Row {
         std::sync::LazyLock::new(|| Row::shape_of(&["id", "total", "user_id"]));
     ORDERS_ROW_POOL.with(|pool| {
         if let Some(row) = pool.borrow_mut().pop() {
+            record_pool_hit();
             return row;
         }
+        record_pool_miss();
         Row::from_parts(
             Arc::clone(&ORDERS_SHAPE),
             [Cell::Null, Cell::Null, Cell::Null],
@@ -70,7 +95,13 @@ pub fn release_id_title_rows(rows: Vec<Row>) {
 
 #[inline]
 pub(crate) fn take_recycled_id_title_vec() -> Option<Vec<Row>> {
-    ID_TITLE_POOL.try_with(|cell| cell.take()).ok().flatten()
+    let out = ID_TITLE_POOL.try_with(|cell| cell.take()).ok().flatten();
+    if out.is_some() {
+        record_pool_hit();
+    } else {
+        record_pool_miss();
+    }
+    out
 }
 
 thread_local! {
@@ -95,6 +126,7 @@ pub(crate) fn take_single_id_title_vec_with_arcs(id: &Arc<str>, title: &Arc<str>
         .try_with(|cell| cell.take())
         .unwrap_or_default();
     if v.len() == 1 {
+        record_pool_hit();
         let shape = shape_id_title();
         let r0 = &mut v[0];
         let matches = r0.shape_arc().is_some_and(|s| Arc::ptr_eq(s, shape))
@@ -111,6 +143,7 @@ pub(crate) fn take_single_id_title_vec_with_arcs(id: &Arc<str>, title: &Arc<str>
         }
         return v;
     }
+    record_pool_miss();
     vec![row_id_title(id, title)]
 }
 
@@ -120,10 +153,12 @@ pub(crate) fn wrap_single_row_vec(row: Row) -> Vec<Row> {
         .try_with(|cell| cell.take())
         .unwrap_or_default();
     if v.capacity() >= 1 {
+        record_pool_hit();
         v.clear();
         v.push(row);
         return v;
     }
+    record_pool_miss();
     vec![row]
 }
 
@@ -144,10 +179,119 @@ pub fn release_general_rows(rows: Vec<Row>) {
 
 #[inline]
 pub(crate) fn take_general_rows() -> Option<Vec<Row>> {
-    GENERAL_ROW_VEC_POOL
+    let out = GENERAL_ROW_VEC_POOL
         .try_with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()))
         .ok()
-        .flatten()
+        .flatten();
+    if out.is_some() {
+        record_pool_hit();
+    } else {
+        record_pool_miss();
+    }
+    out
+}
+
+/// Public accessor for acquiring a recycled general `Vec<Row>` buffer from the thread pool.
+#[inline]
+pub fn acquire_general_rows() -> Option<Vec<Row>> {
+    take_general_rows()
+}
+
+#[inline]
+fn approx_vec_row_bytes(v: &Vec<Row>) -> usize {
+    let base = v.capacity() * std::mem::size_of::<Row>();
+    let extra: usize = v
+        .iter()
+        .take(64)
+        .map(row_byte_size)
+        .sum::<usize>()
+        .saturating_mul(v.len().div_ceil(64).max(1));
+    base.saturating_add(extra)
+}
+
+/// Inspect current thread-local row pool telemetry (`LIN-0321`, `LIN-0351`).
+pub fn row_pool_stats() -> RowPoolStats {
+    let hits = POOL_HITS.try_with(|c| c.get()).unwrap_or(0);
+    let misses = POOL_MISSES.try_with(|c| c.get()).unwrap_or(0);
+    let mut retained_vecs = 0usize;
+    let mut retained_rows = 0usize;
+    let mut retained_bytes_approx = 0usize;
+
+    let _ = ORDERS_ROW_POOL.try_with(|pool| {
+        if let Ok(p) = pool.try_borrow()
+            && (!p.is_empty() || p.capacity() > 0)
+        {
+            retained_vecs += usize::from(!p.is_empty());
+            retained_rows += p.len();
+            retained_bytes_approx += approx_vec_row_bytes(&p);
+        }
+    });
+    let _ = ID_TITLE_POOL.try_with(|cell| {
+        if let Some(v) = cell.take() {
+            retained_vecs += 1;
+            retained_rows += v.len();
+            retained_bytes_approx += approx_vec_row_bytes(&v);
+            cell.set(Some(v));
+        }
+    });
+    let _ = SINGLE_ID_TITLE_VEC.try_with(|cell| {
+        let v = cell.take();
+        if v.capacity() > 0 {
+            retained_vecs += 1;
+            retained_rows += v.len();
+            retained_bytes_approx += approx_vec_row_bytes(&v);
+        }
+        cell.set(v);
+    });
+    let _ = GENERAL_ROW_VEC_POOL.try_with(|cell| {
+        if let Ok(slot) = cell.try_borrow()
+            && let Some(ref v) = *slot
+        {
+            retained_vecs += 1;
+            retained_rows += v.len();
+            retained_bytes_approx += approx_vec_row_bytes(v);
+        }
+    });
+
+    RowPoolStats {
+        hits,
+        misses,
+        retained_vecs,
+        retained_rows,
+        retained_bytes_approx,
+    }
+}
+
+/// Release all retained thread-local pooled `Vec<Row>` and `Row` buffers on the calling
+/// thread, returning approximate freed bytes (`LIN-0322`, `LIN-0352`).
+pub fn purge_thread_row_pools() -> usize {
+    let mut freed = 0usize;
+    let _ = ORDERS_ROW_POOL.try_with(|pool| {
+        if let Ok(mut p) = pool.try_borrow_mut() {
+            freed += approx_vec_row_bytes(&p);
+            *p = Vec::new();
+        }
+    });
+    let _ = ID_TITLE_POOL.try_with(|cell| {
+        if let Some(v) = cell.take() {
+            freed += approx_vec_row_bytes(&v);
+            drop(v);
+        }
+    });
+    let _ = SINGLE_ID_TITLE_VEC.try_with(|cell| {
+        let v = cell.take();
+        freed += approx_vec_row_bytes(&v);
+        drop(v);
+    });
+    let _ = GENERAL_ROW_VEC_POOL.try_with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut()
+            && let Some(v) = slot.take()
+        {
+            freed += approx_vec_row_bytes(&v);
+            drop(v);
+        }
+    });
+    freed
 }
 
 /// Compact inline string storage for strings up to 22 bytes.
@@ -589,6 +733,69 @@ impl RowExt for Row {
     fn cell(&self, key: &str) -> &Cell {
         static NULL: Cell = Cell::Null;
         self.get(key).unwrap_or(&NULL)
+    }
+}
+
+/// Zero-allocation borrowed view over a [`Row`] with typed scalar accessors (`D08`: `LIN-0310`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowView<'a>(pub &'a Row);
+
+impl<'a> RowView<'a> {
+    #[inline]
+    pub const fn new(row: &'a Row) -> Self {
+        Self(row)
+    }
+
+    #[inline]
+    pub const fn row(&self) -> &'a Row {
+        self.0
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn get_cell(&self, field: &str) -> Option<&'a Cell> {
+        self.0.get_str(field)
+    }
+
+    #[inline]
+    pub fn get_str(&self, field: &str) -> Option<&'a str> {
+        self.0.get_str(field).and_then(Cell::text)
+    }
+
+    #[inline]
+    pub fn get_i64(&self, field: &str) -> Option<i64> {
+        self.0.get_str(field).and_then(Cell::as_i64)
+    }
+
+    #[inline]
+    pub fn get_f64(&self, field: &str) -> Option<f64> {
+        self.0.get_str(field).and_then(Cell::as_f64)
+    }
+
+    #[inline]
+    pub fn get_bool(&self, field: &str) -> Option<bool> {
+        self.0.get_str(field).and_then(Cell::as_bool)
+    }
+
+    #[inline]
+    pub fn get_time(&self, field: &str) -> Option<i64> {
+        self.0.get_str(field).and_then(Cell::as_time)
+    }
+
+    #[inline]
+    pub fn iter_fields(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&'a str, &'a Cell)> + DoubleEndedIterator + 'a {
+        self.0.iter().map(|(k, v)| (k.as_str(), v))
     }
 }
 

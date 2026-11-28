@@ -5007,3 +5007,255 @@ impl super::ReadDb {
         self.run_prepared_batch_lossless(&prepared)
     }
 }
+
+/// Numerically stable single-pass & parallel-mergeable anchor-shifted Welford mean/variance/stddev
+/// accumulator (`D19`: `LIN-0745`, `LIN-0746`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WelfordAcc {
+    n: usize,
+    anchor: f64,
+    u_mean: f64,
+    m2: f64,
+    has_nan: bool,
+}
+
+impl WelfordAcc {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            n: 0,
+            anchor: 0.0,
+            u_mean: 0.0,
+            m2: 0.0,
+            has_nan: false,
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, x: f64) {
+        if self.has_nan || x.is_nan() {
+            self.n += 1;
+            self.has_nan = true;
+            self.u_mean = f64::NAN;
+            self.m2 = f64::NAN;
+            return;
+        }
+        if self.n == 0 {
+            self.n = 1;
+            if x.is_finite() {
+                self.anchor = x;
+                self.u_mean = 0.0;
+            } else {
+                self.anchor = 0.0;
+                self.u_mean = x;
+            }
+            self.m2 = 0.0;
+            return;
+        }
+        self.n += 1;
+        let u = x - self.anchor;
+        let delta = u - self.u_mean;
+        self.u_mean += delta / (self.n as f64);
+        let delta2 = u - self.u_mean;
+        self.m2 += delta * delta2;
+    }
+
+    /// Merge another Welford accumulator using Chan et al.'s numerically stable pairwise formula
+    /// over exact anchor-shifted residuals.
+    #[inline]
+    pub fn merge(&mut self, other: &Self) {
+        if other.n == 0 {
+            return;
+        }
+        if self.n == 0 {
+            *self = *other;
+            return;
+        }
+        let total_n = self.n + other.n;
+        if self.has_nan || other.has_nan {
+            self.n = total_n;
+            self.has_nan = true;
+            self.u_mean = f64::NAN;
+            self.m2 = f64::NAN;
+            return;
+        }
+        let na = self.n as f64;
+        let nb = other.n as f64;
+        let nt = total_n as f64;
+        let delta = (other.anchor - self.anchor) + (other.u_mean - self.u_mean);
+        self.u_mean += delta * (nb / nt);
+        self.m2 += other.m2 + delta * delta * (na * nb / nt);
+        self.n = total_n;
+    }
+
+    #[inline]
+    pub const fn count(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn mean(&self) -> Option<f64> {
+        if self.n == 0 {
+            None
+        } else if self.has_nan {
+            Some(f64::NAN)
+        } else {
+            Some(self.anchor + self.u_mean)
+        }
+    }
+
+    #[inline]
+    pub fn variance_pop(&self) -> Option<f64> {
+        if self.n == 0 {
+            None
+        } else if self.has_nan {
+            Some(f64::NAN)
+        } else if self.n == 1 {
+            Some(0.0)
+        } else {
+            Some((self.m2 / (self.n as f64)).max(0.0))
+        }
+    }
+
+    #[inline]
+    pub fn variance_sample(&self) -> Option<f64> {
+        if self.n < 2 {
+            None
+        } else if self.has_nan {
+            Some(f64::NAN)
+        } else {
+            Some((self.m2 / ((self.n - 1) as f64)).max(0.0))
+        }
+    }
+
+    #[inline]
+    pub fn stddev_pop(&self) -> Option<f64> {
+        self.variance_pop().map(f64::sqrt)
+    }
+
+    #[inline]
+    pub fn stddev_sample(&self) -> Option<f64> {
+        self.variance_sample().map(f64::sqrt)
+    }
+}
+
+/// Cardinality and memory budget for grouped aggregations (`D19`: `LIN-0757`, `LIN-0760`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupBudget {
+    pub max_groups: usize,
+    pub max_bytes: usize,
+}
+
+/// Group cardinality and Zipf/heavy-hitter skew diagnostics (`D19`: `LIN-0759`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggSkewDiagnostics {
+    pub total_rows: usize,
+    pub distinct_groups: usize,
+    pub max_group_rows: usize,
+    pub top_group_share: f64,
+    pub overflowed: bool,
+}
+
+/// Compute grouped Welford statistics over `rows` with an optional `FILTER` predicate,
+/// enforcing `GroupBudget` limits and reporting group skew diagnostics (`LIN-0745`..`LIN-0760`).
+pub fn summarize_grouped_welford(
+    rows: &[Row],
+    group_fields: &[&str],
+    value_field: &str,
+    filter: Option<&Pred>,
+    budget: &GroupBudget,
+) -> Result<(Vec<(Vec<Cell>, WelfordAcc)>, AggSkewDiagnostics), Error> {
+    let now = super::now_ms();
+    let mut flt = filter.map(PredSlots::new);
+    let mut g_slots: Vec<FieldSlot<'_>> = group_fields.iter().map(|&f| FieldSlot::new(f)).collect();
+    let mut v_slot = FieldSlot::new(value_field);
+
+    let mut groups: FxHashMap<Vec<Cell>, (WelfordAcc, usize)> = FxHashMap::default();
+    let mut key_scratch: Vec<Cell> = Vec::with_capacity(group_fields.len());
+    let mut used_bytes = 0usize;
+    let mut qualifying_rows = 0usize;
+
+    for row in rows {
+        if !flt.as_mut().is_none_or(|f| f.eval(row, now)) {
+            continue;
+        }
+        qualifying_rows += 1;
+        key_scratch.clear();
+        for slot in &mut g_slots {
+            key_scratch.push(
+                slot.get(row)
+                    .map(Cell::clone_for_borrow)
+                    .unwrap_or(Cell::Null),
+            );
+        }
+        let val_opt = v_slot.get(row).and_then(Cell::as_f64);
+
+        if let Some((acc, grp_rows)) = groups.get_mut(key_scratch.as_slice()) {
+            *grp_rows += 1;
+            if let Some(x) = val_opt {
+                acc.update(x);
+            }
+        } else {
+            let next_groups = groups.len() + 1;
+            if next_groups > budget.max_groups {
+                return Err(Error::resource_limit(format!(
+                    "aggregate group cardinality {next_groups} exceeds max_groups budget {}",
+                    budget.max_groups
+                )));
+            }
+            let entry_bytes = 64usize.saturating_add(
+                key_scratch
+                    .iter()
+                    .map(|c| match c {
+                        Cell::Text(s) => 32 + s.len(),
+                        Cell::Vec(v) => 32 + v.len() * 4,
+                        _ => 24,
+                    })
+                    .sum::<usize>(),
+            );
+            used_bytes = used_bytes.saturating_add(entry_bytes);
+            if used_bytes > budget.max_bytes {
+                return Err(Error::resource_limit(format!(
+                    "aggregate group state bytes {used_bytes} exceeds max_bytes budget {}",
+                    budget.max_bytes
+                )));
+            }
+            let mut acc = WelfordAcc::new();
+            if let Some(x) = val_opt {
+                acc.update(x);
+            }
+            groups.insert(key_scratch.clone(), (acc, 1));
+        }
+    }
+
+    let distinct_groups = groups.len();
+    let max_group_rows = groups.values().map(|(_, cnt)| *cnt).max().unwrap_or(0);
+    let top_group_share = if qualifying_rows == 0 {
+        0.0
+    } else {
+        (max_group_rows as f64) / (qualifying_rows as f64)
+    };
+
+    let mut out: Vec<(Vec<Cell>, WelfordAcc)> = groups
+        .into_iter()
+        .map(|(k, (acc, _))| (k, acc))
+        .collect();
+    out.sort_by(|(ka, _), (kb, _)| {
+        for (ca, cb) in ka.iter().zip(kb.iter()) {
+            let ord = cmp_sort(ca, cb);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        ka.len().cmp(&kb.len())
+    });
+
+    let diag = AggSkewDiagnostics {
+        total_rows: qualifying_rows,
+        distinct_groups,
+        max_group_rows,
+        top_group_share,
+        overflowed: false,
+    };
+    Ok((out, diag))
+}

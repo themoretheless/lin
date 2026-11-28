@@ -14,6 +14,60 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+static ACTIVE_CURSORS: AtomicUsize = AtomicUsize::new(0);
+static DROPPED_UNCONSUMED_CURSORS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of currently live [`QueryCursor`] instances (`D17`: `LIN-0668`).
+#[inline]
+pub fn active_cursor_count() -> usize {
+    ACTIVE_CURSORS.load(AtomicOrdering::Relaxed)
+}
+
+/// Number of [`QueryCursor`] instances dropped before reaching exhaustion or explicit
+/// cancellation (`D17`: `LIN-0668`).
+#[inline]
+pub fn dropped_unconsumed_cursor_count() -> usize {
+    DROPPED_UNCONSUMED_CURSORS.load(AtomicOrdering::Relaxed)
+}
+
+/// Live runtime diagnostics for a [`QueryCursor`] (`D17`: `LIN-0642`..`LIN-0680`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorStats {
+    pub consumed_rows: usize,
+    pub retained_bytes: usize,
+    pub cancelled: bool,
+    pub snapshot_gen: u64,
+}
+
+/// Receipt returned when cancelling a [`QueryCursor`] with an explicit reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorCancellationReceipt {
+    pub consumed_rows: usize,
+    pub reason: String,
+}
+
+/// Keyset / generation-checked resumable pagination token (`D17`: `LIN-0655`..`LIN-0660`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorToken {
+    pub snapshot_gen: u64,
+    pub last_id: Option<Cell>,
+    pub consumed_rows: usize,
+}
+
+impl CursorToken {
+    /// Reject pagination tokens issued against a different store generation.
+    pub fn validate_generation(&self, current_gen: u64) -> Result<(), Error> {
+        if self.snapshot_gen != current_gen {
+            return Err(Error::stale_prepared(format!(
+                "cursor token snapshot_gen {} does not match current generation {current_gen}",
+                self.snapshot_gen
+            )));
+        }
+        Ok(())
+    }
+}
 
 use crate::ast::{CmpOp, Field, Pred, Query, SearchMode, Source, Step, Stmt, Value};
 use crate::error::Error;
@@ -146,11 +200,28 @@ fn build_hot_right_index(
     map
 }
 
+struct CursorLifecycleGuard {
+    completed_or_cancelled: bool,
+}
+
+impl Drop for CursorLifecycleGuard {
+    fn drop(&mut self) {
+        ACTIVE_CURSORS.fetch_sub(1, AtomicOrdering::Relaxed);
+        if !self.completed_or_cancelled {
+            DROPPED_UNCONSUMED_CURSORS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
 /// Sync pull cursor over query results.
 pub struct QueryCursor<'a> {
     db: CursorDb<'a>,
     state: CursorState<'a>,
     last_proj_schema: Option<(Arc<crate::store::RowShape>, Arc<[String]>)>,
+    consumed_rows: usize,
+    cancelled: bool,
+    snapshot_gen: u64,
+    lifecycle: CursorLifecycleGuard,
 }
 
 /// Compact cursor projection: one shared field schema plus row-local cells.
@@ -1114,6 +1185,26 @@ impl<'a> QueryCursor<'a> {
         Self::open(CursorDb::Reader(db), q)
     }
 
+    fn finish_open(db: CursorDb<'a>, state: CursorState<'a>) -> Self {
+        let snapshot_gen = db.inner().store.r#gen;
+        ACTIVE_CURSORS.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut cur = Self {
+            db,
+            state,
+            last_proj_schema: None,
+            consumed_rows: 0,
+            cancelled: false,
+            snapshot_gen,
+            lifecycle: CursorLifecycleGuard {
+                completed_or_cancelled: false,
+            },
+        };
+        if cur.is_exhausted() {
+            cur.lifecycle.completed_or_cancelled = true;
+        }
+        cur
+    }
+
     fn open(db: CursorDb<'a>, q: &Query) -> Result<Self, Error> {
         let q = {
             let (_, cat) = db.store_catalog();
@@ -1124,68 +1215,292 @@ impl<'a> QueryCursor<'a> {
 
         #[cfg(feature = "gpu")]
         if let Some(stream) = try_gpu_stream(&db, q) {
-            return Ok(Self {
-                db,
-                state: CursorState::GpuStream(stream),
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, CursorState::GpuStream(stream)));
         }
         if let Some(join) = try_disk_join(&db, q) {
-            return Ok(Self {
-                db,
-                state: CursorState::DiskJoin(join),
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, CursorState::DiskJoin(join)));
         }
         if let Some(join) = try_lazy_join_soa(&db, q)? {
-            return Ok(Self {
-                db,
-                state: CursorState::LazyJoinSoa(join),
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, CursorState::LazyJoinSoa(join)));
         }
         if let Some(join) = try_lazy_join(&db, q)? {
-            return Ok(Self {
-                db,
-                state: CursorState::LazyJoin(join),
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, CursorState::LazyJoin(join)));
         }
         if let Some(state) = try_lazy_search(&db, q)? {
-            return Ok(Self {
-                db,
-                state,
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, state));
         }
         if let Some(state) = try_lazy_hop(&db, q)? {
-            return Ok(Self {
-                db,
-                state,
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, state));
         }
         if let Some(lazy) = try_lazy_simple(&db, q)? {
-            return Ok(Self {
-                db,
-                state: CursorState::Lazy(lazy),
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, CursorState::Lazy(lazy)));
         }
         if let Some(stream) = try_disk_stream(&db, q) {
-            return Ok(Self {
-                db,
-                state: CursorState::DiskStream(stream),
-                last_proj_schema: None,
-            });
+            return Ok(Self::finish_open(db, CursorState::DiskStream(stream)));
         }
 
         let rows = db.run_query(q)?;
-        Ok(Self {
-            db,
-            state: CursorState::Buffered(rows.into_iter()),
-            last_proj_schema: None,
-        })
+        let state = if rows.is_empty() {
+            CursorState::Done
+        } else {
+            CursorState::Buffered(rows.into_iter())
+        };
+        Ok(Self::finish_open(db, state))
+    }
+
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        match &self.state {
+            CursorState::Done => true,
+            CursorState::Buffered(it) => it.len() == 0,
+            CursorState::Lazy(lazy) => {
+                lazy.take_left == Some(0)
+                    || match &lazy.source {
+                        RowSource::Idxs(idxs) => lazy.pos >= idxs.len(),
+                        RowSource::Scan { len } => lazy.pos >= *len,
+                    }
+            }
+            CursorState::LazyJoinSoa(join) => {
+                join.buf_pos >= join.buf_len
+                    && (join.take_left == Some(0)
+                        || match &join.source {
+                            RowSource::Idxs(idxs) => join.pos >= idxs.len(),
+                            RowSource::Scan { len } => join.pos >= *len,
+                        })
+            }
+            CursorState::LazyJoin(join) => {
+                join.take_left == Some(0)
+                    || (join.pending.is_empty()
+                        && match &join.left.source {
+                            RowSource::Idxs(idxs) => join.left.pos >= idxs.len(),
+                            RowSource::Scan { len } => join.left.pos >= *len,
+                        })
+            }
+            CursorState::DiskIds(ids) => {
+                ids.take_left == Some(0)
+                    || ids.resolved_left == Some(0)
+                    || ids.pos >= ids.ids.len()
+            }
+            CursorState::DiskStream(s) => s.take_left == Some(0),
+            CursorState::DiskJoin(j) => j.take_left == Some(0),
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(s) => s.pending.is_empty() && (s.stopped || s.pos >= s.len),
+        }
+    }
+
+    fn projected_schema_names(&self) -> Option<Arc<[String]>> {
+        match &self.state {
+            CursorState::Lazy(lazy) => lazy.project.clone(),
+            CursorState::LazyJoinSoa(join) => Some(Arc::clone(&join.proj_fields)),
+            CursorState::DiskIds(ids) => ids.project.clone(),
+            CursorState::DiskStream(s) => s.project.as_ref().map(|v| v.clone().into()),
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(s) => s.project.clone(),
+            _ => self.last_proj_schema.as_ref().map(|(_, names)| Arc::clone(names)),
+        }
+    }
+
+    /// Pull up to `max_rows` rows in a single batch (`D17`: `LIN-0644`).
+    pub fn fetch_batch(&mut self, max_rows: usize) -> Result<Vec<Row>, Error> {
+        if max_rows == 0 || matches!(self.state, CursorState::Done) {
+            return Ok(Vec::new());
+        }
+        let (_, hi) = self.size_hint_rows();
+        let cap = hi.unwrap_or(max_rows).min(max_rows).min(4096);
+        let mut out = Vec::with_capacity(cap);
+        for _ in 0..max_rows {
+            match self.next() {
+                Some(Ok(row)) => out.push(row),
+                Some(Err(err)) => {
+                    self.state = CursorState::Done;
+                    return Err(err);
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pull up to `max_rows` rows directly as a columnar [`crate::batch::RecordBatch`] (`LIN-0645`).
+    pub fn fetch_record_batch(&mut self, max_rows: usize) -> Result<crate::batch::RecordBatch, Error> {
+        let proj = self.projected_schema_names();
+        let rows = self.fetch_batch(max_rows)?;
+        if rows.is_empty()
+            && let Some(names) = proj
+        {
+            return Ok(crate::batch::RecordBatch::empty(names));
+        }
+        Ok(crate::batch::RecordBatch::from_rows(&rows))
+    }
+
+    /// Estimated `(lower_bound, upper_bound)` remaining rows (`LIN-0648`).
+    pub fn size_hint_rows(&self) -> (usize, Option<usize>) {
+        match &self.state {
+            CursorState::Done => (0, Some(0)),
+            CursorState::Buffered(it) => it.size_hint(),
+            CursorState::Lazy(lazy) => {
+                if lazy.take_left == Some(0) {
+                    return (0, Some(0));
+                }
+                let rem_src = match &lazy.source {
+                    RowSource::Idxs(idxs) => idxs.len().saturating_sub(lazy.pos),
+                    RowSource::Scan { len } => len.saturating_sub(lazy.pos),
+                };
+                let after_skip = rem_src.saturating_sub(lazy.skip_left);
+                let upper = match lazy.take_left {
+                    Some(t) => after_skip.min(t),
+                    None => after_skip,
+                };
+                let exact = !lazy.need_filter && matches!(lazy.source, RowSource::Scan { .. });
+                (if exact { upper } else { 0 }, Some(upper))
+            }
+            CursorState::LazyJoinSoa(join) => {
+                let buffered = usize::from(join.buf_len.saturating_sub(join.buf_pos));
+                if join.take_left == Some(0) && buffered == 0 {
+                    return (0, Some(0));
+                }
+                let rem_src = match &join.source {
+                    RowSource::Idxs(idxs) => idxs.len().saturating_sub(join.pos),
+                    RowSource::Scan { len } => len.saturating_sub(join.pos),
+                };
+                let max_future = match join.take_left {
+                    Some(t) => rem_src.min(t),
+                    None => rem_src,
+                };
+                (buffered, Some(buffered.saturating_add(max_future)))
+            }
+            CursorState::LazyJoin(join) => {
+                if join.take_left == Some(0) {
+                    return (0, Some(0));
+                }
+                let lower = if join.skip_left == 0 {
+                    join.pending.len().min(join.take_left.unwrap_or(usize::MAX))
+                } else {
+                    0
+                };
+                (lower, join.take_left)
+            }
+            CursorState::DiskStream(s) => {
+                if s.take_left == Some(0) {
+                    (0, Some(0))
+                } else {
+                    (0, s.take_left)
+                }
+            }
+            CursorState::DiskIds(ids) => {
+                if ids.take_left == Some(0) || ids.resolved_left == Some(0) {
+                    return (0, Some(0));
+                }
+                let rem = ids.ids.len().saturating_sub(ids.pos);
+                let mut upper = rem.saturating_sub(ids.skip_left);
+                if let Some(t) = ids.take_left {
+                    upper = upper.min(t);
+                }
+                if let Some(r) = ids.resolved_left {
+                    upper = upper.min(r);
+                }
+                (0, Some(upper))
+            }
+            CursorState::DiskJoin(join) => {
+                if join.take_left == Some(0) {
+                    (0, Some(0))
+                } else {
+                    let lower = if join.skip_left == 0 {
+                        join.pending.len().min(join.take_left.unwrap_or(usize::MAX))
+                    } else {
+                        0
+                    };
+                    (lower, join.take_left)
+                }
+            }
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(s) => {
+                if s.stopped || (s.pending.is_empty() && s.pos >= s.len) {
+                    (0, Some(0))
+                } else {
+                    (s.pending.len(), None)
+                }
+            }
+        }
+    }
+
+    /// Snapshot runtime stats (consumed rows, retained bytes, cancellation, generation).
+    pub fn stats(&self) -> CursorStats {
+        let retained_bytes = match &self.state {
+            CursorState::Done => 0,
+            CursorState::Buffered(it) => it
+                .as_slice()
+                .iter()
+                .map(crate::store::row_byte_size)
+                .sum(),
+            CursorState::Lazy(lazy) => match &lazy.source {
+                RowSource::Idxs(idxs) => idxs.capacity() * std::mem::size_of::<usize>(),
+                RowSource::Scan { .. } => 0,
+            },
+            CursorState::LazyJoinSoa(join) => {
+                let idx_bytes = match &join.source {
+                    RowSource::Idxs(idxs) => idxs.capacity() * std::mem::size_of::<usize>(),
+                    RowSource::Scan { .. } => 0,
+                };
+                let probe_bytes = match &join.probe {
+                    UserProbe::Borrowed(_) => 0,
+                    UserProbe::Owned(m) => m.capacity() * 24,
+                };
+                idx_bytes + probe_bytes
+            }
+            CursorState::LazyJoin(join) => {
+                join.pending
+                    .iter()
+                    .map(crate::store::row_byte_size)
+                    .sum::<usize>()
+                    + join.disk_right_memo.len() * 64
+                    + join.multi_right_memo.len() * 64
+            }
+            CursorState::DiskStream(s) => {
+                s.pending.iter().map(crate::store::row_byte_size).sum()
+            }
+            CursorState::DiskIds(ids) => ids.ids.capacity() * std::mem::size_of::<Arc<str>>(),
+            CursorState::DiskJoin(join) => {
+                join.pending
+                    .iter()
+                    .map(crate::store::row_byte_size)
+                    .sum::<usize>()
+                    + join.left.pending.iter().map(crate::store::row_byte_size).sum::<usize>()
+                    + join.memo.len() * 64
+                    + join.multi_memo.len() * 64
+            }
+            #[cfg(feature = "gpu")]
+            CursorState::GpuStream(s) => {
+                s.pending.iter().map(crate::store::row_byte_size).sum()
+            }
+        };
+        CursorStats {
+            consumed_rows: self.consumed_rows,
+            retained_bytes,
+            cancelled: self.cancelled,
+            snapshot_gen: self.snapshot_gen,
+        }
+    }
+
+    /// Explicitly cancel this cursor, releasing all buffered state immediately and returning a receipt.
+    pub fn cancel_with_reason(&mut self, reason: impl Into<String>) -> CursorCancellationReceipt {
+        self.cancelled = true;
+        self.state = CursorState::Done;
+        self.last_proj_schema = None;
+        self.lifecycle.completed_or_cancelled = true;
+        CursorCancellationReceipt {
+            consumed_rows: self.consumed_rows,
+            reason: reason.into(),
+        }
+    }
+
+    /// Mint a generation-tagged resumable keyset pagination token (`LIN-0655`).
+    pub fn resume_token(&self, last_row: Option<&Row>) -> CursorToken {
+        CursorToken {
+            snapshot_gen: self.snapshot_gen,
+            last_id: last_row.and_then(|r| r.get("id").map(Cell::clone_for_borrow)),
+            consumed_rows: self.consumed_rows,
+        }
     }
 
     /// Whether this cursor pulls lazily (not a pre-built `Vec`).
@@ -1209,8 +1524,18 @@ impl<'a> QueryCursor<'a> {
     pub fn next_projected(&mut self) -> Option<Result<ProjectedRow, Error>> {
         if let CursorState::LazyJoinSoa(join) = &mut self.state {
             let item = next_lazy_join_soa_projected(join);
-            if item.is_none() {
-                self.state = CursorState::Done;
+            match &item {
+                Some(Ok(_)) => {
+                    self.consumed_rows += 1;
+                    if self.is_exhausted() {
+                        self.lifecycle.completed_or_cancelled = true;
+                    }
+                }
+                None => {
+                    self.state = CursorState::Done;
+                    self.lifecycle.completed_or_cancelled = true;
+                }
+                Some(Err(_)) => {}
             }
             return item;
         }
@@ -1242,8 +1567,18 @@ impl<'a> QueryCursor<'a> {
             CursorState::Lazy(lazy) => next_lazy_projected(store, lazy),
             _ => unreachable!("native projected state checked above"),
         };
-        if item.is_none() {
-            self.state = CursorState::Done;
+        match &item {
+            Some(Ok(_)) => {
+                self.consumed_rows += 1;
+                if self.is_exhausted() {
+                    self.lifecycle.completed_or_cancelled = true;
+                }
+            }
+            None => {
+                self.state = CursorState::Done;
+                self.lifecycle.completed_or_cancelled = true;
+            }
+            Some(Err(_)) => {}
         }
         item
     }
@@ -1258,11 +1593,26 @@ impl Iterator for QueryCursor<'_> {
     type Item = Result<Row, Error>;
 
     #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.size_hint_rows()
+    }
+
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if let CursorState::LazyJoinSoa(join) = &mut self.state {
             let item = next_lazy_join_soa(join);
-            if item.is_none() {
-                self.state = CursorState::Done;
+            match &item {
+                Some(Ok(_)) => {
+                    self.consumed_rows += 1;
+                    if self.is_exhausted() {
+                        self.lifecycle.completed_or_cancelled = true;
+                    }
+                }
+                None => {
+                    self.state = CursorState::Done;
+                    self.lifecycle.completed_or_cancelled = true;
+                }
+                Some(Err(_)) => {}
             }
             return item;
         }
@@ -1273,7 +1623,18 @@ impl Iterator for QueryCursor<'_> {
             let CursorState::Buffered(it) = &mut self.state else {
                 unreachable!()
             };
-            return it.next().map(Ok);
+            let next_row = it.next();
+            if next_row.is_some() {
+                self.consumed_rows += 1;
+                if it.len() == 0 {
+                    self.state = CursorState::Done;
+                    self.lifecycle.completed_or_cancelled = true;
+                }
+                return next_row.map(Ok);
+            }
+            self.state = CursorState::Done;
+            self.lifecycle.completed_or_cancelled = true;
+            return None;
         }
 
         let (store, _) = self.db.store_catalog();
@@ -1289,8 +1650,18 @@ impl Iterator for QueryCursor<'_> {
             _ => None,
         };
 
-        if item.is_none() {
-            self.state = CursorState::Done;
+        match &item {
+            Some(Ok(_)) => {
+                self.consumed_rows += 1;
+                if self.is_exhausted() {
+                    self.lifecycle.completed_or_cancelled = true;
+                }
+            }
+            None => {
+                self.state = CursorState::Done;
+                self.lifecycle.completed_or_cancelled = true;
+            }
+            Some(Err(_)) => {}
         }
         item
     }
