@@ -27,7 +27,7 @@ mod tests;
 
 pub use crate::persist::{OpenConfig, OpenMemOpts as OpenOpts, SyncMode};
 pub use matview::MaterializedViewStats;
-pub use prepared::Prepared;
+pub use prepared::{Prepared, PreparedSchemaInfo};
 pub use shared::{SharedDb, SharedTransaction};
 pub use tx::Transaction;
 
@@ -227,6 +227,8 @@ pub struct Db {
     pub(crate) pulled_wal: Vec<u8>,
     /// Durable hot-standby: [`Self::apply_wal`] OK, user writes rejected.
     pub(crate) follower: bool,
+    /// Explicit read-only mode (`DbBuilder::read_only(true)`): all writes rejected.
+    pub(crate) read_only: bool,
     /// Active embedder (`search vec` / hybrid / auto-embed on insert).
     pub(crate) embedder: Option<Arc<dyn Embedder>>,
     /// Cached read-only snapshot keyed by `(gen, docs_epoch, collections_epoch, collections_len, edges_len, facts_len)`.
@@ -374,6 +376,223 @@ impl Stats {
     }
 }
 
+/// Fluent builder for configuring and opening a [`Db`] instance (`LIN-1445`).
+#[derive(Debug, Clone, Default)]
+pub struct DbBuilder {
+    data_dir: Option<std::path::PathBuf>,
+    quotas: Option<Quotas>,
+    sync_mode: SyncMode,
+    cold: bool,
+    read_only: bool,
+    strict_embed_dim: bool,
+}
+
+impl DbBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn data_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.data_dir = Some(path.into());
+        self
+    }
+
+    pub fn quotas(mut self, quotas: Quotas) -> Self {
+        self.quotas = Some(quotas);
+        self
+    }
+
+    pub fn sync_mode(mut self, sync_mode: SyncMode) -> Self {
+        self.sync_mode = sync_mode;
+        self
+    }
+
+    pub fn cold(mut self, cold: bool) -> Self {
+        self.cold = cold;
+        self
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn strict_embed_dim(mut self, strict: bool) -> Self {
+        self.strict_embed_dim = strict;
+        self
+    }
+
+    pub fn build(self) -> Result<Db, Error> {
+        let mut db = match self.data_dir {
+            Some(dir) if self.read_only => {
+                let t0 = Instant::now();
+                let catalog = crate::catalog::fixture();
+                let (store, lock, store_phases) = Store::open_read_with_profiled(&dir, &catalog)?;
+                let mut catalog = catalog;
+                store.merge_extras_into(&mut catalog);
+                let embedder = Db::default_embedder(&catalog);
+                let mut d = Db {
+                    catalog,
+                    store,
+                    persist: None,
+                    reader_lock: Some(lock),
+                    plan_cache: FxHashMap::default(),
+                    query_cache: FxHashMap::default(),
+                    seen_dml_hashes: [0; 16],
+                    cold_program_packs: None,
+                    pending_insert_rows: None,
+                    quotas: Quotas::default(),
+                    reopen: store_phases.into(),
+                    append_rows: 0,
+                    append_ms: 0.0,
+                    pins: BTreeMap::new(),
+                    pulled_wal: Vec::new(),
+                    follower: false,
+                    read_only: true,
+                    embedder: Some(embedder),
+                    reader_cache: None,
+                    reader_plan_cache: None,
+                    declared_cols: Default::default(),
+                    catalog_soa: false,
+                    strict_embed_dim: false,
+                    col_mirrors: Default::default(),
+                    vec_matrices: Default::default(),
+                    mat_views: Default::default(),
+                    interval_indexes: Default::default(),
+                    #[cfg(feature = "gpu")]
+                    gpu: None,
+                    #[cfg(feature = "gpu")]
+                    gpu_cache: Default::default(),
+                };
+                d.reopen.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                d
+            }
+            Some(dir) => Db::open_with(
+                dir,
+                OpenOpts {
+                    sync: self.sync_mode,
+                    cold: self.cold,
+                },
+            )?,
+            None => {
+                let mut d = Db::empty();
+                d.read_only = self.read_only;
+                d
+            }
+        };
+        if let Some(q) = self.quotas {
+            db = db.with_quotas(q);
+        }
+        if self.strict_embed_dim {
+            db = db.with_strict_embed_dim(true);
+        }
+        if !self.read_only {
+            db = db.with_sync_mode(self.sync_mode);
+        }
+        Ok(db)
+    }
+}
+
+/// Runtime storage and compute capabilities reported by [`Db::capabilities`] (`LIN-1447`, `LIN-1448`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageCapabilities {
+    pub durable: bool,
+    pub read_only: bool,
+    pub follower: bool,
+    pub cold_tier: bool,
+    pub gpu_enabled: bool,
+    pub has_embedder: bool,
+    pub embedder_id: String,
+    pub strict_embed_dim: bool,
+    pub sync_mode: SyncMode,
+    pub spill_enabled: bool,
+    pub supported_wal_codecs: &'static [u8],
+}
+
+/// Thread-safe cooperative cancellation token for queries (`LIN-1449`, `LIN-1450`).
+#[derive(Debug, Clone, Default)]
+pub struct QueryCancelToken {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl QueryCancelToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Per-execution cancellation, deadline, row cap, and vector-search precision controls (`LIN-1449`..`LIN-1451`, `LIN-1460`, `LIN-1461`, `LIN-1464`).
+#[derive(Debug, Clone, Default)]
+pub struct QueryOptions {
+    pub cancel_token: Option<QueryCancelToken>,
+    pub deadline: Option<Instant>,
+    pub max_rows: Option<usize>,
+    pub exact_vector_search: bool,
+}
+
+/// Telemetry receipt returned alongside [`Handle`] by [`Db::execute_with_options`] (`LIN-1464`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExecutionStats {
+    pub elapsed_ms: f64,
+    pub prepare_ns: u64,
+    pub execute_ns: u64,
+    pub rows_returned: usize,
+    pub truncated_by_max_rows: bool,
+    pub used_exact_vector_search: bool,
+    pub generation: u64,
+}
+
+#[derive(Clone, Default)]
+struct ActiveQueryGuard {
+    cancel_token: Option<QueryCancelToken>,
+    deadline: Option<Instant>,
+}
+
+impl ActiveQueryGuard {
+    #[inline]
+    fn check(&self) -> Result<(), Error> {
+        if let Some(ref tok) = self.cancel_token
+            && tok.is_cancelled()
+        {
+            return Err(Error::canceled("query execution canceled"));
+        }
+        if let Some(dl) = self.deadline
+            && Instant::now() >= dl
+        {
+            return Err(Error::deadline_exceeded("query execution deadline exceeded"));
+        }
+        Ok(())
+    }
+}
+
+thread_local! {
+    static ACTIVE_QUERY_GUARD: std::cell::RefCell<Option<ActiveQueryGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+pub(crate) fn check_active_query_guard() -> Result<(), Error> {
+    ACTIVE_QUERY_GUARD.with(|slot| {
+        let borrow = slot.borrow();
+        if let Some(ref guard) = *borrow {
+            guard.check()
+        } else {
+            Ok(())
+        }
+    })
+}
+
 const PLAN_CACHE_MAX: usize = 512;
 /// Maximum rows and approximate payload bytes packed into a single WAL frame on cold
 /// overlay inserts (`MAX_RECORD` is 16 MiB); larger inserts split into consecutive
@@ -485,6 +704,7 @@ impl Db {
             pins: BTreeMap::new(),
             pulled_wal: Vec::new(),
             follower: false,
+            read_only: false,
             embedder: Some(embedder),
             reader_cache: None,
             reader_plan_cache: None,
@@ -707,6 +927,7 @@ impl Db {
                 pins: BTreeMap::new(),
                 pulled_wal: Vec::new(),
                 follower: false,
+            read_only: false,
                 embedder: Some(embedder),
                 reader_cache: None,
                 reader_plan_cache: None,
@@ -749,6 +970,7 @@ impl Db {
             pins: BTreeMap::new(),
             pulled_wal: Vec::new(),
             follower: false,
+            read_only: false,
             embedder: Some(embedder),
             reader_cache: None,
             reader_plan_cache: None,
@@ -829,6 +1051,7 @@ impl Db {
             pins: BTreeMap::new(),
             pulled_wal: Vec::new(),
             follower: false,
+            read_only: false,
             embedder: Some(embedder),
             reader_cache: None,
             reader_plan_cache: None,
@@ -878,6 +1101,46 @@ impl Db {
 
     pub fn is_durable(&self) -> bool {
         self.persist.is_some() || self.store.is_native_disk()
+    }
+
+    /// Start a fluent [`DbBuilder`] (`LIN-1445`).
+    pub fn builder() -> DbBuilder {
+        DbBuilder::new()
+    }
+
+    /// True when this database was opened in strict read-only mode (`DbBuilder::read_only(true)`).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Inspect runtime storage, durability, cold-tier, GPU, and codec capabilities (`LIN-1447`, `LIN-1448`).
+    pub fn capabilities(&self) -> StorageCapabilities {
+        let (sync_mode, cold_persist) = match self.persist.as_ref() {
+            Some(p) => (p.sync, p.cold),
+            None => (SyncMode::Full, false),
+        };
+        #[cfg(feature = "gpu")]
+        let gpu_enabled = self.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let gpu_enabled = false;
+
+        StorageCapabilities {
+            durable: self.is_durable(),
+            read_only: self.read_only,
+            follower: self.follower,
+            cold_tier: cold_persist || self.store.disk.is_some(),
+            gpu_enabled,
+            has_embedder: self.embedder.is_some(),
+            embedder_id: self
+                .embedder
+                .as_ref()
+                .map(|e| e.id().to_string())
+                .unwrap_or_else(|| self.catalog.embed_id.clone()),
+            strict_embed_dim: self.strict_embed_dim,
+            sync_mode,
+            spill_enabled: self.quotas.spill_enabled,
+            supported_wal_codecs: crate::persist::CodecCapabilities::supported_wal_codecs(),
+        }
     }
 
     /// True when opened via [`Self::open_follower`] / [`Self::bootstrap_follower`].
@@ -951,6 +1214,7 @@ impl Db {
                 pins: BTreeMap::new(),
                 pulled_wal: Vec::new(),
                 follower: false,
+            read_only: false,
                 embedder: self.embedder.clone(),
                 reader_cache: None,
                 reader_plan_cache: None,
@@ -1412,6 +1676,7 @@ impl Db {
             src: String::new(),
             stmts: Arc::from(stmts),
             plan,
+            catalog_hash: self.catalog.hash_u64(),
             writes,
             append_only,
             schema,
@@ -3583,6 +3848,11 @@ impl Db {
                 ms: 0.0,
             });
         }
+        if self.read_only && writes {
+            return Err(Error::permission_denied(
+                "read-only database: writes not allowed",
+            ));
+        }
         if self.follower && writes {
             return Err(Error::runtime(
                 "follower: read-only — apply_wal for replication, open primary for writes",
@@ -4016,6 +4286,11 @@ impl Db {
         schema: bool,
         want_rows: bool,
     ) -> Result<Handle, Error> {
+        if self.read_only && writes {
+            return Err(Error::permission_denied(
+                "read-only database: writes not allowed",
+            ));
+        }
         if self.follower && writes {
             return Err(Error::runtime(
                 "follower: read-only — apply_wal for replication, open primary for writes",
@@ -4429,12 +4704,87 @@ impl Db {
         self.run_src_ext(src, true)
     }
 
+    /// Execute `query` under cancellation, deadline, output row ceiling, and exact-vector controls (`LIN-1449`..`LIN-1451`, `LIN-1460`, `LIN-1461`, `LIN-1464`).
+    pub fn execute_with_options(
+        &mut self,
+        query: &str,
+        opts: &QueryOptions,
+    ) -> Result<(Handle, ExecutionStats), Error> {
+        let t_start = Instant::now();
+        let guard = ActiveQueryGuard {
+            cancel_token: opts.cancel_token.clone(),
+            deadline: opts.deadline,
+        };
+        guard.check()?;
+
+        struct GuardReset;
+        impl Drop for GuardReset {
+            fn drop(&mut self) {
+                ACTIVE_QUERY_GUARD.with(|slot| {
+                    *slot.borrow_mut() = None;
+                });
+            }
+        }
+        ACTIVE_QUERY_GUARD.with(|slot| {
+            *slot.borrow_mut() = Some(guard.clone());
+        });
+        let _reset = GuardReset;
+
+        let t_prep = Instant::now();
+        let prepared = self.prepare(query)?;
+        let prepare_ns = u64::try_from(t_prep.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        guard.check()?;
+
+        let saved_hnsw = if opts.exact_vector_search && !self.store.hnsw.is_empty() {
+            Some(std::mem::take(&mut self.store.hnsw))
+        } else {
+            None
+        };
+        let prev_filtered_hnsw = self.store.filtered_hnsw_enabled;
+        if opts.exact_vector_search {
+            self.store.filtered_hnsw_enabled = false;
+        }
+
+        let t_exec = Instant::now();
+        let run_res = self.run_prepared(&prepared);
+        let execute_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        if let Some(hnsw) = saved_hnsw {
+            self.store.hnsw = hnsw;
+        }
+        self.store.filtered_hnsw_enabled = prev_filtered_hnsw;
+
+        let mut handle = run_res?;
+        guard.check()?;
+
+        let mut truncated_by_max_rows = false;
+        if let Some(max_rows) = opts.max_rows
+            && handle.rows.len() > max_rows
+        {
+            handle.rows.truncate(max_rows);
+            handle.done.n = handle.rows.len();
+            truncated_by_max_rows = true;
+        }
+
+        let stats = ExecutionStats {
+            elapsed_ms: t_start.elapsed().as_secs_f64() * 1000.0,
+            prepare_ns,
+            execute_ns,
+            rows_returned: handle.rows.len(),
+            truncated_by_max_rows,
+            used_exact_vector_search: opts.exact_vector_search,
+            generation: handle.done.r#gen,
+        };
+        Ok((handle, stats))
+    }
+
     /// Write / batch verb: `n` + `gen` without keeping the row buffer.
     pub fn execute(&mut self, src: &str) -> Result<Done, Error> {
         Ok(self.run_src_ext(src, false)?.done)
     }
 
     fn run_src_ext(&mut self, src: &str, want_rows: bool) -> Result<Handle, Error> {
+        check_active_query_guard()?;
         if !self.plan_cache.is_empty()
             && let Some(ep) = self.plan_cache.get(src).map(Prepared::exec_plan)
         {
@@ -4448,6 +4798,7 @@ impl Db {
             )));
         }
         if !self.follower
+            && !self.read_only
             && src.len() <= self.quotas.max_ast_bytes.min(2048)
             && src.trim_start().starts_with("insert")
             && let Some((collection, fields)) = parse::try_parse_single_insert(src)
@@ -4766,6 +5117,11 @@ impl Db {
     /// embeddings, WAL, cold overlay). Null cells mean "field absent". Vector columns are
     /// rejected: embeddings are produced by the configured embedder, not supplied.
     pub fn insert_batch(&mut self, collection: &str, batch: &RecordBatch) -> Result<Done, Error> {
+        if self.read_only {
+            return Err(Error::permission_denied(
+                "read-only database: writes not allowed",
+            ));
+        }
         let n = batch.n();
         if batch.cols.iter().any(|c| c.len() != n) {
             return Err(Error::runtime("insert_batch: columns have different lengths"));
@@ -4820,6 +5176,203 @@ impl Db {
                 false,
             )?
             .done)
+    }
+
+    /// Atomic batch insertion entrypoint for streaming JSONL/CSV importers (`src/io_formats.rs`),
+    /// supporting standard `RecordBatch` columns, `facts` append-only collections, and explicit `Cell::Vec` columns.
+    pub(crate) fn insert_imported_rows(
+        &mut self,
+        collection: &str,
+        mut rows: Vec<Row>,
+    ) -> Result<Done, Error> {
+        if self.read_only {
+            return Err(Error::permission_denied(
+                "read-only database: writes not allowed",
+            ));
+        }
+        if self.follower {
+            return Err(Error::runtime(
+                "follower: read-only — apply_wal for replication, open primary for writes",
+            ));
+        }
+        if rows.is_empty() {
+            return Ok(Done {
+                r#gen: self.store.r#gen,
+                n: 0,
+            });
+        }
+        if collection == "facts" {
+            let records: Vec<crate::ast::Record> = rows
+                .into_iter()
+                .map(|r| crate::ast::Record {
+                    fields: r
+                        .into_iter()
+                        .filter_map(|(k, c)| {
+                            c.text_shared().map(|s| (k, Value::String(s)))
+                        })
+                        .collect(),
+                })
+                .collect();
+            return Ok(self
+                .run_prepared_ext(
+                    &self.prepare_stmts_checked(vec![Stmt::AppendFacts { records }])?,
+                    false,
+                )?
+                .done);
+        }
+
+        let has_vec_cells = rows
+            .iter()
+            .any(|r| r.values().any(|c| matches!(c, Cell::Vec(_))));
+        if !has_vec_cells {
+            let rb = RecordBatch::from_rows(&rows);
+            return self.insert_batch(collection, &rb);
+        }
+
+        // Vector-bearing row batch: validate non-vector fields against catalog, check constraints,
+        // maintain indexes/FTS/HNSW/WAL atomically, and roll back cleanly on any error.
+        let cdef = self
+            .catalog
+            .collection(collection)
+            .ok_or_else(|| Error::missing_schema(format!("unknown collection: {collection}")))?
+            .clone();
+        if cdef.append_only {
+            return Err(Error::check(format!(
+                "{collection} is append-only; use `append`"
+            )));
+        }
+        for row in &rows {
+            for (k, c) in row {
+                let info = cdef
+                    .field(k)
+                    .ok_or_else(|| Error::check(format!("unknown field: {collection}.{k}")))?;
+                let ok = match (c, info.ty) {
+                    (Cell::Null, _) => true,
+                    (Cell::Vec(_), crate::catalog::Type::Vec) => true,
+                    (Cell::Text(_) | Cell::SmallText(_), crate::catalog::Type::Text | crate::catalog::Type::Var | crate::catalog::Type::Id | crate::catalog::Type::Uri | crate::catalog::Type::Rel) => true,
+                    (Cell::Int(_), crate::catalog::Type::I64 | crate::catalog::Type::F64 | crate::catalog::Type::Time | crate::catalog::Type::Dur) => true,
+                    (Cell::Float(f), crate::catalog::Type::F64) => f.is_finite(),
+                    (Cell::Bool(_), crate::catalog::Type::Bool) => true,
+                    (Cell::Time(_), crate::catalog::Type::Time | crate::catalog::Type::Dur) => true,
+                    _ => false,
+                };
+                if !ok {
+                    return Err(Error::check(format!(
+                        "type mismatch on `{collection}.{k}`: expected {}",
+                        info.ty.name()
+                    )));
+                }
+            }
+        }
+
+        let n = rows.len();
+        let next_total = self.total_rows().saturating_add(n);
+        if next_total > self.quotas.max_rows {
+            return Err(Error::resource_limit(format!(
+                "quota: rows {next_total} > max_rows {}",
+                self.quotas.max_rows
+            )));
+        }
+
+        let base_gen = self.store.r#gen;
+        let undo = if self.store.is_disk_backed(collection) {
+            Undo::Full(Box::new(self.store.mem_backup()))
+        } else {
+            Undo::Append(self.store.append_mark())
+        };
+        if self.store.is_disk_backed(collection) {
+            self.store.promote_disk_col(collection);
+        }
+
+        let commit_res: Result<(), Error> = (|| {
+            for row in &mut rows {
+                if row.get("id").and_then(Cell::text).is_none() {
+                    row.insert("id", Cell::text_arc(self.store.alloc_id()));
+                }
+                if row.get("hash").and_then(Cell::text).is_none()
+                    && let Some(body) = row.get("body").and_then(Cell::text)
+                {
+                    row.insert("hash", Cell::SmallText(content_hash_inline(body)));
+                }
+            }
+
+            let mut seen_ids: FxHashSet<String> = FxHashSet::default();
+            let mut seen_uris: FxHashSet<String> = FxHashSet::default();
+            for row in &rows {
+                if let Some(id) = row_text(row, "id") {
+                    if !seen_ids.insert(id.to_string())
+                        || self.store.row_index(collection, id).is_some()
+                    {
+                        return Err(Error::runtime(format!("duplicate id: {id}")));
+                    }
+                }
+                if collection == "docs"
+                    && let Some(uri) = row_text(row, "uri")
+                    && (!seen_uris.insert(uri.to_string()) || self.store.get_by_uri(uri).is_some())
+                {
+                    return Err(Error::runtime(format!("duplicate uri: {uri}")));
+                }
+                if !self.catalog.fks.is_empty() {
+                    self.check_row_fks(collection, row)?;
+                }
+            }
+
+            let start = self.store.collection(collection).len();
+            for (offset, row) in rows.iter().enumerate() {
+                let idx = start + offset;
+                if !self.store.indexes.is_empty() {
+                    self.store.index_insert_row(collection, idx, row)?;
+                }
+                if !self.store.fts.is_empty() && self.store.fts.contains_key(collection) {
+                    self.store.fts_insert_row(collection, idx, row);
+                }
+                if !self.store.hnsw.is_empty()
+                    && let Some(Cell::Vec(v)) = row.get("embedding")
+                    && let Some(hnsw) = self.store.hnsw.get_mut(collection)
+                {
+                    hnsw.insert(idx, Arc::clone(v));
+                }
+                self.store.row_maps_register_row(collection, idx, row);
+            }
+            self.store.update_col_count(collection, n as isize);
+
+            let pack = if self.is_durable() {
+                Some(crate::persist::rows_to_insert_pack(
+                    collection,
+                    &rows,
+                    Vec::new(),
+                ))
+            } else {
+                None
+            };
+            self.store.collection_append_mut(collection).extend(rows);
+
+            if let Some(pack) = pack {
+                if let Some(p) = self.persist.as_mut() {
+                    self.store.durable_commit(p, pack)?;
+                } else if self.store.is_native_disk() {
+                    self.store.commit_pack_to_native_disk(&pack)?;
+                }
+            }
+            self.store.r#gen += 1;
+            self.reader_cache = None;
+            if let Some(p) = self.persist.as_mut() {
+                self.store.maybe_checkpoint(p)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = commit_res {
+            self.rollback(undo, None, base_gen);
+            return Err(e);
+        }
+        if matches!(undo, Undo::Full(_)) {
+            self.store.commit_disk_overlay_savepoint();
+        }
+        Ok(Done {
+            r#gen: self.store.r#gen,
+            n,
+        })
     }
 
     /// Type-check a batch for `insert` into `collection` exactly as the checker would
@@ -5918,6 +6471,7 @@ impl Db {
         }
 
         for (step_idx, step) in q.steps.iter().enumerate() {
+            check_active_query_guard()?;
             work = work.saturating_add(rows.len());
             if work > self.quotas.max_execution_work {
                 return Err(Error::runtime(format!(

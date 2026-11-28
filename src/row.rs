@@ -1,7 +1,80 @@
-//! Typed row mapping (`FromRow` / `LinRow`).
+//! Typed row mapping (`FromRow` / `LinRow`), zero-copy borrowed text views, batch decoders,
+//! field-provenance diagnostics, and newtype/enum cell macros (`D38`: `LIN-1489`..`LIN-1520`).
 
+use std::fmt;
+use std::ops::Deref;
+
+use crate::batch::RecordBatch;
 use crate::error::Error;
 use crate::store::{Cell, Row};
+
+/// Zero-copy borrowed string slice tied to the lifetime of a [`Row`] or [`Cell`] (`LIN-1497`, `LIN-1498`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BorrowedText<'a>(pub &'a str);
+
+impl<'a> BorrowedText<'a> {
+    #[inline]
+    pub const fn new(s: &'a str) -> Self {
+        Self(s)
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+impl Deref for BorrowedText<'_> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
+impl AsRef<str> for BorrowedText<'_> {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+
+impl fmt::Display for BorrowedText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl ToCell for BorrowedText<'_> {
+    #[inline]
+    fn to_cell(&self) -> Cell {
+        Cell::from_text(self.0)
+    }
+}
+
+impl Row {
+    /// Borrow a string field directly from the row (`Cell::Text` or `Cell::SmallText`) without allocating (`LIN-1497`, `LIN-1498`).
+    #[inline]
+    pub fn borrow_str<'a>(&'a self, field: &str) -> Option<&'a str> {
+        self.get_str(field).and_then(Cell::text)
+    }
+
+    /// Borrow a required string field as [`BorrowedText`], attaching field provenance on missing/type errors (`LIN-1497`, `LIN-1520`).
+    #[inline]
+    pub fn borrow_text<'a>(&'a self, field: &str) -> Result<BorrowedText<'a>, Error> {
+        match self.get_str(field) {
+            Some(cell) => cell.text().map(BorrowedText).ok_or_else(|| {
+                let err = match cell {
+                    Cell::Null => Error::runtime("expected text, got null"),
+                    other => Error::runtime(format!("expected text, got {other:?}")),
+                };
+                enrich_field_err(field, err)
+            }),
+            None => Err(enrich_field_err(field, missing_column_err(field))),
+        }
+    }
+}
 
 /// Convert a single [`Cell`] into a Rust value.
 pub trait FromCell: Sized {
@@ -18,6 +91,18 @@ pub trait FromCell: Sized {
 #[inline(never)]
 fn missing_column_err(key: &str) -> Error {
     Error::runtime(format!("missing column `{key}`"))
+}
+
+#[cold]
+#[inline(never)]
+pub fn enrich_field_err(key: &str, err: Error) -> Error {
+    let prefix = format!("field `{key}`: ");
+    let msg = if err.message.starts_with(&prefix) {
+        err.message
+    } else {
+        format!("{prefix}{}", err.message)
+    };
+    Error::runtime(msg).with_field(key)
 }
 
 impl FromCell for String {
@@ -235,6 +320,12 @@ impl ToCell for str {
     }
 }
 
+impl ToCell for &str {
+    fn to_cell(&self) -> Cell {
+        Cell::from_text(self)
+    }
+}
+
 impl ToCell for i64 {
     fn to_cell(&self) -> Cell {
         Cell::Int(*self)
@@ -292,6 +383,85 @@ impl<T: ToCell> ToCell for Option<T> {
     }
 }
 
+/// Implement [`FromCell`] and [`ToCell`] for a single-field tuple newtype `Wrapper(Inner)` (`LIN-1505`).
+#[macro_export]
+macro_rules! impl_newtype_cell {
+    ($newtype:ty, $inner:ty $(,)?) => {
+        impl $crate::row::FromCell for $newtype {
+            #[inline]
+            fn from_cell(cell: &$crate::Cell) -> ::core::result::Result<Self, $crate::Error> {
+                <$inner as $crate::row::FromCell>::from_cell(cell).map(Self)
+            }
+
+            #[inline]
+            fn from_missing(key: &str) -> ::core::result::Result<Self, $crate::Error> {
+                <$inner as $crate::row::FromCell>::from_missing(key).map(Self)
+            }
+        }
+
+        impl $crate::row::ToCell for $newtype {
+            #[inline]
+            fn to_cell(&self) -> $crate::Cell {
+                <$inner as $crate::row::ToCell>::to_cell(&self.0)
+            }
+        }
+    };
+}
+
+/// Implement [`FromCell`] and [`ToCell`] for a unit enum mapped to canonical string tags (`LIN-1506`).
+#[macro_export]
+macro_rules! impl_str_enum_cell {
+    ($enum_ty:ty { $($variant:ident => $lit:literal),+ $(,)? }) => {
+        impl $crate::row::FromCell for $enum_ty {
+            #[inline]
+            fn from_cell(cell: &$crate::Cell) -> ::core::result::Result<Self, $crate::Error> {
+                let s = match cell {
+                    $crate::Cell::Text(t) => t.as_ref(),
+                    $crate::Cell::SmallText(t) => t.as_str(),
+                    $crate::Cell::Null => {
+                        return ::core::result::Result::Err($crate::Error::runtime(
+                            concat!("expected ", stringify!($enum_ty), " text, got null"),
+                        ));
+                    }
+                    other => {
+                        return ::core::result::Result::Err($crate::Error::runtime(format!(
+                            "expected {} text, got {other:?}",
+                            stringify!($enum_ty)
+                        )));
+                    }
+                };
+                match s {
+                    $($lit => ::core::result::Result::Ok(<$enum_ty>::$variant),)+
+                    other => ::core::result::Result::Err($crate::Error::runtime(format!(
+                        "unknown {} variant {:?} (expected one of: {})",
+                        stringify!($enum_ty),
+                        other,
+                        [$($lit),+].join(", ")
+                    ))),
+                }
+            }
+
+            #[cold]
+            fn from_missing(key: &str) -> ::core::result::Result<Self, $crate::Error> {
+                ::core::result::Result::Err($crate::Error::runtime(format!(
+                    "missing column `{key}`"
+                )))
+            }
+        }
+
+        impl $crate::row::ToCell for $enum_ty {
+            #[inline]
+            fn to_cell(&self) -> $crate::Cell {
+                match self {
+                    $(<$enum_ty>::$variant => $crate::Cell::from_text($lit),)+
+                }
+            }
+        }
+    };
+}
+
+pub use crate::{impl_newtype_cell, impl_str_enum_cell};
+
 /// Cached column slot for `#[derive(LinRow)]` batch decoding (`FromRow::from_rows`).
 #[doc(hidden)]
 pub struct RowSlot<'k>(crate::store::row::FieldSlot<'k>);
@@ -304,9 +474,10 @@ impl<'k> RowSlot<'k> {
 
     #[inline]
     pub fn read<T: FromCell>(&mut self, row: &Row) -> Result<T, Error> {
+        let key = self.0.key();
         match self.0.get(row) {
-            Some(cell) => T::from_cell(cell),
-            None => T::from_missing(self.0.key()),
+            Some(cell) => T::from_cell(cell).map_err(|e| enrich_field_err(key, e)),
+            None => T::from_missing(key).map_err(|e| enrich_field_err(key, e)),
         }
     }
 }
@@ -377,14 +548,14 @@ pub trait LinRow: FromRow {
     fn cols() -> Self::Cols;
 }
 
-/// Read a required column via [`FromCell`].
+/// Read a required column via [`FromCell`], enriching errors with `"field `key`: ..."` (`LIN-1520`).
 #[inline]
 pub fn cell_get<T: FromCell>(row: &Row, key: &str) -> Result<T, Error> {
     match row.get(key) {
-        Some(cell) => T::from_cell(cell),
+        Some(cell) => T::from_cell(cell).map_err(|e| enrich_field_err(key, e)),
         // Rows are sparse: a field never set is absent, not `Null`. A type that accepts
         // `Null` (`Option<T>`) reads that as `None`; any other type reports the column.
-        None => T::from_missing(key),
+        None => T::from_missing(key).map_err(|e| enrich_field_err(key, e)),
     }
 }
 
@@ -394,10 +565,26 @@ pub fn map_rows<T: FromRow>(rows: &[Row]) -> Result<Vec<T>, Error> {
     T::from_rows(rows)
 }
 
+/// Decode a columnar [`RecordBatch`] into typed rows (`LIN-1499`).
+#[inline]
+pub fn map_batch<T: FromRow>(batch: &RecordBatch) -> Result<Vec<T>, Error> {
+    T::from_rows(&batch.to_rows())
+}
+
+impl RecordBatch {
+    /// Decode this columnar batch into typed rows `Vec<T>` (`LIN-1499`).
+    #[inline]
+    pub fn to_typed_rows<T: FromRow>(&self) -> Result<Vec<T>, Error> {
+        map_batch(self)
+    }
+}
+
 /// Optional column (`Null` or missing → `None`).
 pub fn cell_opt<T: FromCell>(row: &Row, key: &str) -> Result<Option<T>, Error> {
     match row.get(key) {
         None | Some(Cell::Null) => Ok(None),
-        Some(cell) => T::from_cell(cell).map(Some),
+        Some(cell) => T::from_cell(cell)
+            .map(Some)
+            .map_err(|e| enrich_field_err(key, e)),
     }
 }

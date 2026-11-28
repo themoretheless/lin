@@ -1452,6 +1452,10 @@ impl<'a, T> BoundQueryable<'a, T> {
         }
     }
 
+    pub fn cursor_typed<U: FromRow>(self) -> Result<TypedCursorIter<'a, U>, Error> {
+        Ok(self.cursor()?.into_typed_iter::<U>())
+    }
+
     pub fn first(mut self) -> Result<Row, Error> {
         if !matches!(
             self.q.query.steps.last(),
@@ -1563,6 +1567,35 @@ fn scalar_ref_from_row(row: &Row) -> Result<&Cell, Error> {
 
 fn scalar_from_row(row: &Row) -> Result<Cell, Error> {
     scalar_ref_from_row(row).cloned()
+}
+
+/// Streamed typed iterator wrapping [`QueryCursor`] without materializing an intermediate `Vec<Row>` (`LIN-1452`).
+pub struct TypedCursorIter<'a, T> {
+    cursor: QueryCursor<'a>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: FromRow> Iterator for TypedCursorIter<'a, T> {
+    type Item = Result<T, Error>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.cursor.next()? {
+            Ok(row) => Some(T::from_row(&row)),
+            Err(err) => Some(Err(err)),
+        }
+    }
+}
+
+impl<'a> QueryCursor<'a> {
+    /// Convert this pull cursor into a lazy iterator of typed rows `Result<T, Error>` (`LIN-1452`).
+    #[inline]
+    pub fn into_typed_iter<T: FromRow>(self) -> TypedCursorIter<'a, T> {
+        TypedCursorIter {
+            cursor: self,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl From<&str> for Value {

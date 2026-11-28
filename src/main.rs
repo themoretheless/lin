@@ -10,6 +10,8 @@ use lin::{Db, GraphFmt, explain_as};
 
 /// `--cold`: open the data directory with the disk tier enabled.
 static COLD: AtomicBool = AtomicBool::new(false);
+/// `--json-errors`: emit structured JSON diagnostics on stderr with stable exit codes.
+static JSON_ERRORS: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     restore_default_sigpipe();
@@ -32,10 +34,15 @@ fn main() -> ExitCode {
         Some("compact") => cmd_compact(&rest[1..], data, follower),
         Some("repair-catalog-hash") => cmd_repair_catalog_hash(data),
         Some("recover") => cmd_recover(&rest[1..], data),
-        Some("version") | Some("--version") => {
-            println!("lin {}", lin::VERSION);
-            ExitCode::SUCCESS
-        }
+        Some("inspect") => cmd_inspect(&rest[1..], data),
+        Some("import") => cmd_import(&rest[1..], data, follower),
+        Some("export") => cmd_export(&rest[1..], data, follower),
+        Some("health") => cmd_health(data, follower),
+        Some("readiness") => cmd_readiness(data, follower),
+        Some("config") => cmd_config(&rest[1..], data, follower),
+        Some("completions") => cmd_completions(&rest[1..]),
+        Some("repl") => cmd_repl(&rest[1..], data, follower),
+        Some("version") | Some("--version") => cmd_version(&rest[1..]),
         _ => usage(2),
     }
 }
@@ -73,12 +80,71 @@ fn parse_global(args: &[String]) -> (Option<PathBuf>, bool, Vec<String>) {
         } else if args[i] == "--cold" {
             COLD.store(true, Ordering::Relaxed);
             i += 1;
+        } else if args[i] == "--json-errors" {
+            JSON_ERRORS.store(true, Ordering::Relaxed);
+            i += 1;
         } else {
             rest.push(args[i].clone());
             i += 1;
         }
     }
     (data, follower, rest)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutputFormat {
+    Compact,
+    Table,
+    Json,
+    Jsonl,
+}
+
+fn exit_code_for_error(err: &lin::Error) -> u8 {
+    use lin::error::{ErrorCode, Phase};
+    match err.code() {
+        ErrorCode::Canceled => 130,
+        ErrorCode::CorruptData | ErrorCode::UnsupportedFormat | ErrorCode::Io => 4,
+        _ if err.message.starts_with("persist:") || err.message.contains("corrupt") => 4,
+        _ => match err.phase {
+            Phase::Compile => 2,
+            Phase::Runtime => 3,
+        },
+    }
+}
+
+fn emit_lin_error(err: &lin::Error) -> ExitCode {
+    let code_u8 = exit_code_for_error(err);
+    if JSON_ERRORS.load(Ordering::Relaxed) {
+        let phase = match err.phase {
+            lin::error::Phase::Compile => "compile",
+            lin::error::Phase::Runtime => "runtime",
+        };
+        let payload = serde_json::json!({
+            "code": err.code().as_str(),
+            "phase": phase,
+            "message": err.message,
+            "exit_code": code_u8,
+        });
+        eprintln!("{payload}");
+    } else {
+        eprintln!("{err}");
+    }
+    ExitCode::from(code_u8)
+}
+
+fn emit_usage_error(msg: &str) -> ExitCode {
+    if JSON_ERRORS.load(Ordering::Relaxed) {
+        let payload = serde_json::json!({
+            "code": "E_USAGE",
+            "phase": "cli",
+            "message": msg,
+            "exit_code": 2,
+        });
+        eprintln!("{payload}");
+    } else {
+        eprintln!("{msg}");
+    }
+    ExitCode::from(2)
 }
 
 fn cmd_explain(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
@@ -129,16 +195,14 @@ fn cmd_explain(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCo
             }
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::from(1)
-        }
+        Err(e) => emit_lin_error(&e),
     }
 }
 
 fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
     let mut show_plan = false;
     let mut use_gpu = false;
+    let mut format = RunOutputFormat::Compact;
     let mut file: Option<PathBuf> = None;
     let mut rest = Vec::new();
     let mut i = 0;
@@ -152,6 +216,26 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
                 show_plan = true;
                 i += 1;
             }
+            "--format" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("table") => format = RunOutputFormat::Table,
+                    Some("json") => format = RunOutputFormat::Json,
+                    Some("jsonl") => format = RunOutputFormat::Jsonl,
+                    Some("compact") => format = RunOutputFormat::Compact,
+                    Some(other) => {
+                        return emit_usage_error(&format!(
+                            "unknown --format {other:?} (expected table|json|jsonl)"
+                        ));
+                    }
+                    None => {
+                        return emit_usage_error(
+                            "usage: lin [--data <dir>] run [--format table|json|jsonl] '<query>'",
+                        );
+                    }
+                }
+                i += 1;
+            }
             "--file" => {
                 i += 1;
                 match args.get(i) {
@@ -160,10 +244,9 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
                         i += 1;
                     }
                     None => {
-                        eprintln!(
-                            "usage: lin [--data <dir>] run [--gpu] [--explain] [--file <path> | - | '<query>']"
+                        return emit_usage_error(
+                            "usage: lin [--data <dir>] run [--gpu] [--explain] [--format table|json|jsonl] [--file <path> | - | '<query>']",
                         );
-                        return ExitCode::from(2);
                     }
                 }
             }
@@ -179,30 +262,22 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
     }
     let q = match load_program(file, &rest) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return emit_usage_error(&e),
     };
     if q.trim().is_empty() {
-        eprintln!(
-            "usage: lin [--data <dir>] run [--gpu] [--explain] [--file <path> | - | '<query>']"
+        return emit_usage_error(
+            "usage: lin [--data <dir>] run [--gpu] [--explain] [--format table|json|jsonl] [--file <path> | - | '<query>']",
         );
-        return ExitCode::from(2);
     }
     #[cfg(not(feature = "gpu"))]
     if use_gpu {
-        eprintln!("GPU support requires building Lin with --features gpu");
-        return ExitCode::from(2);
+        return emit_usage_error("GPU support requires building Lin with --features gpu");
     }
     #[cfg(feature = "gpu")]
     let gpu = if use_gpu {
         match lin::gpu::GpuCompute::new() {
             Ok(gpu) => Some(std::sync::Arc::new(gpu)),
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::from(1);
-            }
+            Err(error) => return emit_lin_error(&error),
         }
     } else {
         None
@@ -246,6 +321,65 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
             use io::Write as _;
             let stdout = io::stdout();
             let mut out = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+            write_handle_formatted(&mut out, &h, format);
+            if let Some(p) = plan {
+                let _ = writeln!(out);
+                let _ = out.write_all(p.as_bytes());
+            }
+            let _ = out.flush();
+            ExitCode::SUCCESS
+        }
+        Err(e) => emit_lin_error(&e),
+    }
+}
+
+fn cell_to_json_value(cell: &lin::Cell) -> serde_json::Value {
+    match cell {
+        lin::Cell::Null => serde_json::Value::Null,
+        lin::Cell::Bool(b) => serde_json::Value::Bool(*b),
+        lin::Cell::Int(n) | lin::Cell::Time(n) => serde_json::Value::Number((*n).into()),
+        lin::Cell::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        lin::Cell::Text(s) => serde_json::Value::String(s.to_string()),
+        lin::Cell::SmallText(s) => serde_json::Value::String(s.as_str().to_string()),
+        lin::Cell::Vec(v) => serde_json::Value::Array(
+            v.iter()
+                .map(|&x| {
+                    serde_json::Number::from_f64(f64::from(x))
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn row_to_json_map(row: &lin::Row) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for (k, v) in row {
+        if !matches!(v, lin::Cell::Null) {
+            map.insert(k.clone(), cell_to_json_value(v));
+        }
+    }
+    map
+}
+
+fn cell_display_table(cell: &lin::Cell) -> String {
+    match cell {
+        lin::Cell::Null => String::new(),
+        lin::Cell::Bool(b) => b.to_string(),
+        lin::Cell::Int(n) | lin::Cell::Time(n) => n.to_string(),
+        lin::Cell::Float(f) => f.to_string(),
+        lin::Cell::Text(s) => s.to_string(),
+        lin::Cell::SmallText(s) => s.as_str().to_string(),
+        lin::Cell::Vec(v) => format!("vec[{}]", v.len()),
+    }
+}
+
+fn write_handle_formatted(out: &mut impl io::Write, h: &lin::Handle, format: RunOutputFormat) {
+    match format {
+        RunOutputFormat::Compact => {
             let mut line = String::with_capacity(128);
             for row in &h.rows {
                 line.clear();
@@ -269,16 +403,82 @@ fn cmd_run(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
                 let _ = writeln!(out, "{msg}");
             }
             let _ = writeln!(out, "gen={} n={}", h.done.r#gen, h.done.n);
-            if let Some(p) = plan {
-                let _ = writeln!(out);
-                let _ = out.write_all(p.as_bytes());
-            }
-            let _ = out.flush();
-            ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::from(1)
+        RunOutputFormat::Jsonl => {
+            for row in &h.rows {
+                let val = serde_json::Value::Object(row_to_json_map(row));
+                let _ = serde_json::to_writer(&mut *out, &val);
+                let _ = out.write_all(b"\n");
+            }
+        }
+        RunOutputFormat::Json => {
+            let rows_json: Vec<serde_json::Value> = h
+                .rows
+                .iter()
+                .map(|r| serde_json::Value::Object(row_to_json_map(r)))
+                .collect();
+            let obj = serde_json::json!({
+                "rows": rows_json,
+                "gen": h.done.r#gen,
+                "n": h.done.n,
+                "message": h.message,
+            });
+            let _ = serde_json::to_writer(&mut *out, &obj);
+            let _ = out.write_all(b"\n");
+        }
+        RunOutputFormat::Table => {
+            let mut cols_set = std::collections::BTreeSet::new();
+            for row in &h.rows {
+                for (k, v) in row {
+                    if !matches!(v, lin::Cell::Null) {
+                        cols_set.insert(k.clone());
+                    }
+                }
+            }
+            let cols: Vec<String> = cols_set.into_iter().collect();
+            if !cols.is_empty() {
+                let mut widths: Vec<usize> = cols.iter().map(String::len).collect();
+                let mut rendered: Vec<Vec<String>> = Vec::with_capacity(h.rows.len());
+                for row in &h.rows {
+                    let mut rvec = Vec::with_capacity(cols.len());
+                    for (ci, cname) in cols.iter().enumerate() {
+                        let s = row
+                            .get(cname.as_str())
+                            .map(cell_display_table)
+                            .unwrap_or_default();
+                        widths[ci] = widths[ci].max(s.len());
+                        rvec.push(s);
+                    }
+                    rendered.push(rvec);
+                }
+                for (ci, cname) in cols.iter().enumerate() {
+                    if ci > 0 {
+                        let _ = out.write_all(b" | ");
+                    }
+                    let _ = write!(out, "{:<width$}", cname, width = widths[ci]);
+                }
+                let _ = out.write_all(b"\n");
+                for (ci, &w) in widths.iter().enumerate() {
+                    if ci > 0 {
+                        let _ = out.write_all(b"-+-");
+                    }
+                    let _ = out.write_all("-".repeat(w).as_bytes());
+                }
+                let _ = out.write_all(b"\n");
+                for rvec in &rendered {
+                    for (ci, val) in rvec.iter().enumerate() {
+                        if ci > 0 {
+                            let _ = out.write_all(b" | ");
+                        }
+                        let _ = write!(out, "{:<width$}", val, width = widths[ci]);
+                    }
+                    let _ = out.write_all(b"\n");
+                }
+            }
+            if let Some(msg) = &h.message {
+                let _ = writeln!(out, "{msg}");
+            }
+            let _ = writeln!(out, "gen={} n={}", h.done.r#gen, h.done.n);
         }
     }
 }
@@ -342,15 +542,22 @@ fn load_program(file: Option<PathBuf>, rest: &[String]) -> Result<String, String
 }
 
 fn usage(code: u8) -> ExitCode {
-    eprintln!(
-        "usage:\n  \
-         lin [--data <dir>] [--follower] run [--gpu] [--explain] [--file <path> | - | '<query>']\n  \
+    let msg = "usage:\n  \
+         lin [--data <dir>] [--follower] [--json-errors] run [--gpu] [--explain] [--format table|json|jsonl] [--file <path> | - | '<query>']\n  \
          lin [--data <dir>] [--follower] explain [--graph mermaid|dot] '<query>'\n  \
+         lin [--data <dir>] import --collection <col> --format jsonl|csv [--file <path>] [--reject-file <path>]\n  \
+         lin [--data <dir>] export --query '<query>' --format jsonl|csv [--out <path>]\n  \
+         lin [--data <dir>] inspect storage|wal|indexes|locks\n  \
+         lin [--data <dir>] health | readiness\n  \
+         lin [--data <dir>] config effective\n  \
+         lin [--data <dir>] repl [--format table|json|jsonl]\n  \
+         lin completions bash|zsh|fish\n  \
          lin --data <dir> wal-serve [--listen HOST:PORT] [--sinks N] [--token TOKEN] [--tls-cert PEM --tls-key PEM]\n  \
          lin --data <dir> follower status|bootstrap|sync …\n  \
          lin --data <dir> --follower apply-wal <frames.bin | ->\n  \
          lin [--data <dir>] backup export <file.json>\n  \
          lin backup import <file.json> [--data <dir>]\n  \
+         lin backup verify <file.json>\n  \
          lin [--data <dir>] cache serve [--node-id ID] [--listen HOST:PORT] [--peer ID=HOST:PORT] [--max-entries N]\n  \
          lin cache cli [--connect HOST:PORT] [COMMAND...]\n  \
          lin [--data <dir>] [--cold] [--follower] serve [--listen HOST:PORT] [--token TOKEN] [--tls-cert PEM --tls-key PEM] [--primary HOST:PORT] [--group-window-ms MS] [--max-group-size N] [--max-group-bytes BYTES]\n  \
@@ -360,9 +567,19 @@ fn usage(code: u8) -> ExitCode {
          lin [--data <dir>] [--follower] stats\n  \
          lin --data <dir> --cold cluster <collection> [<field> | --none]\n  \
          lin --data <dir> --cold compact <collection>\n  \
-         global: --cold opens <dir> with the disk tier (large collections spill to segments)\n  \
-         lin version"
-    );
+         global: --cold opens <dir> with the disk tier; --json-errors emits structured JSON diagnostics\n  \
+         lin version [--capabilities]";
+    if JSON_ERRORS.load(Ordering::Relaxed) {
+        let payload = serde_json::json!({
+            "code": "E_USAGE",
+            "phase": "cli",
+            "message": msg,
+            "exit_code": code,
+        });
+        eprintln!("{payload}");
+    } else {
+        eprintln!("{msg}");
+    }
     ExitCode::from(code)
 }
 
@@ -422,10 +639,7 @@ fn report(out: Result<String, lin::Error>) -> ExitCode {
             println!("{line}");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::from(1)
-        }
+        Err(e) => emit_lin_error(&e),
     }
 }
 
@@ -1039,16 +1253,39 @@ fn cmd_backup(args: &[String], data: Option<PathBuf>) -> ExitCode {
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
-                        eprintln!("{e}");
-                        ExitCode::from(1)
-                    }
+                    let ce = lin::Error::corrupt(e.message);
+                    emit_lin_error(&ce)
+                }
                 },
             }
         }
-        _ => {
-            eprintln!("usage: lin backup export|import …");
-            ExitCode::from(2)
+        Some("verify") => {
+            let Some(path) = args.get(1) else {
+                return emit_usage_error("usage: lin backup verify <file>");
+            };
+            match lin::persist::read_backup(std::path::Path::new(path)) {
+                Ok(snap) => {
+                    let total_rows: usize = snap.collections.values().map(Vec::len).sum();
+                    let out = serde_json::json!({
+                        "valid": true,
+                        "path": path,
+                        "gen": snap.r#gen,
+                        "catalog_hash": snap.catalog_hash,
+                        "embed_id": snap.embed_id,
+                        "collections": snap.collections.len(),
+                        "rows": total_rows,
+                        "edges": snap.edges.len(),
+                    });
+                    println!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    let ce = lin::Error::corrupt(e.message);
+                    emit_lin_error(&ce)
+                }
+            }
         }
+        _ => emit_usage_error("usage: lin backup export|import|verify …"),
     }
 }
 
@@ -2234,6 +2471,993 @@ fn cmd_recover(args: &[String], data: Option<PathBuf>) -> ExitCode {
     if args.iter().any(|a| a == "--fix-catalog-hash") {
         return cmd_repair_catalog_hash(data);
     }
-    eprintln!("usage: lin --data <dir> recover --fix-catalog-hash");
-    ExitCode::from(2)
+    emit_usage_error("usage: lin --data <dir> recover --fix-catalog-hash")
+}
+
+fn cmd_version(args: &[String]) -> ExitCode {
+    let mut capabilities = false;
+    for arg in args {
+        match arg.as_str() {
+            "--capabilities" | "--json" => capabilities = true,
+            other => {
+                return emit_usage_error(&format!(
+                    "unknown version arg {other:?} (expected --capabilities)"
+                ));
+            }
+        }
+    }
+    if !capabilities {
+        println!("lin {}", lin::VERSION);
+        return ExitCode::SUCCESS;
+    }
+
+    let feature_flags = [
+        ("async", cfg!(feature = "async")),
+        ("derive", cfg!(feature = "derive")),
+        ("gpu", cfg!(feature = "gpu")),
+        ("parallel", cfg!(feature = "parallel")),
+        ("compress-flate", cfg!(feature = "compress-flate")),
+        ("compress-lz4", cfg!(feature = "compress-lz4")),
+        ("compress-zstd", cfg!(feature = "compress-zstd")),
+        ("compress-wal", cfg!(feature = "compress-wal")),
+        ("embed-ollama", cfg!(feature = "embed-ollama")),
+        ("embed-onnx", cfg!(feature = "embed-onnx")),
+    ];
+    let mut features_map = serde_json::Map::new();
+    let mut enabled_features = Vec::new();
+    for (name, enabled) in feature_flags {
+        features_map.insert(name.to_string(), serde_json::Value::Bool(enabled));
+        if enabled {
+            enabled_features.push(name);
+        }
+    }
+    let snapshot_magics: Vec<String> = lin::persist::CodecCapabilities::supported_snapshot_magics()
+        .iter()
+        .map(|m| {
+            m.iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect();
+    let out = serde_json::json!({
+        "version": lin::VERSION,
+        "features": features_map,
+        "enabled_features": enabled_features,
+        "wal_codecs": lin::persist::CodecCapabilities::supported_wal_codecs(),
+        "snapshot_magics_hex": snapshot_magics,
+    });
+    println!("{out}");
+    ExitCode::SUCCESS
+}
+
+fn probe_nonblocking_exclusive_flock(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+            return false;
+        };
+        // SAFETY: `file` is a valid open descriptor; non-blocking flock probes contention and unlocks immediately.
+        unsafe {
+            let rc = libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+            if rc == 0 {
+                let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                false
+            } else {
+                true
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn cmd_inspect(args: &[String], data: Option<PathBuf>) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("wal") => {
+            let target_path = if let Some(explicit) = args.get(1) {
+                PathBuf::from(explicit)
+            } else if let Some(dir) = data {
+                lin::persist::log_path(&dir)
+            } else {
+                return emit_usage_error("usage: lin [--data <dir>] inspect wal [<wal_file>]");
+            };
+            if !target_path.exists() {
+                let out = serde_json::json!({
+                    "exists": false,
+                    "path": target_path.display().to_string(),
+                    "frame_count": 0,
+                    "valid_prefix_bytes": 0,
+                    "damaged_offset": serde_json::Value::Null,
+                    "frames": [],
+                });
+                println!("{out}");
+                return ExitCode::SUCCESS;
+            }
+            match lin::persist::inspect_wal_file(&target_path) {
+                Ok(rep) => {
+                    let frames: Vec<serde_json::Value> = rep
+                        .frames
+                        .iter()
+                        .map(|f| {
+                            serde_json::json!({
+                                "frame_index": f.frame_index,
+                                "byte_offset": f.byte_offset,
+                                "byte_len": f.byte_len,
+                                "codec": f.codec,
+                                "gen": f.r#gen,
+                                "next_id": f.next_id,
+                                "pack_kind": f.pack_kind,
+                                "crc_valid": f.crc_valid,
+                            })
+                        })
+                        .collect();
+                    let out = serde_json::json!({
+                        "exists": true,
+                        "path": target_path.display().to_string(),
+                        "frame_count": rep.frames.len(),
+                        "valid_prefix_bytes": rep.valid_prefix_bytes,
+                        "damaged_offset": rep.damaged_offset,
+                        "damaged_reason": rep.damaged_reason,
+                        "frames": frames,
+                    });
+                    println!("{out}");
+                    if rep.damaged_offset.is_some() {
+                        ExitCode::from(4)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    let ce = lin::Error::corrupt(e.message);
+                    emit_lin_error(&ce)
+                }
+            }
+        }
+        Some("storage") => {
+            let Some(dir) = data else {
+                return emit_usage_error("usage: lin --data <dir> inspect storage");
+            };
+            let snap_path = lin::persist::snapshot_path(&dir);
+            let wal_path = lin::persist::log_path(&dir);
+            let snap_rep = match lin::persist::inspect_snapshot_file(&snap_path) {
+                Ok(r) => r,
+                Err(e) => return emit_lin_error(&e),
+            };
+            let wal_rep = if wal_path.exists() {
+                match lin::persist::inspect_wal_file(&wal_path) {
+                    Ok(r) => Some(r),
+                    Err(e) => return emit_lin_error(&e),
+                }
+            } else {
+                None
+            };
+            let recovery = match lin::persist::dry_run_recovery(&dir) {
+                Ok(r) => r,
+                Err(e) => return emit_lin_error(&e),
+            };
+            let head = lin::persist::read_head(&dir).ok().flatten();
+            let out = serde_json::json!({
+                "dir": dir.display().to_string(),
+                "exists": dir.exists(),
+                "head": head.map(|h| serde_json::json!({
+                    "gen": h.r#gen,
+                    "catalog_hash": h.catalog_hash,
+                    "embed_id": h.embed_id,
+                })),
+                "snapshot": {
+                    "exists": snap_rep.exists,
+                    "byte_len": snap_rep.byte_len,
+                    "format_version": snap_rep.format_version,
+                    "crc_trailer_present": snap_rep.crc_trailer_present,
+                    "crc_valid": snap_rep.crc_valid,
+                    "gen": snap_rep.r#gen,
+                    "collection_count": snap_rep.collection_count,
+                    "cold_collections": snap_rep.cold_collections,
+                },
+                "wal": wal_rep.as_ref().map(|w| serde_json::json!({
+                    "exists": true,
+                    "frame_count": w.frames.len(),
+                    "valid_prefix_bytes": w.valid_prefix_bytes,
+                    "damaged_offset": w.damaged_offset,
+                    "damaged_reason": w.damaged_reason,
+                })).unwrap_or_else(|| serde_json::json!({
+                    "exists": false,
+                    "frame_count": 0,
+                    "valid_prefix_bytes": 0,
+                })),
+                "recovery_dry_run": {
+                    "snapshot_gen": recovery.snapshot_gen,
+                    "head_gen": recovery.head_gen,
+                    "replayable_frames": recovery.replayable_frames,
+                    "final_gen": recovery.final_gen,
+                    "truncate_to_offset": recovery.truncate_to_offset,
+                    "damaged_offset": recovery.damaged_offset,
+                    "decision_log": recovery.decision_log,
+                }
+            });
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Some("indexes") => {
+            let cat_info = match data {
+                Some(dir) => match Db::open_read(&dir) {
+                    Ok(rdb) => {
+                        let tmp_db = Db::builder()
+                            .data_dir(&dir)
+                            .read_only(true)
+                            .build();
+                        drop(rdb);
+                        match tmp_db {
+                            Ok(db) => lin::migration::inspect_db_catalog(&db),
+                            Err(e) => return emit_lin_error(&e),
+                        }
+                    }
+                    Err(e) => return emit_lin_error(&e),
+                },
+                None => {
+                    let db = Db::fixture();
+                    lin::migration::inspect_db_catalog(&db)
+                }
+            };
+            let scalar: Vec<serde_json::Value> = cat_info
+                .scalar_indexes
+                .values()
+                .map(|ix| {
+                    serde_json::json!({
+                        "label": ix.label,
+                        "collection": ix.collection,
+                        "unique": ix.unique,
+                        "fields": ix.fields,
+                        "partial_pred": ix.partial_pred,
+                    })
+                })
+                .collect();
+            let out = serde_json::json!({
+                "schema_hash": cat_info.schema_hash,
+                "embedder_id": cat_info.embedder_id,
+                "scalar_indexes": scalar,
+                "fts_fields": cat_info.fts_fields,
+            });
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Some("locks") => {
+            let Some(dir) = data else {
+                return emit_usage_error("usage: lin --data <dir> inspect locks");
+            };
+            let lock_file = lin::persist::lock_path(&dir);
+            let fence_file = lin::persist::fence_path(&dir);
+            let lock_exists = lock_file.exists();
+            let fence_exists = fence_file.exists();
+            let writer_locked = lock_exists && probe_nonblocking_exclusive_flock(&lock_file);
+            let fence_locked = fence_exists && probe_nonblocking_exclusive_flock(&fence_file);
+            let out = serde_json::json!({
+                "dir": dir.display().to_string(),
+                "lock_path": lock_file.display().to_string(),
+                "lock_exists": lock_exists,
+                "writer_locked": writer_locked,
+                "fence_path": fence_file.display().to_string(),
+                "fence_exists": fence_exists,
+                "fence_locked": fence_locked,
+            });
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        _ => emit_usage_error("usage: lin [--data <dir>] inspect storage|wal|indexes|locks"),
+    }
+}
+
+fn cmd_import(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    if follower {
+        return emit_lin_error(&lin::Error::permission_denied(
+            "import is not allowed in --follower mode",
+        ));
+    }
+    let mut collection: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut reject_file: Option<PathBuf> = None;
+    let mut batch_size: usize = 1024;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--collection" | "-c" => {
+                i += 1;
+                collection = args.get(i).cloned();
+            }
+            "--format" | "-f" => {
+                i += 1;
+                format = args.get(i).cloned();
+            }
+            "--file" | "--in" => {
+                i += 1;
+                file = args.get(i).map(PathBuf::from);
+            }
+            "--reject-file" => {
+                i += 1;
+                reject_file = args.get(i).map(PathBuf::from);
+            }
+            "--batch-size" => {
+                i += 1;
+                let Some(Ok(n)) = args.get(i).map(|s| s.parse::<usize>()) else {
+                    return emit_usage_error("--batch-size requires a positive integer");
+                };
+                batch_size = n.max(1);
+            }
+            other => {
+                return emit_usage_error(&format!("unknown import option {other:?}"));
+            }
+        }
+        i += 1;
+    }
+
+    let Some(col) = collection else {
+        return emit_usage_error(
+            "usage: lin [--data <dir>] import --collection <col> --format jsonl|csv [--file <path>]",
+        );
+    };
+    let Some(fmt) = format else {
+        return emit_usage_error(
+            "usage: lin [--data <dir>] import --collection <col> --format jsonl|csv [--file <path>]",
+        );
+    };
+    if fmt != "jsonl" && fmt != "csv" {
+        return emit_usage_error(&format!(
+            "unsupported import --format {fmt:?} (expected jsonl|csv)"
+        ));
+    }
+
+    let limits = lin::io_formats::ImportLimits {
+        batch_size,
+        ..lin::io_formats::ImportLimits::default()
+    };
+    let mapping = lin::io_formats::ImportSchemaMapping::default();
+
+    let run_import = |db: &mut Db| -> Result<lin::io_formats::ImportReceipt, lin::Error> {
+        let mut rej_file_opt = match &reject_file {
+            Some(p) => Some(
+                std::fs::File::create(p)
+                    .map_err(|e| lin::Error::io(format!("create reject file {}: {e}", p.display())))?,
+            ),
+            None => None,
+        };
+        let reject_writer: Option<&mut dyn io::Write> = match rej_file_opt.as_mut() {
+            Some(f) => Some(f),
+            None => None,
+        };
+        let mut progress = |_bytes: u64, _rows: usize| {};
+        let never_cancel = || false;
+
+        match &file {
+            Some(path) => {
+                let f = std::fs::File::open(path)
+                    .map_err(|e| lin::Error::io(format!("open {}: {e}", path.display())))?;
+                let mut reader = io::BufReader::new(f);
+                if fmt == "jsonl" {
+                    lin::io_formats::import_jsonl_reader(
+                        db,
+                        &col,
+                        &mut reader,
+                        &limits,
+                        &mapping,
+                        reject_writer,
+                        &mut progress,
+                        &never_cancel,
+                    )
+                } else {
+                    lin::io_formats::import_csv_reader(
+                        db,
+                        &col,
+                        &mut reader,
+                        &limits,
+                        &mapping,
+                        reject_writer,
+                        &mut progress,
+                        &never_cancel,
+                    )
+                }
+            }
+            None => {
+                let stdin = io::stdin();
+                let mut reader = stdin.lock();
+                if fmt == "jsonl" {
+                    lin::io_formats::import_jsonl_reader(
+                        db,
+                        &col,
+                        &mut reader,
+                        &limits,
+                        &mapping,
+                        reject_writer,
+                        &mut progress,
+                        &never_cancel,
+                    )
+                } else {
+                    lin::io_formats::import_csv_reader(
+                        db,
+                        &col,
+                        &mut reader,
+                        &limits,
+                        &mapping,
+                        reject_writer,
+                        &mut progress,
+                        &never_cancel,
+                    )
+                }
+            }
+        }
+    };
+
+    let res = match data {
+        Some(dir) => with_data(Some(dir), false, |db| run_import(db.unwrap())),
+        None => {
+            let mut db = Db::fixture();
+            run_import(&mut db)
+        }
+    };
+
+    match res {
+        Ok(receipt) => {
+            let out = serde_json::json!({
+                "collection": col,
+                "format": fmt,
+                "imported_rows": receipt.imported_rows,
+                "skipped_rows": receipt.skipped_rows,
+                "rejected_rows": receipt.rejected_rows,
+                "bytes_read": receipt.bytes_read,
+                "batches_committed": receipt.batches_committed,
+            });
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => emit_lin_error(&e),
+    }
+}
+
+fn cmd_export(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let mut query: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--query" | "-q" => {
+                i += 1;
+                query = args.get(i).cloned();
+            }
+            "--format" | "-f" => {
+                i += 1;
+                format = args.get(i).cloned();
+            }
+            "--out" | "-o" => {
+                i += 1;
+                out_path = args.get(i).map(PathBuf::from);
+            }
+            other => {
+                return emit_usage_error(&format!("unknown export option {other:?}"));
+            }
+        }
+        i += 1;
+    }
+
+    let Some(q) = query else {
+        return emit_usage_error(
+            "usage: lin [--data <dir>] export --query '<q>' --format jsonl|csv [--out <path>]",
+        );
+    };
+    let Some(fmt) = format else {
+        return emit_usage_error(
+            "usage: lin [--data <dir>] export --query '<q>' --format jsonl|csv [--out <path>]",
+        );
+    };
+    if fmt != "jsonl" && fmt != "csv" {
+        return emit_usage_error(&format!(
+            "unsupported export --format {fmt:?} (expected jsonl|csv)"
+        ));
+    }
+
+    let do_export = |db: &mut Db| -> Result<usize, lin::Error> {
+        match &out_path {
+            Some(path) => {
+                let f = std::fs::File::create(path)
+                    .map_err(|e| lin::Error::io(format!("create {}: {e}", path.display())))?;
+                let mut writer = io::BufWriter::new(f);
+                if fmt == "jsonl" {
+                    lin::io_formats::export_jsonl_writer(db, &q, &mut writer)
+                } else {
+                    lin::io_formats::export_csv_writer(db, &q, &mut writer)
+                }
+            }
+            None => {
+                let stdout = io::stdout();
+                let mut writer = io::BufWriter::new(stdout.lock());
+                if fmt == "jsonl" {
+                    lin::io_formats::export_jsonl_writer(db, &q, &mut writer)
+                } else {
+                    lin::io_formats::export_csv_writer(db, &q, &mut writer)
+                }
+            }
+        }
+    };
+
+    let res = match data {
+        Some(dir) => with_data(Some(dir), follower, |db| do_export(db.unwrap())),
+        None => {
+            let mut db = Db::fixture();
+            do_export(&mut db)
+        }
+    };
+
+    match res {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => emit_lin_error(&e),
+    }
+}
+
+fn build_health_snapshot(
+    data: Option<PathBuf>,
+    follower: bool,
+    check_ready: bool,
+) -> (serde_json::Value, ExitCode) {
+    let cold = COLD.load(Ordering::Relaxed);
+    match data {
+        None => {
+            let db = Db::fixture();
+            let s = db.stats();
+            let out = serde_json::json!({
+                "status": "healthy",
+                "ready": true,
+                "mode": "memory",
+                "version": lin::VERSION,
+                "gen": s.r#gen,
+                "docs": s.docs,
+                "cold": cold,
+                "follower": follower,
+            });
+            (out, ExitCode::SUCCESS)
+        }
+        Some(dir) => {
+            let recovery = match lin::persist::dry_run_recovery(&dir) {
+                Ok(r) => r,
+                Err(e) => {
+                    let out = serde_json::json!({
+                        "status": "unhealthy",
+                        "ready": false,
+                        "dir": dir.display().to_string(),
+                        "error": e.message,
+                    });
+                    return (out, ExitCode::from(4));
+                }
+            };
+            let corrupt = recovery.damaged_offset.is_some() && recovery.truncate_to_offset.is_none();
+            if corrupt {
+                let out = serde_json::json!({
+                    "status": "unhealthy",
+                    "ready": false,
+                    "dir": dir.display().to_string(),
+                    "damaged_offset": recovery.damaged_offset,
+                    "decision_log": recovery.decision_log,
+                });
+                return (out, ExitCode::from(4));
+            }
+            let writer_locked = {
+                let lp = lin::persist::lock_path(&dir);
+                lp.exists() && probe_nonblocking_exclusive_flock(&lp)
+            };
+            let ready = if check_ready {
+                if !dir.exists() {
+                    true
+                } else {
+                    Db::open_read(&dir).is_ok()
+                }
+            } else {
+                true
+            };
+            let code = if ready {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(3)
+            };
+            let out = serde_json::json!({
+                "status": if ready { "healthy" } else { "degraded" },
+                "ready": ready,
+                "mode": "durable",
+                "dir": dir.display().to_string(),
+                "exists": dir.exists(),
+                "version": lin::VERSION,
+                "gen": recovery.final_gen,
+                "replayable_frames": recovery.replayable_frames,
+                "writer_locked": writer_locked,
+                "cold": cold,
+                "follower": follower,
+            });
+            (out, code)
+        }
+    }
+}
+
+fn cmd_health(data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let (out, code) = build_health_snapshot(data, follower, false);
+    println!("{out}");
+    code
+}
+
+fn cmd_readiness(data: Option<PathBuf>, follower: bool) -> ExitCode {
+    let (out, code) = build_health_snapshot(data, follower, true);
+    println!("{out}");
+    code
+}
+
+fn cmd_config(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    if args.first().map(String::as_str) != Some("effective") {
+        return emit_usage_error("usage: lin [--data <dir>] config effective");
+    }
+    let mut env_overrides = serde_json::Map::new();
+    let resolved_data = match data {
+        Some(d) => Some(d.display().to_string()),
+        None => std::env::var("LIN_DATA_DIR").ok().filter(|s| !s.is_empty()).inspect(|v| {
+            env_overrides.insert(
+                "LIN_DATA_DIR".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }),
+    };
+    let mut cold = COLD.load(Ordering::Relaxed);
+    if let Ok(v) = std::env::var("LIN_COLD")
+        && !v.is_empty()
+    {
+        env_overrides.insert("LIN_COLD".to_string(), serde_json::Value::String(v.clone()));
+        if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+            cold = true;
+        }
+    }
+    let mut eff_follower = follower;
+    if let Ok(v) = std::env::var("LIN_FOLLOWER")
+        && !v.is_empty()
+    {
+        env_overrides.insert(
+            "LIN_FOLLOWER".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+        if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") {
+            eff_follower = true;
+        }
+    }
+    let mut quotas = lin::Quotas::default();
+    if let Ok(v) = std::env::var("LIN_MAX_ROWS")
+        && let Ok(n) = v.parse::<usize>()
+    {
+        quotas.max_rows = n;
+        env_overrides.insert("LIN_MAX_ROWS".to_string(), serde_json::Value::Number(n.into()));
+    }
+    if let Ok(v) = std::env::var("LIN_MAX_LOG_BYTES")
+        && let Ok(n) = v.parse::<u64>()
+    {
+        quotas.max_log_bytes = n;
+        env_overrides.insert(
+            "LIN_MAX_LOG_BYTES".to_string(),
+            serde_json::Value::Number(n.into()),
+        );
+    }
+    if let Ok(v) = std::env::var("LIN_MAX_QUERY_BYTES")
+        && let Ok(n) = v.parse::<usize>()
+    {
+        quotas.max_query_bytes = n;
+        env_overrides.insert(
+            "LIN_MAX_QUERY_BYTES".to_string(),
+            serde_json::Value::Number(n.into()),
+        );
+    }
+
+    let out = serde_json::json!({
+        "data_dir": resolved_data,
+        "cold": cold,
+        "follower": eff_follower,
+        "json_errors": JSON_ERRORS.load(Ordering::Relaxed),
+        "quotas": {
+            "max_rows": quotas.max_rows,
+            "max_edges": quotas.max_edges,
+            "max_log_bytes": quotas.max_log_bytes,
+            "max_query_bytes": quotas.max_query_bytes,
+            "max_ast_depth": quotas.max_ast_depth,
+            "max_output_bytes": quotas.max_output_bytes,
+            "spill_enabled": quotas.spill_enabled,
+        },
+        "env_overrides": env_overrides,
+    });
+    println!("{out}");
+    ExitCode::SUCCESS
+}
+
+fn cmd_completions(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("bash") => {
+            println!(
+                r#"_lin_completions() {{
+    local cur prev cmds
+    COMPREPLY=()
+    cur="${{COMP_WORDS[COMP_CWORD]}}"
+    prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    cmds="run explain import export inspect health readiness backup config completions repl stats cluster compact serve client shard remote follower wal-serve apply-wal cache recover repair-catalog-hash version"
+    if [[ ${{COMP_CWORD}} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "${{cmds}} --data --cold --follower --json-errors" -- "${{cur}}") )
+        return 0
+    fi
+    case "${{prev}}" in
+        --format) COMPREPLY=( $(compgen -W "table json jsonl csv" -- "${{cur}}") ) ;;
+        inspect) COMPREPLY=( $(compgen -W "storage wal indexes locks" -- "${{cur}}") ) ;;
+        backup) COMPREPLY=( $(compgen -W "export import verify" -- "${{cur}}") ) ;;
+        completions) COMPREPLY=( $(compgen -W "bash zsh fish" -- "${{cur}}") ) ;;
+        config) COMPREPLY=( $(compgen -W "effective" -- "${{cur}}") ) ;;
+    esac
+}}
+complete -F _lin_completions lin"#
+            );
+            ExitCode::SUCCESS
+        }
+        Some("zsh") => {
+            println!(
+                r#"#compdef lin
+_lin() {{
+    local -a subcmds
+    subcmds=(
+        'run:Execute a LinQL query or statement'
+        'explain:Explain a LinQL query plan'
+        'import:Stream JSONL or CSV rows into a collection'
+        'export:Stream query results to JSONL or CSV'
+        'inspect:Inspect storage, WAL, indexes, or locks'
+        'health:Report database health JSON'
+        'readiness:Report database readiness JSON'
+        'backup:Export, import, or verify portable backups'
+        'config:Show effective runtime configuration'
+        'completions:Generate shell completion scripts'
+        'repl:Start interactive multiline LinQL shell'
+        'stats:Show database counters'
+        'version:Show version and build capabilities'
+    )
+    _arguments -C \
+        '--data[Data directory]:dir:_files -/' \
+        '--cold[Enable disk tier]' \
+        '--follower[Open as read-only follower]' \
+        '--json-errors[Emit structured JSON errors]' \
+        '1:command:->cmd' \
+        '*::arg:->args'
+    case $state in
+        cmd) _describe 'command' subcmds ;;
+    esac
+}}
+_lin "$@""#
+            );
+            ExitCode::SUCCESS
+        }
+        Some("fish") => {
+            println!(
+                r#"complete -c lin -l data -d 'Data directory' -r
+complete -c lin -l cold -d 'Enable disk tier'
+complete -c lin -l follower -d 'Open as read-only follower'
+complete -c lin -l json-errors -d 'Emit structured JSON errors'
+for cmd in run explain import export inspect health readiness backup config completions repl stats cluster compact serve client shard remote follower wal-serve apply-wal cache recover repair-catalog-hash version
+    complete -c lin -n '__fish_use_subcommand' -a $cmd
+end"#
+            );
+            ExitCode::SUCCESS
+        }
+        _ => emit_usage_error("usage: lin completions bash|zsh|fish"),
+    }
+}
+
+fn find_unquoted_semicolon(buf: &str) -> Option<usize> {
+    let bytes = buf.as_bytes();
+    let mut i = 0usize;
+    let mut in_quote: Option<u8> = None;
+    let mut in_comment = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_comment {
+            if b == b'\n' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if b == b'\\' {
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b';' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn cmd_repl(args: &[String], data: Option<PathBuf>, follower: bool) -> ExitCode {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let mut format = RunOutputFormat::Compact;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--format" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("table") => format = RunOutputFormat::Table,
+                    Some("json") => format = RunOutputFormat::Json,
+                    Some("jsonl") => format = RunOutputFormat::Jsonl,
+                    Some("compact") => format = RunOutputFormat::Compact,
+                    Some(other) => {
+                        return emit_usage_error(&format!(
+                            "unknown repl --format {other:?} (expected table|json|jsonl)"
+                        ));
+                    }
+                    None => {
+                        return emit_usage_error(
+                            "usage: lin [--data <dir>] repl [--format table|json|jsonl]",
+                        );
+                    }
+                }
+            }
+            other => {
+                return emit_usage_error(&format!("unknown repl option {other:?}"));
+            }
+        }
+        i += 1;
+    }
+
+    let cold = COLD.load(Ordering::Relaxed);
+    let mut db = match &data {
+        Some(dir) => {
+            let res = if follower {
+                Db::open_follower(dir)
+            } else if cold {
+                Db::open_with(
+                    dir,
+                    lin::OpenOpts {
+                        cold: true,
+                        ..lin::OpenOpts::default()
+                    },
+                )
+            } else {
+                Db::open(dir)
+            };
+            match res {
+                Ok(d) => d,
+                Err(e) => return emit_lin_error(&e),
+            }
+        }
+        None => {
+            if follower {
+                return emit_lin_error(&lin::Error::runtime("--follower requires --data <dir>"));
+            }
+            Db::fixture()
+        }
+    };
+
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal();
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    if interactive {
+        let _ = writeln!(
+            out,
+            "Lin {} REPL — end multiline statements with `;` (`:quit` to exit)",
+            lin::VERSION
+        );
+        let _ = out.flush();
+    }
+
+    let mut pending = String::new();
+    let mut lines = stdin.lock().lines();
+    let mut last_err: Option<lin::Error> = None;
+
+    loop {
+        if interactive {
+            let prompt = if pending.trim().is_empty() {
+                "lin> "
+            } else {
+                "  .. "
+            };
+            let _ = write!(out, "{prompt}");
+            let _ = out.flush();
+        }
+        let Some(line_res) = lines.next() else {
+            if interactive {
+                let _ = writeln!(out);
+            }
+            break;
+        };
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                last_err = Some(lin::Error::io(format!("repl stdin read error: {e}")));
+                break;
+            }
+        };
+        if pending.trim().is_empty() {
+            let trimmed = line.trim();
+            if matches!(trimmed, ":quit" | ":q" | ":exit" | "quit" | "exit") {
+                break;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+        }
+        if !pending.is_empty() {
+            pending.push('\n');
+        }
+        pending.push_str(&line);
+
+        while let Some(semi_idx) = find_unquoted_semicolon(&pending) {
+            let stmt_src = pending[..semi_idx].trim().to_string();
+            pending.drain(..=semi_idx);
+            if stmt_src.is_empty() {
+                continue;
+            }
+            if matches!(stmt_src.as_str(), ":quit" | ":q" | ":exit" | "quit" | "exit") {
+                pending.clear();
+                let _ = out.flush();
+                let _ = db.close();
+                return ExitCode::SUCCESS;
+            }
+            match db.run(&stmt_src) {
+                Ok(h) => {
+                    write_handle_formatted(&mut out, &h, format);
+                    let _ = out.flush();
+                }
+                Err(e) => {
+                    let _ = out.flush();
+                    let _ = emit_lin_error(&e);
+                    if !interactive {
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+    }
+
+    let tail = pending.trim();
+    if !tail.is_empty() && !matches!(tail, ":quit" | ":q" | ":exit" | "quit" | "exit") {
+        match db.run(tail) {
+            Ok(h) => {
+                write_handle_formatted(&mut out, &h, format);
+            }
+            Err(e) => {
+                let _ = out.flush();
+                let _ = emit_lin_error(&e);
+                last_err = Some(e);
+            }
+        }
+    }
+    let _ = out.flush();
+    if let Err(e) = db.close() {
+        return emit_lin_error(&e);
+    }
+    if let Some(e) = last_err
+        && !interactive
+    {
+        return ExitCode::from(exit_code_for_error(&e));
+    }
+    ExitCode::SUCCESS
 }

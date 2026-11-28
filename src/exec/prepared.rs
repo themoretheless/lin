@@ -175,6 +175,7 @@ pub struct Prepared {
     pub src: String,
     pub(crate) stmts: Arc<[Stmt]>,
     pub plan: Arc<Plan>,
+    pub(crate) catalog_hash: u64,
     /// True if any statement may mutate catalog or store.
     pub(crate) writes: bool,
     /// Append-only writes (insert/append) — cheap rollback without full clone.
@@ -190,6 +191,15 @@ pub struct Prepared {
     pub(crate) point_delete: Option<Arc<PointDeletePlan>>,
     pub(crate) point_update: Option<Arc<PointUpdatePlan>>,
     pub(crate) append_facts: Option<Arc<PreparedAppendFacts>>,
+}
+
+/// Static schema metadata and output column shape of a [`Prepared`] handle (`LIN-1444`, `LIN-1459`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSchemaInfo {
+    pub is_read_only: bool,
+    pub target_collection: Option<String>,
+    pub output_fields: Vec<(String, String)>,
+    pub catalog_hash: u64,
 }
 
 impl Prepared {
@@ -306,6 +316,262 @@ impl Prepared {
     pub fn scalar_read(&self, db: &ReadDb) -> Result<Cell, Error> {
         self.run_read(db)?.scalar()
     }
+
+    /// True when the database catalog hash has evolved since this statement was prepared (`LIN-1459`).
+    #[inline]
+    pub fn is_stale_for(&self, db: &Db) -> bool {
+        self.catalog_hash != db.catalog.hash_u64()
+    }
+
+    /// Inspect statement read/write classification, target collection, output columns, and catalog hash (`LIN-1444`, `LIN-1459`).
+    pub fn schema_info(&self, db: &Db) -> PreparedSchemaInfo {
+        let mut target_collection = None;
+        let mut output_fields = Vec::new();
+        let mut let_scopes: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+
+        for stmt in self.stmts.iter() {
+            match stmt {
+                Stmt::Let { name, query } => {
+                    let (tcol, cols) = infer_query_schema_info(query, &db.catalog, &let_scopes);
+                    target_collection = tcol;
+                    output_fields = cols.clone();
+                    let_scopes.insert(name.clone(), cols);
+                }
+                Stmt::Query(q) | Stmt::IdbSlice { query: q } => {
+                    let (tcol, cols) = infer_query_schema_info(q, &db.catalog, &let_scopes);
+                    target_collection = tcol;
+                    output_fields = cols;
+                }
+                Stmt::Insert { collection, .. }
+                | Stmt::InsertRows { collection, .. }
+                | Stmt::Update { collection, .. }
+                | Stmt::Delete { collection, .. } => {
+                    target_collection = Some(collection.clone());
+                    output_fields = collection_fields_info(&db.catalog, collection);
+                }
+                Stmt::Reembed { collection, .. } => {
+                    target_collection = Some(collection.clone());
+                    output_fields.clear();
+                }
+                Stmt::AppendFacts { .. } => {
+                    target_collection = Some("facts".to_string());
+                    output_fields = collection_fields_info(&db.catalog, "facts");
+                }
+                Stmt::AppendEdges { .. } | Stmt::DeleteEdge { .. } => {
+                    target_collection = None;
+                    output_fields = vec![
+                        ("from".to_string(), "text".to_string()),
+                        ("rel".to_string(), "rel".to_string()),
+                        ("to".to_string(), "text".to_string()),
+                    ];
+                }
+                Stmt::Decl(decl) => {
+                    target_collection = match decl {
+                        crate::ast::Decl::Col { name, .. } => Some(name.clone()),
+                        crate::ast::Decl::Index { collection, .. }
+                        | crate::ast::Decl::Filter { collection, .. }
+                        | crate::ast::Decl::Guard { collection, .. } => Some(collection.clone()),
+                        _ => None,
+                    };
+                    output_fields.clear();
+                }
+                _ => {
+                    output_fields.clear();
+                }
+            }
+        }
+
+        PreparedSchemaInfo {
+            is_read_only: !self.writes,
+            target_collection,
+            output_fields,
+            catalog_hash: self.catalog_hash,
+        }
+    }
+}
+
+fn collection_fields_info(cat: &Catalog, name: &str) -> Vec<(String, String)> {
+    if name == "catalog" {
+        return vec![
+            ("kind".to_string(), "text".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+    }
+    match cat.collection(name) {
+        Some(col) => col
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.ty.name().to_string()))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn infer_query_schema_info(
+    q: &Query,
+    cat: &Catalog,
+    let_scopes: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+) -> (Option<String>, Vec<(String, String)>) {
+    let (target_col, mut cols): (Option<String>, Vec<(String, String)>) = match &q.source {
+        Source::Collection(c) => {
+            if let Some(bound) = let_scopes.get(c) {
+                (None, bound.clone())
+            } else {
+                (Some(c.clone()), collection_fields_info(cat, c))
+            }
+        }
+        Source::Page(_) => (Some("docs".to_string()), collection_fields_info(cat, "docs")),
+        Source::Catalog => (
+            Some("catalog".to_string()),
+            collection_fields_info(cat, "catalog"),
+        ),
+    };
+
+    let lookup_ty = |cols: &[(String, String)], name: &str| -> String {
+        cols.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| "var".to_string())
+    };
+
+    for step in &q.steps {
+        match step {
+            Step::Filter(_) | Step::Sort { .. } | Step::Skip { .. } | Step::Take { .. } | Step::Search { .. } | Step::ArgExtremum { .. } => {}
+            Step::Join { collection, .. } => {
+                for (rk, rty) in collection_fields_info(cat, collection) {
+                    let qual = format!("{collection}.{rk}");
+                    if !cols.iter().any(|(k, _)| k == &qual) {
+                        cols.push((qual, rty.clone()));
+                    }
+                    if !cols.iter().any(|(k, _)| k == &rk) {
+                        cols.push((rk, rty));
+                    }
+                }
+            }
+            Step::Hop { .. } => {
+                cols = collection_fields_info(cat, "docs");
+            }
+            Step::Graph { .. } => {
+                cols = vec![
+                    ("from".to_string(), "text".to_string()),
+                    ("rel".to_string(), "rel".to_string()),
+                    ("to".to_string(), "text".to_string()),
+                ];
+            }
+            Step::Project(fields) => {
+                let mut next = Vec::with_capacity(fields.len());
+                for f in fields {
+                    let fname = f.as_str();
+                    let fty = lookup_ty(&cols, &fname);
+                    next.push((fname, fty));
+                }
+                cols = next;
+            }
+            Step::Without(fields) => {
+                let drop_set: std::collections::BTreeSet<String> =
+                    fields.iter().map(Field::as_str).collect();
+                cols.retain(|(k, _)| !drop_set.contains(k));
+            }
+            Step::Count { by: None } => {
+                cols = vec![("hits".to_string(), "i64".to_string())];
+            }
+            Step::Count { by: Some(by) } => {
+                let bname = by.as_str();
+                let bty = lookup_ty(&cols, &bname);
+                cols = vec![(bname, bty), ("hits".to_string(), "i64".to_string())];
+            }
+            Step::Sum { field, by } => {
+                let fty = lookup_ty(&cols, &field.as_str());
+                let mut next = Vec::new();
+                if let Some(b) = by {
+                    let bn = b.as_str();
+                    next.push((bn.clone(), lookup_ty(&cols, &bn)));
+                }
+                next.push(("sum".to_string(), fty));
+                cols = next;
+            }
+            Step::Min { field, by } => {
+                let fty = lookup_ty(&cols, &field.as_str());
+                let mut next = Vec::new();
+                if let Some(b) = by {
+                    let bn = b.as_str();
+                    next.push((bn.clone(), lookup_ty(&cols, &bn)));
+                }
+                next.push(("min".to_string(), fty));
+                cols = next;
+            }
+            Step::Max { field, by } => {
+                let fty = lookup_ty(&cols, &field.as_str());
+                let mut next = Vec::new();
+                if let Some(b) = by {
+                    let bn = b.as_str();
+                    next.push((bn.clone(), lookup_ty(&cols, &bn)));
+                }
+                next.push(("max".to_string(), fty));
+                cols = next;
+            }
+            Step::Avg { by, .. } => {
+                let mut next = Vec::new();
+                if let Some(b) = by {
+                    let bn = b.as_str();
+                    next.push((bn.clone(), lookup_ty(&cols, &bn)));
+                }
+                next.push(("avg".to_string(), "f64".to_string()));
+                cols = next;
+            }
+            Step::Summarize { specs, by } => {
+                let mut next = Vec::new();
+                for gk in by {
+                    match &gk.expr {
+                        crate::ast::GroupExpr::Field(f) => {
+                            let ty = lookup_ty(&cols, &f.as_str());
+                            next.push((gk.alias.clone(), ty));
+                        }
+                        crate::ast::GroupExpr::Bin { .. } => {
+                            next.push((gk.alias.clone(), "time".to_string()));
+                        }
+                    }
+                }
+                for spec in specs {
+                    let sty = match &spec.func {
+                        crate::ast::AggFunc::Count | crate::ast::AggFunc::DCount(_) => {
+                            "i64".to_string()
+                        }
+                        crate::ast::AggFunc::Avg(_)
+                        | crate::ast::AggFunc::Percentile { .. } => "f64".to_string(),
+                        crate::ast::AggFunc::Sum(f)
+                        | crate::ast::AggFunc::Min(f)
+                        | crate::ast::AggFunc::Max(f) => lookup_ty(&cols, &f.as_str()),
+                        crate::ast::AggFunc::ArgMax { value, .. }
+                        | crate::ast::AggFunc::ArgMin { value, .. } => {
+                            lookup_ty(&cols, &value.as_str())
+                        }
+                    };
+                    next.push((spec.alias.clone(), sty));
+                }
+                cols = next;
+            }
+            Step::Window { func, field, as_field, .. } => {
+                let wty = match func {
+                    crate::window::WindowFunction::RowNumber
+                    | crate::window::WindowFunction::Rank
+                    | crate::window::WindowFunction::DenseRank
+                    | crate::window::WindowFunction::Count => "i64".to_string(),
+                    crate::window::WindowFunction::Avg => "f64".to_string(),
+                    _ => field
+                        .as_ref()
+                        .map(|f| lookup_ty(&cols, &f.as_str()))
+                        .unwrap_or_else(|| "var".to_string()),
+                };
+                cols.retain(|(k, _)| k != as_field);
+                cols.push((as_field.clone(), wty));
+            }
+            Step::Match { .. } | Step::Union(_) => {}
+        }
+    }
+
+    (target_col, cols)
 }
 
 pub(crate) fn stmt_has_param(stmt: &Stmt) -> bool {
