@@ -1454,6 +1454,7 @@ impl Db {
             #[cfg(test)]
             PREENCODE_TEST_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let shared = Arc::new(std::mem::take(&mut built));
+            let phase_started = std::time::Instant::now();
             let task = crate::persist::start_insert_encoding(
                 self.persist.as_mut().unwrap(),
                 generation,
@@ -1464,7 +1465,9 @@ impl Db {
                 bytes,
                 mode,
             );
+            let dispatched = phase_started.elapsed();
             let maintenance = self.maintain_insert_slab(collection, start, &shared);
+            let maintained = phase_started.elapsed();
             let staged = match task {
                 Ok(reply) => reply.recv().unwrap_or_else(|_| {
                     let wal_dict = self.persist.as_ref().and_then(|p| p.wal_dictionary);
@@ -1486,6 +1489,8 @@ impl Db {
                     job.encode()
                 }
             };
+            let finished = phase_started.elapsed();
+            eprintln!("overlap {} {} {}", dispatched.as_nanos(), (maintained-dispatched).as_nanos(), (finished-maintained).as_nanos());
             built = Arc::try_unwrap(shared).expect("encoder retained input after reply");
             maintenance?;
             Some(staged)

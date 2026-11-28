@@ -569,6 +569,7 @@ pub(crate) struct EncodeJob {
 }
 impl EncodeJob {
     pub(crate) fn encode(self) -> PreparedInsert {
+        let encode_started = std::time::Instant::now();
         let Self {
             generation,
             next_id,
@@ -608,6 +609,7 @@ impl EncodeJob {
         }));
         // Drop the worker input before reply; the caller recovers its Vec without copying.
         drop(rows);
+        eprintln!("encode {}", encode_started.elapsed().as_nanos());
         staged.unwrap_or_else(|payload| PreparedInsert {
             pack: None,
             encoding: PreparedEncoding::Panicked(payload),

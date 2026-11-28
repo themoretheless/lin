@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/prefix-caller-first-chunk]
+    branches: [codex/profile-prefix-index-overlap]
 
 permissions:
   contents: read
@@ -36,39 +36,20 @@ jobs:
             dpkg-deb -x "$RUNNER_TEMP"/libgoogle-perftools-dev_*.deb "$RUNNER_TEMP/perftools"
             link=(-C link-arg=-Wl,-u,tc_malloc -C "link-arg=$RUNNER_TEMP/perftools/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.a" -C link-arg=-lstdc++)
           fi
-          build_worker() {
-            cargo rustc --no-default-features --locked --release -p lin-peer-worker --bin embedded-native "$@" -- "${link[@]}"
-          }
-          git restore --source=HEAD^ -- src/exec/dml.rs
-          git show 3b967b4c5:src/persist/codec.rs > src/persist/codec.rs
-          build_worker
-          cp target/release/embedded-native target/release/typed-baseline
-          git restore src/persist/codec.rs
-          build_worker --features lin/wal-delta-trial
-          cp target/release/embedded-native target/release/typed-two-pass
-          git restore src/exec/dml.rs
-          build_worker --features lin/wal-delta-trial
-          for n in 1000 10000; do
-            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
-            LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/scalar-$n" target/release/typed-two-pass lin-wal "$n" 1 "$(mktemp -d)"
-          done
-          python3 - <<'PYCODE'
-          import os
-          from pathlib import Path
-          for size, codec in [(1000, 3), (10000, 3)]:
-              data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
-              start = 8 + int.from_bytes(data[4:8], "little")
-              assert len(data) == {1000: 113697, 10000: 1174118}[size]
-              assert (Path(os.environ["RUNNER_TEMP"]) / f"scalar-{size}").stat().st_size == {1000: 113697, 10000: 1174118}[size]
-              assert data[start + 8] == codec
-              assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
-          PYCODE
+          cargo rustc --no-default-features --features lin/wal-delta-trial --locked --release -p lin-peer-worker --bin embedded-native -- "${link[@]}"
           lscpu > cpu.txt
-          python3 scripts/typed-wal-four-way.py
+          for i in {1..12}; do
+            for n in 1000 10000; do
+              target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)" > "total-$n-$i.txt" 2> "stage-$n-$i.txt"
+              grep -q '^encode ' "stage-$n-$i.txt"
+              grep -q '^overlap ' "stage-$n-$i.txt"
+            done
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-embedded-${{ matrix.runner }}
           path: |
             cpu.txt
-            typed-wal-four-way.json
+            stage-*.txt
+            total-*.txt
