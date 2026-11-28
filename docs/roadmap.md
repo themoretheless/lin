@@ -1,8 +1,8 @@
 # Lin — план развития
 
-Срез: **2026-11-20**, коммит `fc2923b74`. Единственный файл с планом в репозитории: в нём хранится только несделанное. Всё реализованное перенесено в [CHANGELOG](../CHANGELOG.md), профильные документы `docs/` и отчёты `benches/results/` ([2026-11-20-roadmap-acceptance](../benches/results/2026-11-20-roadmap-acceptance/report.md)).
+Срез: **2026-11-28**, ветка `main`. Единственный файл с планом в репозитории: в нём хранится только несделанное. Всё реализованное перенесено в [CHANGELOG](../CHANGELOG.md), профильные документы `docs/` ([api-and-feature-matrix.md](api-and-feature-matrix.md), [storage-and-compatibility.md](storage-and-compatibility.md), [query-semantics.md](query-semantics.md), [migration-and-operations-runbooks.md](migration-and-operations-runbooks.md), [benchmark-and-evidence-guide.md](benchmark-and-evidence-guide.md)) и отчёты `benches/results/` ([2026-11-20-roadmap-acceptance](../benches/results/2026-11-20-roadmap-acceptance/report.md)).
 
-Открыто **1276** пунктов общего backlog (часть II) и **1** платформенно-зависимый замер части I (`P4.2` на физическом Linux `ext4` / `xfs`). Это план работ и гипотез, не список подтверждённых дефектов и не обещание ускорений без приёмочного замера.
+Открыто **378** пунктов общего backlog (часть II: в основном сравнительные `G-PERF` замеры из ≥6 чередующихся process-pairs и платформенно/внешне заблокированные проверки) и **1** платформенно-зависимый замер части I (`P4.2` на физическом Linux `ext4` / `xfs`). Это план работ и гипотез, не список подтверждённых дефектов и не обещание ускорений без приёмочного замера.
 
 ID `LIN-xxxx` и `Rank` стабильны и не перенумеровываются (закрытые пункты удалены). Перед взятием пункта со статусом `candidate` или `qualification` сначала сверять с текущим кодом.
 
@@ -91,9 +91,9 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 Для каждой строки итоговый критерий — её конкретный результат плюс указанный gate. Если критерий требует недоступной платформы/endpoint, статус остаётся непроверенным; mock/compile не заменяет live qualification.
 
-### Приоритетный список — 1276 пунктов
+### Приоритетный список — 378 пунктов
 
-Количества: P1: 1, P2: 759, P3: 516; статусы: blocked_external: 1, candidate: 905, qualification: 370.
+Количества: P1: 1, P2: 257, P3: 120; статусы: blocked_external: 1, candidate: 339, qualification: 38.
 
 #### P1: 1 пунктов
 
@@ -101,7 +101,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 |---:|---|---|---|---|---|---|---|
 | 22 | LIN-0006 | [D01](#d01) | Получить тестовый endpoint Kusto | OPS | blocked_external | M | G-OPS |
 
-#### P2: 759 пунктов
+#### P2: 257 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
@@ -112,8 +112,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 116 | LIN-0014 | [D01](#d01) | Сохранять runtime feature flags | PERF | candidate | M | G-PERF |
 | 117 | LIN-0015 | [D01](#d01) | Проверять sample operation counts | PERF | candidate | M | G-PERF |
 | 118 | LIN-0016 | [D01](#d01) | Измерять cold constructor latency | PERF | candidate | M | G-PERF |
-| 119 | LIN-0017 | [D01](#d01) | Ввести matched mixed-case fixtures | VERIFY | qualification | S | G-VERIFY |
-| 120 | LIN-0018 | [D01](#d01) | Проверять adversarial строковые fixtures | VERIFY | qualification | S | G-VERIFY |
 | 122 | LIN-0020 | [D01](#d01) | Отдельно измерять 1M-row ingestion | PERF | candidate | M | G-PERF |
 | 123 | LIN-0021 | [D01](#d01) | Измерять wide-row insertion | PERF | candidate | M | G-PERF |
 | 124 | LIN-0022 | [D01](#d01) | Измерять skewed-key insertion | PERF | candidate | M | G-PERF |
@@ -137,15 +135,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 158 | LIN-0062 | [D02](#d02) | Переиспользовать точный serialized size | CORRECTNESS | qualification | M | G-CORRECT |
 | 159 | LIN-0063 | [D02](#d02) | Измерить segmented WAL encoding | PERF | candidate | M | G-PERF |
 | 160 | LIN-0064 | [D02](#d02) | Измерить reserve buffer policy | PERF | candidate | M | G-PERF |
-| 162 | LIN-0066 | [D02](#d02) | Ввести явный decoder capability set | CORRECTNESS | qualification | M | G-CORRECT |
-| 163 | LIN-0067 | [D02](#d02) | Документировать frame layout байтами | CORRECTNESS | qualification | M | G-CORRECT |
-| 164 | LIN-0068 | [D02](#d02) | Подготовить независимый frame inspector | CORRECTNESS | qualification | M | G-CORRECT |
-| 173 | LIN-0077 | [D02](#d02) | Проверить одинаковые bytes разных CPU | CORRECTNESS | qualification | S | G-CORRECT |
-| 174 | LIN-0078 | [D02](#d02) | Создать corpus исторических WAL frames | VERIFY | qualification | S | G-VERIFY |
-| 175 | LIN-0079 | [D02](#d02) | Версионировать WAL golden fixtures | VERIFY | qualification | S | G-VERIFY |
-| 177 | LIN-0085 | [D03](#d03) | Проверить barrier semantics Darwin | CORRECTNESS | qualification | S | G-CORRECT |
 | 178 | LIN-0086 | [D03](#d03) | Проверить fdatasync semantics Linux | CORRECTNESS | qualification | S | G-CORRECT |
-| 179 | LIN-0087 | [D03](#d03) | Проверить sync error propagation | CORRECTNESS | qualification | S | G-CORRECT |
 | 181 | LIN-0089 | [D03](#d03) | Сопоставить acknowledged durable boundaries | PERF | candidate | M | G-PERF |
 | 187 | LIN-0095 | [D03](#d03) | Измерить header coalescing | PERF | candidate | M | G-PERF |
 | 188 | LIN-0096 | [D03](#d03) | Измерить reusable frame buffers | PERF | candidate | M | G-PERF |
@@ -154,14 +144,8 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 191 | LIN-0099 | [D03](#d03) | Измерить buffered против direct I/O | PERF | candidate | M | G-PERF |
 | 192 | LIN-0100 | [D03](#d03) | Измерить sequential write advice | PERF | candidate | M | G-PERF |
 | 194 | LIN-0102 | [D03](#d03) | Разделить throughput и sync latency | PERF | candidate | M | G-PERF |
-| 195 | LIN-0103 | [D03](#d03) | Ввести per-commit sync telemetry | PERF | candidate | M | G-PERF |
-| 196 | LIN-0104 | [D03](#d03) | Разделить encode/write/sync histograms | PERF | candidate | M | G-PERF |
 | 197 | LIN-0105 | [D03](#d03) | Сопоставить групповой commit fairness | PERF | candidate | M | G-PERF |
-| 200 | LIN-0108 | [D03](#d03) | Проверить mixed sync policies | CORRECTNESS | qualification | S | G-CORRECT |
-| 202 | LIN-0110 | [D03](#d03) | Проверить file creation durability | CORRECTNESS | qualification | S | G-CORRECT |
-| 205 | LIN-0113 | [D03](#d03) | Проверить out-of-space до sync | CORRECTNESS | qualification | S | G-CORRECT |
 | 206 | LIN-0114 | [D03](#d03) | Проверить file descriptor exhaustion | CORRECTNESS | qualification | S | G-CORRECT |
-| 208 | LIN-0116 | [D03](#d03) | Проверить quota exhaustion propagation | CORRECTNESS | qualification | S | G-CORRECT |
 | 209 | LIN-0117 | [D03](#d03) | Измерить tiny WAL commits | PERF | candidate | M | G-PERF |
 | 210 | LIN-0118 | [D03](#d03) | Измерить large WAL commits | PERF | candidate | M | G-PERF |
 | 211 | LIN-0119 | [D03](#d03) | Измерить concurrent-reader sync impact | PERF | candidate | M | G-PERF |
@@ -170,47 +154,23 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 234 | LIN-0146 | [D04](#d04) | Измерить hot replay throughput | PERF | candidate | M | G-PERF |
 | 235 | LIN-0147 | [D04](#d04) | Измерить cold replay throughput | PERF | candidate | M | G-PERF |
 | 236 | LIN-0148 | [D04](#d04) | Профилировать metadata rebuild replay | PERF | candidate | M | G-PERF |
-| 237 | LIN-0149 | [D04](#d04) | Добавить progress recovery callbacks | FEATURE | candidate | M | G-FEATURE |
-| 238 | LIN-0150 | [D04](#d04) | Добавить cancellation recovery contract | FEATURE | candidate | M | G-FEATURE |
-| 239 | LIN-0151 | [D04](#d04) | Добавить dry-run recovery report | FEATURE | candidate | M | G-FEATURE |
-| 240 | LIN-0152 | [D04](#d04) | Добавить damaged-frame location diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 242 | LIN-0154 | [D04](#d04) | Проверить replay удалённого catalog object | CORRECTNESS | qualification | S | G-CORRECT |
-| 243 | LIN-0155 | [D04](#d04) | Проверить replay несовместимого field type | CORRECTNESS | qualification | S | G-CORRECT |
-| 244 | LIN-0156 | [D04](#d04) | Проверить replay schema generation mismatch | CORRECTNESS | qualification | S | G-CORRECT |
-| 249 | LIN-0165 | [D05](#d05) | Проверить SnapshotRef lifetime | CORRECTNESS | qualification | S | G-CORRECT |
-| 251 | LIN-0167 | [D05](#d05) | Проверить checkpoint generation fencing | CORRECTNESS | qualification | S | G-CORRECT |
-| 253 | LIN-0169 | [D05](#d05) | Ввести versioned snapshot manifest | PERF | candidate | M | G-PERF |
-| 255 | LIN-0171 | [D05](#d05) | Ограничить snapshot section sizes | CORRECTNESS | qualification | M | G-CORRECT |
-| 256 | LIN-0172 | [D05](#d05) | Ограничить nested collection sizes | CORRECTNESS | qualification | M | G-CORRECT |
 | 257 | LIN-0173 | [D05](#d05) | Измерить incremental checkpoint | PERF | candidate | M | G-PERF |
 | 258 | LIN-0174 | [D05](#d05) | Измерить section-local compression | PERF | candidate | M | G-PERF |
 | 259 | LIN-0175 | [D05](#d05) | Измерить parallel snapshot sections | PERF | candidate | M | G-PERF |
-| 264 | LIN-0180 | [D05](#d05) | Проверить parent directory persistence | CORRECTNESS | qualification | S | G-CORRECT |
-| 276 | LIN-0212 | [D06](#d06) | Проверить rollback после allocator failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 279 | LIN-0215 | [D06](#d06) | Измерить rollback work amplification | PERF | candidate | M | G-PERF |
 | 280 | LIN-0216 | [D06](#d06) | Измерить journal clone elimination | PERF | candidate | M | G-PERF |
-| 284 | LIN-0220 | [D06](#d06) | Спроектировать nested transaction rejection | FEATURE | candidate | L | G-FEATURE |
-| 301 | LIN-0237 | [D06](#d06) | Добавить transaction phase diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 302 | LIN-0238 | [D06](#d06) | Добавить rollback reason counters | FEATURE | candidate | M | G-FEATURE |
-| 304 | LIN-0240 | [D06](#d06) | Добавить transaction replay identifiers | FEATURE | candidate | M | G-FEATURE |
 | 305 | LIN-0245 | [D07](#d07) | Измерить borrowed identity sets сейчас | PERF | candidate | M | G-PERF |
 | 306 | LIN-0246 | [D07](#d07) | Измерить defaults materialization batching | PERF | candidate | M | G-PERF |
 | 307 | LIN-0247 | [D07](#d07) | Измерить body hash cost | PERF | candidate | M | G-PERF |
 | 308 | LIN-0248 | [D07](#d07) | Измерить staged field validation | PERF | candidate | M | G-PERF |
-| 309 | LIN-0249 | [D07](#d07) | Проверить borrowed key lifetime | CORRECTNESS | qualification | S | G-CORRECT |
 | 320 | LIN-0260 | [D07](#d07) | Проверить large bulk memory release | CORRECTNESS | qualification | S | G-CORRECT |
 | 321 | LIN-0261 | [D07](#d07) | Измерить streaming bulk input | PERF | candidate | M | G-PERF |
-| 324 | LIN-0264 | [D07](#d07) | Спроектировать retry-safe bulk identifiers | FEATURE | candidate | L | G-FEATURE |
 | 325 | LIN-0265 | [D07](#d07) | Измерить changed-field update masks | PERF | candidate | M | G-PERF |
 | 326 | LIN-0266 | [D07](#d07) | Измерить no-op update fast path | PERF | candidate | M | G-PERF |
 | 327 | LIN-0267 | [D07](#d07) | Измерить multirow delete compaction | PERF | candidate | M | G-PERF |
 | 328 | LIN-0268 | [D07](#d07) | Измерить swap-remove map repair | PERF | candidate | M | G-PERF |
-| 334 | LIN-0274 | [D07](#d07) | Проверить mutation projection consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 335 | LIN-0275 | [D07](#d07) | Проверить mutation returning old/new values | CORRECTNESS | qualification | S | G-CORRECT |
 | 336 | LIN-0276 | [D07](#d07) | Проверить mutation counters overflow | CORRECTNESS | qualification | S | G-CORRECT |
-| 338 | LIN-0278 | [D07](#d07) | Добавить bulk cancellation boundary | FEATURE | candidate | M | G-FEATURE |
-| 339 | LIN-0279 | [D07](#d07) | Добавить per-collection ingestion limits | FEATURE | candidate | M | G-FEATURE |
-| 340 | LIN-0280 | [D07](#d07) | Добавить ingest backpressure diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 349 | LIN-0293 | [D08](#d08) | Измерить SSO field length distribution | PERF | candidate | M | G-PERF |
 | 350 | LIN-0294 | [D08](#d08) | Измерить Cell size regression | PERF | candidate | M | G-PERF |
 | 351 | LIN-0295 | [D08](#d08) | Измерить cloned inline strings | PERF | candidate | M | G-PERF |
@@ -220,15 +180,12 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 362 | LIN-0307 | [D08](#d08) | Спроектировать duration Cell | FEATURE | candidate | L | G-FEATURE |
 | 363 | LIN-0308 | [D08](#d08) | Спроектировать UUID scalar handling | FEATURE | candidate | L | G-FEATURE |
 | 364 | LIN-0309 | [D08](#d08) | Спроектировать field-name interning boundary | FEATURE | candidate | L | G-FEATURE |
-| 365 | LIN-0310 | [D08](#d08) | Спроектировать borrowed RowView | FEATURE | candidate | L | G-FEATURE |
 | 366 | LIN-0311 | [D08](#d08) | Спроектировать stable typed field IDs | FEATURE | candidate | L | G-FEATURE |
 | 367 | LIN-0312 | [D08](#d08) | Спроектировать row version metadata | FEATURE | candidate | L | G-FEATURE |
 | 372 | LIN-0317 | [D08](#d08) | Измерить inline-key layout alternatives | PERF | candidate | M | G-PERF |
 | 373 | LIN-0318 | [D08](#d08) | Измерить hot/cold row metadata | PERF | candidate | M | G-PERF |
 | 374 | LIN-0319 | [D08](#d08) | Измерить compressed null metadata | PERF | candidate | M | G-PERF |
 | 375 | LIN-0320 | [D08](#d08) | Измерить scalar access dispatch | PERF | candidate | M | G-PERF |
-| 376 | LIN-0321 | [D09](#d09) | Измерить row pool hit rate | PERF | candidate | M | G-PERF |
-| 377 | LIN-0322 | [D09](#d09) | Измерить row pool retained bytes | PERF | candidate | M | G-PERF |
 | 388 | LIN-0333 | [D09](#d09) | Измерить arena для temporary keys | PERF | candidate | M | G-PERF |
 | 389 | LIN-0334 | [D09](#d09) | Измерить arena для plan scratch | PERF | candidate | M | G-PERF |
 | 390 | LIN-0335 | [D09](#d09) | Измерить arena для join buffers | PERF | candidate | M | G-PERF |
@@ -241,7 +198,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 397 | LIN-0342 | [D09](#d09) | Профилировать String key allocation | PERF | candidate | M | G-PERF |
 | 398 | LIN-0343 | [D09](#d09) | Профилировать vector Arc allocation | PERF | candidate | M | G-PERF |
 | 399 | LIN-0344 | [D09](#d09) | Профилировать metadata clone allocation | PERF | candidate | M | G-PERF |
-| 402 | LIN-0368 | [D10](#d10) | Проверить remove missing position | CORRECTNESS | qualification | S | G-CORRECT |
 | 403 | LIN-0369 | [D10](#d10) | Измерить short posting inline storage | PERF | candidate | M | G-PERF |
 | 404 | LIN-0370 | [D10](#d10) | Измерить large posting chunking | PERF | candidate | M | G-PERF |
 | 405 | LIN-0371 | [D10](#d10) | Измерить sorted bulk index build | PERF | candidate | M | G-PERF |
@@ -253,94 +209,23 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 419 | LIN-0385 | [D10](#d10) | Спроектировать covering index payload | FEATURE | candidate | L | G-FEATURE |
 | 421 | LIN-0387 | [D10](#d10) | Спроектировать expression index contract | FEATURE | candidate | L | G-FEATURE |
 | 422 | LIN-0388 | [D10](#d10) | Спроектировать index visibility generations | FEATURE | candidate | L | G-FEATURE |
-| 424 | LIN-0390 | [D10](#d10) | Проверить index drop active cursor | CORRECTNESS | qualification | S | G-CORRECT |
-| 425 | LIN-0391 | [D10](#d10) | Проверить index build cancellation | CORRECTNESS | qualification | S | G-CORRECT |
-| 426 | LIN-0392 | [D10](#d10) | Проверить index schema mutation safety | CORRECTNESS | qualification | S | G-CORRECT |
-| 427 | LIN-0393 | [D10](#d10) | Добавить index selectivity telemetry | FEATURE | candidate | M | G-FEATURE |
-| 428 | LIN-0394 | [D10](#d10) | Добавить posting fanout statistics | FEATURE | candidate | M | G-FEATURE |
-| 429 | LIN-0395 | [D10](#d10) | Добавить index rebuild progress | FEATURE | candidate | M | G-FEATURE |
-| 430 | LIN-0396 | [D10](#d10) | Добавить index consistency inspector | FEATURE | candidate | M | G-FEATURE |
 | 431 | LIN-0397 | [D10](#d10) | Сравнить dense reverse map crossover | PERF | candidate | M | G-PERF |
 | 432 | LIN-0398 | [D10](#d10) | Сравнить adaptive posting representation | PERF | candidate | M | G-PERF |
 | 434 | LIN-0400 | [D10](#d10) | Сравнить hash-only equality indexes | PERF | candidate | M | G-PERF |
 | 451 | LIN-0421 | [D11](#d11) | Спроектировать named constraints | FEATURE | candidate | L | G-FEATURE |
 | 452 | LIN-0422 | [D11](#d11) | Спроектировать configurable NULL distinctness | FEATURE | candidate | L | G-FEATURE |
 | 453 | LIN-0423 | [D11](#d11) | Спроектировать CHECK predicates | FEATURE | candidate | L | G-FEATURE |
-| 455 | LIN-0441 | [D12](#d12) | Улучшить span для вложенных выражений | API | candidate | M | G-API |
-| 456 | LIN-0442 | [D12](#d12) | Уточнить unexpected-token diagnostics | API | candidate | M | G-API |
-| 457 | LIN-0443 | [D12](#d12) | Уточнить unterminated-string diagnostics | API | candidate | M | G-API |
-| 458 | LIN-0444 | [D12](#d12) | Уточнить trailing-input diagnostics | API | candidate | M | G-API |
-| 462 | LIN-0448 | [D12](#d12) | Ограничить escaped string expansion | CORRECTNESS | qualification | M | G-CORRECT |
 | 472 | LIN-0458 | [D12](#d12) | Спроектировать named parameter binding | API | candidate | L | G-API |
 | 473 | LIN-0459 | [D12](#d12) | Спроектировать batch statement separators | API | candidate | L | G-API |
-| 474 | LIN-0460 | [D12](#d12) | Спроектировать multiline query formatting | API | candidate | L | G-API |
-| 482 | LIN-0488 | [D13](#d13) | Проверить invalid projection aliases | CORRECTNESS | qualification | S | G-CORRECT |
-| 486 | LIN-0492 | [D13](#d13) | Проверить nested expression typing | CORRECTNESS | qualification | S | G-CORRECT |
 | 487 | LIN-0493 | [D13](#d13) | Спроектировать nullable schema fields | FEATURE | candidate | L | G-FEATURE |
 | 488 | LIN-0494 | [D13](#d13) | Спроектировать union scalar types | FEATURE | candidate | L | G-FEATURE |
 | 489 | LIN-0495 | [D13](#d13) | Спроектировать strict schema mode | FEATURE | candidate | L | G-FEATURE |
-| 490 | LIN-0496 | [D13](#d13) | Спроектировать inferred schema reporting | FEATURE | candidate | L | G-FEATURE |
-| 491 | LIN-0497 | [D13](#d13) | Проверить constant-fold overflow | CORRECTNESS | qualification | S | G-CORRECT |
-| 492 | LIN-0498 | [D13](#d13) | Проверить constant-fold NaN semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 495 | LIN-0501 | [D13](#d13) | Проверить checked cast boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 496 | LIN-0502 | [D13](#d13) | Проверить date/time literal validation | CORRECTNESS | qualification | S | G-CORRECT |
-| 499 | LIN-0505 | [D13](#d13) | Добавить type error suggestions | FEATURE | candidate | M | G-FEATURE |
-| 500 | LIN-0506 | [D13](#d13) | Добавить related source spans | FEATURE | candidate | M | G-FEATURE |
-| 501 | LIN-0507 | [D13](#d13) | Добавить explain type annotations | FEATURE | candidate | L | G-FEATURE |
-| 502 | LIN-0508 | [D13](#d13) | Добавить machine-readable check diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 504 | LIN-0510 | [D13](#d13) | Проверить prepared query stale field IDs | CORRECTNESS | qualification | S | G-CORRECT |
 | 507 | LIN-0513 | [D13](#d13) | Измерить repeated check caching | PERF | candidate | M | G-PERF |
 | 508 | LIN-0514 | [D13](#d13) | Измерить catalog lookup interning | PERF | candidate | M | G-PERF |
 | 509 | LIN-0515 | [D13](#d13) | Измерить type constraint sharing | PERF | candidate | M | G-PERF |
 | 510 | LIN-0516 | [D13](#d13) | Измерить lightweight query validation | PERF | candidate | M | G-PERF |
-| 511 | LIN-0517 | [D13](#d13) | Согласовать CPU/GPU comparison typing | CORRECTNESS | qualification | M | G-CORRECT |
-| 513 | LIN-0519 | [D13](#d13) | Согласовать cursor/materialized type errors | CORRECTNESS | qualification | M | G-CORRECT |
-| 514 | LIN-0520 | [D13](#d13) | Согласовать typed/untyped query errors | CORRECTNESS | qualification | M | G-CORRECT |
-| 516 | LIN-0526 | [D14](#d14) | Спроектировать lazy DNF iterator | FEATURE | candidate | L | G-FEATURE |
-| 517 | LIN-0527 | [D14](#d14) | Измерить conjunct flattening copies | PERF | candidate | M | G-PERF |
 | 518 | LIN-0528 | [D14](#d14) | Измерить plan-node allocation | PERF | candidate | M | G-PERF |
-| 523 | LIN-0533 | [D14](#d14) | Спроектировать logical rewrite registry | FEATURE | candidate | L | G-FEATURE |
-| 524 | LIN-0534 | [D14](#d14) | Спроектировать rewrite preconditions | FEATURE | candidate | L | G-FEATURE |
-| 525 | LIN-0535 | [D14](#d14) | Спроектировать rewrite trace output | FEATURE | candidate | L | G-FEATURE |
-| 526 | LIN-0536 | [D14](#d14) | Спроектировать optimizer iteration budget | FEATURE | candidate | L | G-FEATURE |
-| 527 | LIN-0537 | [D14](#d14) | Добавить common-subexpression sharing | FEATURE | candidate | M | G-FEATURE |
-| 528 | LIN-0538 | [D14](#d14) | Добавить deterministic expression classification | FEATURE | candidate | M | G-FEATURE |
-| 529 | LIN-0539 | [D14](#d14) | Добавить volatile expression barriers | FEATURE | candidate | M | G-FEATURE |
-| 530 | LIN-0540 | [D14](#d14) | Добавить normalized predicate fingerprints | FEATURE | candidate | M | G-FEATURE |
-| 539 | LIN-0549 | [D14](#d14) | Добавить plan equivalence oracle | VERIFY | qualification | S | G-VERIFY |
-| 540 | LIN-0550 | [D14](#d14) | Добавить no-optimization execution mode | FEATURE | candidate | M | G-FEATURE |
-| 541 | LIN-0551 | [D14](#d14) | Добавить reproducible plan fingerprints | FEATURE | candidate | M | G-FEATURE |
-| 542 | LIN-0552 | [D14](#d14) | Добавить optimizer debug counters | FEATURE | candidate | M | G-FEATURE |
 | 544 | LIN-0554 | [D14](#d14) | Измерить plan cache key construction | PERF | candidate | M | G-PERF |
-| 545 | LIN-0555 | [D14](#d14) | Ограничить retained plan-cache bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 547 | LIN-0557 | [D14](#d14) | Спроектировать row/batch backend selection | FEATURE | candidate | L | G-FEATURE |
-| 548 | LIN-0558 | [D14](#d14) | Спроектировать GPU eligibility explanation | FEATURE | candidate | L | G-FEATURE |
-| 549 | LIN-0559 | [D14](#d14) | Спроектировать exact/approximate plan labels | FEATURE | candidate | L | G-FEATURE |
-| 550 | LIN-0560 | [D14](#d14) | Спроектировать plan stability contract | FEATURE | candidate | L | G-FEATURE |
-| 551 | LIN-0561 | [D15](#d15) | Добавить collection cardinality statistics | FEATURE | candidate | M | G-FEATURE |
-| 552 | LIN-0562 | [D15](#d15) | Добавить distinct-key estimates | FEATURE | candidate | M | G-FEATURE |
-| 553 | LIN-0563 | [D15](#d15) | Добавить NULL fraction statistics | FEATURE | candidate | M | G-FEATURE |
-| 554 | LIN-0564 | [D15](#d15) | Добавить text-length histograms | FEATURE | candidate | M | G-FEATURE |
-| 555 | LIN-0565 | [D15](#d15) | Добавить posting fanout histograms | FEATURE | candidate | M | G-FEATURE |
-| 556 | LIN-0566 | [D15](#d15) | Добавить numeric range histograms | FEATURE | candidate | M | G-FEATURE |
-| 557 | LIN-0567 | [D15](#d15) | Добавить composite prefix statistics | FEATURE | candidate | M | G-FEATURE |
-| 558 | LIN-0568 | [D15](#d15) | Добавить vector dimension statistics | FEATURE | candidate | M | G-FEATURE |
-| 559 | LIN-0569 | [D15](#d15) | Спроектировать explicit ANALYZE operation | FEATURE | candidate | L | G-FEATURE |
-| 560 | LIN-0570 | [D15](#d15) | Спроектировать bounded statistics sampling | FEATURE | candidate | L | G-FEATURE |
-| 561 | LIN-0571 | [D15](#d15) | Спроектировать incremental statistics updates | FEATURE | candidate | L | G-FEATURE |
-| 562 | LIN-0572 | [D15](#d15) | Спроектировать stale statistics detection | FEATURE | candidate | L | G-FEATURE |
-| 563 | LIN-0573 | [D15](#d15) | Оценивать index seek cardinality | PERF | candidate | M | G-PERF |
-| 564 | LIN-0574 | [D15](#d15) | Оценивать residual-filter selectivity | PERF | candidate | M | G-PERF |
-| 565 | LIN-0575 | [D15](#d15) | Оценивать substring candidate count | PERF | candidate | M | G-PERF |
-| 566 | LIN-0576 | [D15](#d15) | Оценивать graph traversal expansion | PERF | candidate | M | G-PERF |
-| 567 | LIN-0577 | [D15](#d15) | Оценивать join output cardinality | PERF | candidate | M | G-PERF |
-| 568 | LIN-0578 | [D15](#d15) | Оценивать join build-side bytes | PERF | candidate | M | G-PERF |
-| 569 | LIN-0579 | [D15](#d15) | Оценивать sort memory demand | PERF | candidate | M | G-PERF |
-| 570 | LIN-0580 | [D15](#d15) | Оценивать aggregation group count | PERF | candidate | M | G-PERF |
-| 571 | LIN-0581 | [D15](#d15) | Измерить estimator error distributions | PERF | candidate | M | G-PERF |
-| 572 | LIN-0582 | [D15](#d15) | Проверить adversarial skew estimates | CORRECTNESS | qualification | S | G-CORRECT |
-| 573 | LIN-0583 | [D15](#d15) | Проверить correlated predicate estimates | CORRECTNESS | qualification | S | G-CORRECT |
-| 574 | LIN-0584 | [D15](#d15) | Проверить sparse collection estimates | CORRECTNESS | qualification | S | G-CORRECT |
 | 575 | LIN-0601 | [D16](#d16) | Профилировать operator boundary copies | PERF | candidate | M | G-PERF |
 | 576 | LIN-0602 | [D16](#d16) | Профилировать residual predicate evaluation | PERF | candidate | M | G-PERF |
 | 577 | LIN-0603 | [D16](#d16) | Профилировать row materialization cost | PERF | candidate | M | G-PERF |
@@ -350,55 +235,22 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 581 | LIN-0607 | [D16](#d16) | Измерить reusable predicate scratch | PERF | candidate | M | G-PERF |
 | 582 | LIN-0608 | [D16](#d16) | Измерить field-ID expression access | PERF | candidate | M | G-PERF |
 | 587 | LIN-0613 | [D16](#d16) | Спроектировать physical operator interface | FEATURE | candidate | L | G-FEATURE |
-| 588 | LIN-0614 | [D16](#d16) | Спроектировать explicit execution budgets | FEATURE | candidate | L | G-FEATURE |
-| 589 | LIN-0615 | [D16](#d16) | Спроектировать operator cancellation checkpoints | FEATURE | candidate | L | G-FEATURE |
-| 590 | LIN-0616 | [D16](#d16) | Спроектировать plan-level memory accounting | FEATURE | candidate | L | G-FEATURE |
-| 591 | LIN-0617 | [D16](#d16) | Добавить row-count operator counters | FEATURE | candidate | M | G-FEATURE |
-| 592 | LIN-0618 | [D16](#d16) | Добавить bytes-in/bytes-out counters | FEATURE | candidate | M | G-FEATURE |
-| 593 | LIN-0619 | [D16](#d16) | Добавить materialization reason diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 594 | LIN-0620 | [D16](#d16) | Добавить backend transition traces | FEATURE | candidate | M | G-FEATURE |
-| 595 | LIN-0621 | [D16](#d16) | Проверить error после partial result | CORRECTNESS | qualification | S | G-CORRECT |
-| 597 | LIN-0623 | [D16](#d16) | Проверить row pool между operators | CORRECTNESS | qualification | S | G-CORRECT |
 | 599 | LIN-0625 | [D16](#d16) | Измерить chunked batch execution | PERF | candidate | M | G-PERF |
 | 600 | LIN-0626 | [D16](#d16) | Измерить adaptive batch sizing | PERF | candidate | M | G-PERF |
 | 601 | LIN-0627 | [D16](#d16) | Измерить branch-specialized scalar loops | PERF | candidate | M | G-PERF |
 | 602 | LIN-0628 | [D16](#d16) | Измерить hot/cold operator separation | PERF | candidate | M | G-PERF |
-| 603 | LIN-0629 | [D16](#d16) | Спроектировать spillable execution nodes | FEATURE | candidate | L | G-FEATURE |
-| 604 | LIN-0630 | [D16](#d16) | Спроектировать bounded pipeline queues | FEATURE | candidate | L | G-FEATURE |
 | 605 | LIN-0631 | [D16](#d16) | Спроектировать execution admission control | FEATURE | candidate | L | G-FEATURE |
 | 606 | LIN-0632 | [D16](#d16) | Спроектировать fairness между queries | FEATURE | candidate | L | G-FEATURE |
-| 607 | LIN-0633 | [D16](#d16) | Проверить CPU feature dispatch fallback | CORRECTNESS | qualification | S | G-CORRECT |
-| 608 | LIN-0634 | [D16](#d16) | Проверить disabled backend explicit errors | CORRECTNESS | qualification | S | G-CORRECT |
-| 611 | LIN-0637 | [D16](#d16) | Создать per-operator reference evaluator | PERF | candidate | M | G-PERF |
-| 612 | LIN-0638 | [D16](#d16) | Создать execution differential corpus | VERIFY | qualification | S | G-VERIFY |
 | 613 | LIN-0639 | [D16](#d16) | Создать operator resource stress suite | PERF | candidate | M | G-PERF |
-| 614 | LIN-0640 | [D16](#d16) | Создать deterministic execution trace mode | PERF | candidate | M | G-PERF |
-| 616 | LIN-0642 | [D17](#d17) | Проверить first-row latency | CORRECTNESS | qualification | S | G-CORRECT |
-| 620 | LIN-0646 | [D17](#d17) | Проверить projected row pool reuse | CORRECTNESS | qualification | S | G-CORRECT |
-| 621 | LIN-0647 | [D17](#d17) | Проверить cursor output lifetime | CORRECTNESS | qualification | S | G-CORRECT |
-| 624 | LIN-0650 | [D17](#d17) | Проверить canceled cursor cleanup | CORRECTNESS | qualification | S | G-CORRECT |
-| 627 | LIN-0653 | [D17](#d17) | Спроектировать borrowed cursor items | API | candidate | L | G-API |
-| 628 | LIN-0654 | [D17](#d17) | Спроектировать batched cursor fetch | API | candidate | L | G-API |
-| 629 | LIN-0655 | [D17](#d17) | Спроектировать cursor size hints | API | candidate | L | G-API |
-| 630 | LIN-0656 | [D17](#d17) | Спроектировать resumable cursor tokens | API | candidate | L | G-API |
 | 631 | LIN-0657 | [D17](#d17) | Измерить seek cursor opening | PERF | candidate | M | G-PERF |
 | 632 | LIN-0658 | [D17](#d17) | Измерить range cursor stepping | PERF | candidate | M | G-PERF |
 | 633 | LIN-0659 | [D17](#d17) | Измерить join cursor buffering | PERF | candidate | M | G-PERF |
 | 634 | LIN-0660 | [D17](#d17) | Измерить vector cursor buffering | PERF | candidate | M | G-PERF |
-| 635 | LIN-0661 | [D17](#d17) | Спроектировать stable cursor ordering | API | candidate | L | G-API |
-| 636 | LIN-0662 | [D17](#d17) | Спроектировать keyset pagination | API | candidate | L | G-API |
-| 637 | LIN-0663 | [D17](#d17) | Спроектировать cursor snapshot pinning | API | candidate | L | G-API |
-| 638 | LIN-0664 | [D17](#d17) | Спроектировать cursor generation errors | API | candidate | L | G-API |
 | 643 | LIN-0685 | [D18](#d18) | Измерить row-to-column packing | PERF | candidate | M | G-PERF |
 | 644 | LIN-0686 | [D18](#d18) | Измерить column-to-row draining | PERF | candidate | M | G-PERF |
 | 645 | LIN-0687 | [D18](#d18) | Измерить projected column materialization | PERF | candidate | M | G-PERF |
 | 646 | LIN-0688 | [D18](#d18) | Измерить batch ownership transfer | PERF | candidate | M | G-PERF |
-| 647 | LIN-0689 | [D18](#d18) | Спроектировать borrowed ColumnView | FEATURE | candidate | L | G-FEATURE |
 | 649 | LIN-0691 | [D18](#d18) | Спроектировать offset-based binary columns | FEATURE | candidate | L | G-FEATURE |
-| 655 | LIN-0697 | [D18](#d18) | Добавить zero-copy batch slicing | FEATURE | candidate | M | G-FEATURE |
-| 656 | LIN-0698 | [D18](#d18) | Добавить shared bitmap slicing | FEATURE | candidate | M | G-FEATURE |
-| 657 | LIN-0699 | [D18](#d18) | Добавить batch concatenation contract | FEATURE | candidate | M | G-FEATURE |
-| 658 | LIN-0700 | [D18](#d18) | Добавить batch schema reconciliation | FEATURE | candidate | M | G-FEATURE |
 | 659 | LIN-0701 | [D18](#d18) | Измерить SIMD numeric predicates | PERF | candidate | M | G-PERF |
 | 660 | LIN-0702 | [D18](#d18) | Измерить SIMD bitmap operations | PERF | candidate | M | G-PERF |
 | 661 | LIN-0703 | [D18](#d18) | Измерить packed UTF-8 projection | PERF | candidate | M | G-PERF |
@@ -408,26 +260,10 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 677 | LIN-0739 | [D19](#d19) | Измерить group aggregate state layout | PERF | candidate | M | G-PERF |
 | 679 | LIN-0741 | [D19](#d19) | Спроектировать streaming aggregation | FEATURE | candidate | L | G-FEATURE |
 | 681 | LIN-0743 | [D19](#d19) | Спроектировать sorted-key aggregation | FEATURE | candidate | L | G-FEATURE |
-| 683 | LIN-0745 | [D19](#d19) | Добавить variance aggregate contract | FEATURE | candidate | M | G-FEATURE |
-| 684 | LIN-0746 | [D19](#d19) | Добавить standard-deviation aggregate contract | FEATURE | candidate | M | G-FEATURE |
-| 687 | LIN-0749 | [D19](#d19) | Проверить aggregate FILTER clauses | CORRECTNESS | qualification | S | G-CORRECT |
-| 695 | LIN-0757 | [D19](#d19) | Добавить group cardinality limits | FEATURE | candidate | M | G-FEATURE |
-| 697 | LIN-0759 | [D19](#d19) | Добавить aggregation skew diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 698 | LIN-0760 | [D19](#d19) | Добавить group overflow diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 703 | LIN-0765 | [D20](#d20) | Измерить decorated sort key reuse | PERF | candidate | M | G-PERF |
 | 704 | LIN-0766 | [D20](#d20) | Измерить bounded Top-K crossover | PERF | candidate | M | G-PERF |
 | 705 | LIN-0767 | [D20](#d20) | Измерить partial selection partition | PERF | candidate | M | G-PERF |
 | 706 | LIN-0768 | [D20](#d20) | Измерить multi-key comparator cost | PERF | candidate | M | G-PERF |
-| 715 | LIN-0777 | [D20](#d20) | Спроектировать spillable external sort | FEATURE | candidate | L | G-FEATURE |
-| 716 | LIN-0778 | [D20](#d20) | Спроектировать merge sorted runs | FEATURE | candidate | L | G-FEATURE |
-| 717 | LIN-0779 | [D20](#d20) | Спроектировать sorted-stream merge | FEATURE | candidate | L | G-FEATURE |
-| 718 | LIN-0780 | [D20](#d20) | Спроектировать sort cancellation cleanup | FEATURE | candidate | L | G-FEATURE |
-| 719 | LIN-0781 | [D20](#d20) | Добавить collation explicit policy | FEATURE | candidate | M | G-FEATURE |
-| 720 | LIN-0782 | [D20](#d20) | Добавить locale collation opt-in | FEATURE | candidate | M | G-FEATURE |
-| 721 | LIN-0783 | [D20](#d20) | Добавить binary collation baseline | FEATURE | candidate | M | G-FEATURE |
-| 722 | LIN-0784 | [D20](#d20) | Добавить natural-sort opt-in | FEATURE | candidate | M | G-FEATURE |
-| 726 | LIN-0804 | [D21](#d21) | Проверить numeric cross-type join keys | CORRECTNESS | qualification | S | G-CORRECT |
-| 727 | LIN-0805 | [D21](#d21) | Проверить asymmetric build-side selection | CORRECTNESS | qualification | S | G-CORRECT |
 | 728 | LIN-0806 | [D21](#d21) | Профилировать hash table build cost | PERF | candidate | M | G-PERF |
 | 729 | LIN-0807 | [D21](#d21) | Профилировать join result materialization | PERF | candidate | M | G-PERF |
 | 730 | LIN-0808 | [D21](#d21) | Профилировать semi-join prefilter | PERF | candidate | M | G-PERF |
@@ -435,88 +271,29 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 732 | LIN-0810 | [D21](#d21) | Измерить borrowed join keys | PERF | candidate | M | G-PERF |
 | 733 | LIN-0811 | [D21](#d21) | Измерить compact join payloads | PERF | candidate | M | G-PERF |
 | 734 | LIN-0812 | [D21](#d21) | Измерить dense ID joins | PERF | candidate | M | G-PERF |
-| 735 | LIN-0813 | [D21](#d21) | Спроектировать merge join operator | FEATURE | candidate | L | G-FEATURE |
-| 737 | LIN-0815 | [D21](#d21) | Спроектировать anti-join semantics | FEATURE | candidate | L | G-FEATURE |
-| 738 | LIN-0816 | [D21](#d21) | Спроектировать existence-only joins | FEATURE | candidate | L | G-FEATURE |
-| 742 | LIN-0820 | [D21](#d21) | Проверить multi-join associative rewrites | CORRECTNESS | qualification | S | G-CORRECT |
-| 743 | LIN-0821 | [D21](#d21) | Добавить join output cardinality limit | FEATURE | candidate | M | G-FEATURE |
-| 744 | LIN-0822 | [D21](#d21) | Добавить join memory budget | FEATURE | candidate | M | G-FEATURE |
-| 745 | LIN-0823 | [D21](#d21) | Добавить spillable hash partitions | FEATURE | candidate | L | G-FEATURE |
-| 746 | LIN-0824 | [D21](#d21) | Добавить join skew handling | FEATURE | candidate | M | G-FEATURE |
-| 760 | LIN-0854 | [D22](#d22) | Спроектировать RANGE frame semantics | FEATURE | candidate | L | G-FEATURE |
-| 761 | LIN-0855 | [D22](#d22) | Спроектировать GROUPS frame semantics | FEATURE | candidate | L | G-FEATURE |
-| 762 | LIN-0856 | [D22](#d22) | Спроектировать excluded-current-row frame | FEATURE | candidate | L | G-FEATURE |
-| 766 | LIN-0860 | [D22](#d22) | Проверить percent_rank empty cases | VERIFY | qualification | S | G-VERIFY |
-| 777 | LIN-0892 | [D23](#d23) | Проверить combining-mark token boundaries | CORRECTNESS | qualification | S | G-CORRECT |
 | 778 | LIN-0893 | [D23](#d23) | Измерить ASCII token fast path | PERF | candidate | M | G-PERF |
 | 779 | LIN-0894 | [D23](#d23) | Измерить byte-scan tokenizer crossover | PERF | candidate | M | G-PERF |
 | 780 | LIN-0895 | [D23](#d23) | Измерить borrowed token lifetimes | PERF | candidate | M | G-PERF |
 | 781 | LIN-0896 | [D23](#d23) | Измерить interned term dictionaries | PERF | candidate | M | G-PERF |
-| 782 | LIN-0897 | [D23](#d23) | Спроектировать tokenizer identity version | FEATURE | candidate | L | G-FEATURE |
-| 783 | LIN-0898 | [D23](#d23) | Спроектировать configurable token length | FEATURE | candidate | L | G-FEATURE |
-| 784 | LIN-0899 | [D23](#d23) | Спроектировать stopword opt-in | FEATURE | candidate | L | G-FEATURE |
-| 785 | LIN-0900 | [D23](#d23) | Спроектировать stemming opt-in | FEATURE | candidate | L | G-FEATURE |
-| 786 | LIN-0901 | [D23](#d23) | Добавить token position storage | FEATURE | candidate | M | G-FEATURE |
-| 787 | LIN-0902 | [D23](#d23) | Добавить field-local token metadata | FEATURE | candidate | M | G-FEATURE |
-| 788 | LIN-0903 | [D23](#d23) | Добавить document length metadata | FEATURE | candidate | M | G-FEATURE |
-| 789 | LIN-0904 | [D23](#d23) | Добавить original offset mapping | FEATURE | candidate | M | G-FEATURE |
 | 790 | LIN-0905 | [D23](#d23) | Измерить parallel FTS build | PERF | candidate | M | G-PERF |
 | 791 | LIN-0906 | [D23](#d23) | Измерить sorted term bulk build | PERF | candidate | M | G-PERF |
 | 792 | LIN-0907 | [D23](#d23) | Измерить posting delta compression | PERF | candidate | M | G-PERF |
 | 793 | LIN-0908 | [D23](#d23) | Измерить adaptive posting container | PERF | candidate | M | G-PERF |
-| 794 | LIN-0909 | [D23](#d23) | Ограничить per-document token count | CORRECTNESS | qualification | M | G-CORRECT |
-| 795 | LIN-0910 | [D23](#d23) | Ограничить unique vocabulary bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 796 | LIN-0911 | [D23](#d23) | Ограничить pending FTS bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 797 | LIN-0912 | [D23](#d23) | Ограничить term length allocation | CORRECTNESS | qualification | M | G-CORRECT |
-| 802 | LIN-0917 | [D23](#d23) | Добавить tokenizer inspection API | FEATURE | candidate | M | G-FEATURE |
-| 803 | LIN-0918 | [D23](#d23) | Добавить vocabulary statistics API | FEATURE | candidate | M | G-FEATURE |
-| 804 | LIN-0919 | [D23](#d23) | Добавить FTS build progress | FEATURE | candidate | M | G-FEATURE |
-| 805 | LIN-0920 | [D23](#d23) | Добавить tokenizer regression corpus | VERIFY | qualification | S | G-VERIFY |
-| 806 | LIN-0921 | [D24](#d24) | Проверить borrowed posting view lifetime | CORRECTNESS | qualification | S | G-CORRECT |
-| 807 | LIN-0922 | [D24](#d24) | Проверить zero-copy single-term query | CORRECTNESS | qualification | S | G-CORRECT |
-| 810 | LIN-0925 | [D24](#d24) | Измерить shortest-list-first intersection | PERF | candidate | M | G-PERF |
-| 811 | LIN-0926 | [D24](#d24) | Измерить galloping posting intersection | PERF | candidate | M | G-PERF |
 | 812 | LIN-0927 | [D24](#d24) | Измерить bitmap/list adaptive intersection | PERF | candidate | M | G-PERF |
 | 813 | LIN-0928 | [D24](#d24) | Измерить query token cache | PERF | candidate | M | G-PERF |
-| 818 | LIN-0933 | [D24](#d24) | Спроектировать phrase search | FEATURE | candidate | L | G-FEATURE |
-| 819 | LIN-0934 | [D24](#d24) | Спроектировать proximity search | FEATURE | candidate | L | G-FEATURE |
 | 821 | LIN-0936 | [D24](#d24) | Спроектировать fuzzy term opt-in | VERIFY | qualification | L | G-VERIFY |
-| 822 | LIN-0937 | [D24](#d24) | Спроектировать field-boost scoring | FEATURE | candidate | L | G-FEATURE |
-| 824 | LIN-0939 | [D24](#d24) | Спроектировать score explanation API | FEATURE | candidate | L | G-FEATURE |
-| 825 | LIN-0940 | [D24](#d24) | Спроектировать score model versioning | FEATURE | candidate | L | G-FEATURE |
-| 836 | LIN-0971 | [D25](#d25) | Проверить monotonic posting order | CORRECTNESS | qualification | S | G-CORRECT |
 | 838 | LIN-0973 | [D25](#d25) | Измерить pending fold trigger | PERF | candidate | M | G-PERF |
 | 839 | LIN-0974 | [D25](#d25) | Измерить incremental fold work | PERF | candidate | M | G-PERF |
 | 840 | LIN-0975 | [D25](#d25) | Измерить compaction pause budget | PERF | candidate | M | G-PERF |
 | 841 | LIN-0976 | [D25](#d25) | Измерить hot-term mutation cost | PERF | candidate | M | G-PERF |
-| 842 | LIN-0977 | [D25](#d25) | Спроектировать term-local generations | FEATURE | candidate | L | G-FEATURE |
-| 843 | LIN-0978 | [D25](#d25) | Спроектировать tombstone density policy | FEATURE | candidate | L | G-FEATURE |
-| 844 | LIN-0979 | [D25](#d25) | Спроектировать incremental posting compaction | FEATURE | candidate | L | G-FEATURE |
-| 845 | LIN-0980 | [D25](#d25) | Спроектировать compaction backpressure | FEATURE | candidate | L | G-FEATURE |
-| 850 | LIN-0985 | [D25](#d25) | Ограничить pending edits per term | CORRECTNESS | qualification | M | G-CORRECT |
-| 851 | LIN-0986 | [D25](#d25) | Ограничить stale posting retention | CORRECTNESS | qualification | M | G-CORRECT |
-| 852 | LIN-0987 | [D25](#d25) | Ограничить compaction temporary memory | CORRECTNESS | qualification | M | G-CORRECT |
-| 853 | LIN-0988 | [D25](#d25) | Ограничить pathological hot-term churn | CORRECTNESS | qualification | M | G-CORRECT |
-| 854 | LIN-0989 | [D25](#d25) | Добавить FTS invariant checker | FEATURE | candidate | M | G-FEATURE |
-| 855 | LIN-0990 | [D25](#d25) | Добавить live-versus-rebuild diff tool | FEATURE | candidate | M | G-FEATURE |
-| 856 | LIN-0991 | [D25](#d25) | Добавить term mutation counters | FEATURE | candidate | M | G-FEATURE |
-| 857 | LIN-0992 | [D25](#d25) | Добавить compaction debt telemetry | FEATURE | candidate | M | G-FEATURE |
 | 858 | LIN-0993 | [D25](#d25) | Сравнить shared scratch на ASCII | PERF | candidate | M | G-PERF |
 | 859 | LIN-0994 | [D25](#d25) | Сравнить shared scratch на Unicode | PERF | candidate | M | G-PERF |
 | 860 | LIN-0995 | [D25](#d25) | Сравнить posting delta representation | PERF | candidate | M | G-PERF |
 | 861 | LIN-0996 | [D25](#d25) | Сравнить batched term remapping | PERF | candidate | M | G-PERF |
-| 864 | LIN-0999 | [D25](#d25) | Проверить mutation после schema FTS change | CORRECTNESS | qualification | S | G-CORRECT |
 | 866 | LIN-1001 | [D26](#d26) | Профилировать current embed_batch | PERF | candidate | M | G-PERF |
 | 867 | LIN-1002 | [D26](#d26) | Профилировать embedding text assembly | PERF | candidate | M | G-PERF |
 | 868 | LIN-1003 | [D26](#d26) | Профилировать scratch finish allocation | PERF | candidate | M | G-PERF |
 | 869 | LIN-1004 | [D26](#d26) | Профилировать feature hashing instructions | PERF | candidate | M | G-PERF |
-| 871 | LIN-1006 | [D26](#d26) | Проверить dimension parsing limits | CORRECTNESS | qualification | S | G-CORRECT |
-| 872 | LIN-1007 | [D26](#d26) | Проверить minimum dimension policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 875 | LIN-1010 | [D26](#d26) | Проверить whole-text bigram semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 876 | LIN-1011 | [D26](#d26) | Проверить token trigram semantics | CORRECTNESS | qualification | S | G-CORRECT |
-| 879 | LIN-1014 | [D26](#d26) | Проверить touched slot reset | CORRECTNESS | qualification | S | G-CORRECT |
-| 880 | LIN-1015 | [D26](#d26) | Проверить long-input sum fallback | CORRECTNESS | qualification | S | G-CORRECT |
-| 881 | LIN-1016 | [D26](#d26) | Проверить variable-dimension slot mapping | CORRECTNESS | qualification | S | G-CORRECT |
 | 882 | LIN-1017 | [D26](#d26) | Измерить reusable embedding output buffers | PERF | candidate | M | G-PERF |
 | 883 | LIN-1018 | [D26](#d26) | Измерить direct Arc slice construction | PERF | candidate | M | G-PERF |
 | 884 | LIN-1019 | [D26](#d26) | Измерить trigram cache working set | PERF | candidate | M | G-PERF |
@@ -525,29 +302,12 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 887 | LIN-1022 | [D26](#d26) | Измерить cold thread-pool startup | PERF | candidate | M | G-PERF |
 | 888 | LIN-1023 | [D26](#d26) | Измерить scoped embedding crossover | PERF | candidate | M | G-PERF |
 | 889 | LIN-1024 | [D26](#d26) | Измерить concurrent embedding contention | PERF | candidate | M | G-PERF |
-| 898 | LIN-1053 | [D27](#d27) | Спроектировать configurable ef_search | FEATURE | candidate | L | G-FEATURE |
-| 899 | LIN-1054 | [D27](#d27) | Спроектировать configurable ef_construction | FEATURE | candidate | L | G-FEATURE |
-| 900 | LIN-1055 | [D27](#d27) | Спроектировать configurable neighbor degree | FEATURE | candidate | L | G-FEATURE |
-| 901 | LIN-1056 | [D27](#d27) | Спроектировать deterministic HNSW seed | FEATURE | candidate | L | G-FEATURE |
 | 906 | LIN-1061 | [D27](#d27) | Измерить SQ8 recall degradation | PERF | candidate | M | G-PERF |
 | 907 | LIN-1062 | [D27](#d27) | Измерить exact reranking budget | PERF | candidate | M | G-PERF |
 | 908 | LIN-1063 | [D27](#d27) | Измерить filtered ANN recall | PERF | candidate | L | G-PERF |
 | 909 | LIN-1064 | [D27](#d27) | Измерить skewed-cluster HNSW behavior | PERF | candidate | L | G-PERF |
-| 922 | LIN-1097 | [D28](#d28) | Спроектировать explicit distance metric | FEATURE | candidate | L | G-FEATURE |
-| 923 | LIN-1098 | [D28](#d28) | Спроектировать dot-product search | FEATURE | candidate | L | G-FEATURE |
-| 924 | LIN-1099 | [D28](#d28) | Спроектировать Euclidean search | FEATURE | candidate | L | G-FEATURE |
-| 925 | LIN-1100 | [D28](#d28) | Спроектировать normalized-vector metadata | FEATURE | candidate | L | G-FEATURE |
-| 926 | LIN-1101 | [D28](#d28) | Добавить query-time vector parameters | FEATURE | candidate | M | G-FEATURE |
-| 927 | LIN-1102 | [D28](#d28) | Добавить vector field selection | FEATURE | candidate | M | G-FEATURE |
-| 928 | LIN-1103 | [D28](#d28) | Добавить multi-vector row search | FEATURE | candidate | M | G-FEATURE |
-| 929 | LIN-1104 | [D28](#d28) | Добавить vector search explanation | FEATURE | candidate | M | G-FEATURE |
-| 934 | LIN-1129 | [D29](#d29) | Ограничить resident GPU bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 935 | LIN-1130 | [D29](#d29) | Ограничить storage buffer sizes | CORRECTNESS | qualification | M | G-CORRECT |
-| 936 | LIN-1131 | [D29](#d29) | Ограничить bind-group count | CORRECTNESS | qualification | M | G-CORRECT |
-| 937 | LIN-1132 | [D29](#d29) | Ограничить dispatch dimensions | CORRECTNESS | qualification | M | G-CORRECT |
 | 938 | LIN-1133 | [D29](#d29) | Проверить readback map failure | CORRECTNESS | qualification | S | G-CORRECT |
 | 939 | LIN-1134 | [D29](#d29) | Проверить mapped buffer cancellation | CORRECTNESS | qualification | S | G-CORRECT |
-| 941 | LIN-1136 | [D29](#d29) | Проверить dropped GPU query cleanup | CORRECTNESS | qualification | S | G-CORRECT |
 | 942 | LIN-1137 | [D29](#d29) | Измерить upload/readback split | PERF | candidate | M | G-PERF |
 | 943 | LIN-1138 | [D29](#d29) | Измерить resident repeated query benefit | PERF | candidate | M | G-PERF |
 | 944 | LIN-1139 | [D29](#d29) | Измерить CPU/GPU crossover cardinality | PERF | candidate | M | G-PERF |
@@ -563,15 +323,6 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 979 | LIN-1210 | [D31](#d31) | Измерить for_each_neighbor borrowing | PERF | candidate | M | G-PERF |
 | 980 | LIN-1211 | [D31](#d31) | Измерить traversal scratch reuse | PERF | candidate | M | G-PERF |
 | 981 | LIN-1212 | [D31](#d31) | Измерить sparse visited representation | PERF | candidate | M | G-PERF |
-| 982 | LIN-1213 | [D31](#d31) | Спроектировать edge property schema | FEATURE | candidate | L | G-FEATURE |
-| 983 | LIN-1214 | [D31](#d31) | Спроектировать labeled path predicates | FEATURE | candidate | L | G-FEATURE |
-| 984 | LIN-1215 | [D31](#d31) | Спроектировать shortest unweighted paths | FEATURE | candidate | L | G-FEATURE |
-| 985 | LIN-1216 | [D31](#d31) | Спроектировать weighted path opt-in | FEATURE | candidate | L | G-FEATURE |
-| 986 | LIN-1217 | [D31](#d31) | Добавить traversal edge filters | FEATURE | candidate | M | G-FEATURE |
-| 987 | LIN-1218 | [D31](#d31) | Добавить traversal node filters | FEATURE | candidate | M | G-FEATURE |
-| 988 | LIN-1219 | [D31](#d31) | Добавить traversal result projections | FEATURE | candidate | M | G-FEATURE |
-| 989 | LIN-1220 | [D31](#d31) | Добавить graph result explanation | FEATURE | candidate | M | G-FEATURE |
-| 991 | LIN-1222 | [D31](#d31) | Ограничить traversal frontier bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 994 | LIN-1241 | [D32](#d32) | Профилировать cold page faults | PERF | candidate | M | G-PERF |
 | 995 | LIN-1242 | [D32](#d32) | Профилировать cold decode allocations | PERF | candidate | M | G-PERF |
 | 996 | LIN-1243 | [D32](#d32) | Профилировать cold projection access | PERF | candidate | M | G-PERF |
@@ -580,42 +331,18 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1003 | LIN-1250 | [D32](#d32) | Измерить random madvise policy | PERF | candidate | M | G-PERF |
 | 1004 | LIN-1251 | [D32](#d32) | Измерить bounded prefetch windows | PERF | candidate | M | G-PERF |
 | 1005 | LIN-1252 | [D32](#d32) | Измерить page-aligned section layout | PERF | candidate | M | G-PERF |
-| 1008 | LIN-1255 | [D32](#d32) | Спроектировать hot/cold tier thresholds | FEATURE | candidate | L | G-FEATURE |
 | 1014 | LIN-1261 | [D32](#d32) | Измерить dictionary cold strings | PERF | candidate | M | G-PERF |
 | 1015 | LIN-1262 | [D32](#d32) | Измерить delta-encoded cold integers | PERF | candidate | M | G-PERF |
 | 1016 | LIN-1263 | [D32](#d32) | Измерить compressed cold vectors | PERF | candidate | M | G-PERF |
 | 1017 | LIN-1264 | [D32](#d32) | Измерить compressed block random access | PERF | candidate | M | G-PERF |
-| 1018 | LIN-1281 | [D33](#d33) | Проверить spawn_blocking ownership | CORRECTNESS | qualification | S | G-CORRECT |
-| 1020 | LIN-1283 | [D33](#d33) | Проверить cancellation во время scan | CORRECTNESS | qualification | S | G-CORRECT |
-| 1022 | LIN-1285 | [D33](#d33) | Ограничить blocking worker concurrency | CORRECTNESS | qualification | M | G-CORRECT |
-| 1023 | LIN-1286 | [D33](#d33) | Ограничить queued query count | CORRECTNESS | qualification | M | G-CORRECT |
-| 1024 | LIN-1287 | [D33](#d33) | Ограничить queued input bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 1025 | LIN-1288 | [D33](#d33) | Ограничить stream buffered rows | CORRECTNESS | qualification | M | G-CORRECT |
-| 1026 | LIN-1289 | [D33](#d33) | Спроектировать per-client backpressure | API | candidate | L | G-API |
-| 1027 | LIN-1290 | [D33](#d33) | Спроектировать deadline propagation | API | candidate | L | G-API |
-| 1028 | LIN-1291 | [D33](#d33) | Спроектировать priority admission policy | API | candidate | L | G-API |
 | 1030 | LIN-1293 | [D33](#d33) | Измерить first-item async latency | PERF | candidate | M | G-PERF |
 | 1031 | LIN-1294 | [D33](#d33) | Измерить async batch coalescing | PERF | candidate | M | G-PERF |
 | 1032 | LIN-1295 | [D33](#d33) | Измерить scheduler handoff overhead | PERF | candidate | M | G-PERF |
 | 1033 | LIN-1296 | [D33](#d33) | Измерить stream wakeup amplification | PERF | candidate | M | G-PERF |
-| 1036 | LIN-1299 | [D33](#d33) | Проверить slow consumer memory bound | CORRECTNESS | qualification | S | G-CORRECT |
-| 1038 | LIN-1301 | [D33](#d33) | Добавить stream completion receipts | API | candidate | M | G-API |
-| 1039 | LIN-1302 | [D33](#d33) | Добавить async queue wait metrics | API | candidate | M | G-API |
-| 1040 | LIN-1303 | [D33](#d33) | Добавить active-query gauges | API | candidate | M | G-API |
-| 1041 | LIN-1304 | [D33](#d33) | Добавить cancellation reason counters | API | candidate | M | G-API |
 | 1046 | LIN-1329 | [D34](#d34) | Измерить read snapshot creation | PERF | candidate | M | G-PERF |
 | 1047 | LIN-1330 | [D34](#d34) | Измерить snapshot retained memory | PERF | candidate | M | G-PERF |
 | 1048 | LIN-1331 | [D34](#d34) | Измерить Arc contention concurrent readers | PERF | candidate | M | G-PERF |
 | 1049 | LIN-1332 | [D34](#d34) | Измерить cross-thread query scaling | PERF | candidate | M | G-PERF |
-| 1051 | LIN-1334 | [D34](#d34) | Спроектировать generation-based reclamation | FEATURE | candidate | L | G-FEATURE |
-| 1052 | LIN-1335 | [D34](#d34) | Спроектировать reader lifetime diagnostics | FEATURE | candidate | L | G-FEATURE |
-| 1053 | LIN-1336 | [D34](#d34) | Спроектировать writer admission fairness | FEATURE | candidate | L | G-FEATURE |
-| 1056 | LIN-1339 | [D34](#d34) | Проверить dropped reader reclamation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1058 | LIN-1341 | [D34](#d34) | Добавить snapshot pin byte counters | FEATURE | candidate | M | G-FEATURE |
-| 1059 | LIN-1342 | [D34](#d34) | Добавить oldest-reader generation metric | FEATURE | candidate | M | G-FEATURE |
-| 1060 | LIN-1343 | [D34](#d34) | Добавить blocked-reclamation diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1061 | LIN-1344 | [D34](#d34) | Добавить concurrent read latency histograms | FEATURE | candidate | M | G-FEATURE |
-| 1062 | LIN-1365 | [D35](#d35) | Проверить TCP_NODELAY effectiveness | CORRECTNESS | qualification | S | G-CORRECT |
 | 1063 | LIN-1366 | [D35](#d35) | Измерить single-write handshake cost | PERF | candidate | M | G-PERF |
 | 1064 | LIN-1367 | [D35](#d35) | Измерить replication RTT budget | PERF | candidate | M | G-PERF |
 | 1065 | LIN-1368 | [D35](#d35) | Измерить replication throughput saturation | PERF | candidate | M | G-PERF |
@@ -623,132 +350,7 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1071 | LIN-1374 | [D35](#d35) | Спроектировать replication authorization scopes | FEATURE | candidate | L | G-FEATURE |
 | 1072 | LIN-1375 | [D35](#d35) | Спроектировать authenticated peer identity | FEATURE | candidate | L | G-FEATURE |
 | 1073 | LIN-1376 | [D35](#d35) | Спроектировать replay-resistant session nonce | FEATURE | candidate | L | G-FEATURE |
-| 1076 | LIN-1379 | [D35](#d35) | Ограничить idle connection lifetime | CORRECTNESS | qualification | M | G-CORRECT |
-| 1091 | LIN-1414 | [D36](#d36) | Спроектировать bounded replay catch-up | FEATURE | candidate | L | G-FEATURE |
-| 1092 | LIN-1415 | [D36](#d36) | Спроектировать catch-up progress receipts | FEATURE | candidate | L | G-FEATURE |
 | 1094 | LIN-1417 | [D36](#d36) | Проверить follower disk-full behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 1098 | LIN-1421 | [D36](#d36) | Спроектировать retention pinned by followers | FEATURE | candidate | L | G-FEATURE |
-| 1101 | LIN-1424 | [D36](#d36) | Спроектировать explicit promotion fencing | FEATURE | candidate | L | G-FEATURE |
-| 1102 | LIN-1441 | [D37](#d37) | Зафиксировать stable Row representation | CORRECTNESS | qualification | M | G-CORRECT |
-| 1103 | LIN-1442 | [D37](#d37) | Зафиксировать public Cell variant policy | CORRECTNESS | qualification | M | G-CORRECT |
-| 1104 | LIN-1443 | [D37](#d37) | Зафиксировать query result ownership | CORRECTNESS | qualification | M | G-CORRECT |
-| 1105 | LIN-1444 | [D37](#d37) | Зафиксировать prepared handle invalidation | CORRECTNESS | qualification | M | G-CORRECT |
-| 1106 | LIN-1445 | [D37](#d37) | Спроектировать DbBuilder configuration | API | candidate | L | G-API |
-| 1108 | LIN-1447 | [D37](#d37) | Спроектировать storage capability introspection | API | candidate | L | G-API |
-| 1109 | LIN-1448 | [D37](#d37) | Спроектировать backend capability introspection | API | candidate | L | G-API |
-| 1110 | LIN-1449 | [D37](#d37) | Добавить explicit query cancellation handle | API | candidate | M | G-API |
-| 1111 | LIN-1450 | [D37](#d37) | Добавить query deadline builder | API | candidate | M | G-API |
-| 1112 | LIN-1451 | [D37](#d37) | Добавить bounded result collection | API | candidate | M | G-API |
-| 1113 | LIN-1452 | [D37](#d37) | Добавить streamed typed row conversion | API | candidate | M | G-API |
-| 1114 | LIN-1453 | [D37](#d37) | Проверить public error type stability | CORRECTNESS | qualification | S | G-CORRECT |
-| 1115 | LIN-1454 | [D37](#d37) | Проверить public serde compatibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 1117 | LIN-1456 | [D37](#d37) | Проверить minimum Rust version usability | CORRECTNESS | qualification | S | G-CORRECT |
-| 1118 | LIN-1457 | [D37](#d37) | Спроектировать safe borrowed row API | API | candidate | L | G-API |
-| 1119 | LIN-1458 | [D37](#d37) | Спроектировать typed parameter binding | API | candidate | L | G-API |
-| 1120 | LIN-1459 | [D37](#d37) | Спроектировать prepared query schema info | API | candidate | L | G-API |
-| 1121 | LIN-1460 | [D37](#d37) | Спроектировать query execution receipts | API | candidate | L | G-API |
-| 1122 | LIN-1461 | [D37](#d37) | Добавить exact/approximate search options | API | candidate | M | G-API |
-| 1124 | LIN-1463 | [D37](#d37) | Добавить explain structured output | API | candidate | M | G-API |
-| 1125 | LIN-1464 | [D37](#d37) | Добавить structured runtime statistics | API | candidate | M | G-API |
-| 1134 | LIN-1489 | [D38](#d38) | Улучшить proc-macro error spans | API | candidate | M | G-API |
-| 1135 | LIN-1490 | [D38](#d38) | Уточнить unsupported field-type errors | API | candidate | M | G-API |
-| 1136 | LIN-1491 | [D38](#d38) | Уточнить conflicting attribute errors | API | candidate | M | G-API |
-| 1137 | LIN-1492 | [D38](#d38) | Уточнить duplicate field rename errors | API | candidate | M | G-API |
-| 1138 | LIN-1493 | [D38](#d38) | Спроектировать typed parameter structs | API | candidate | L | G-API |
-| 1139 | LIN-1494 | [D38](#d38) | Спроектировать typed projection schemas | API | candidate | L | G-API |
-| 1140 | LIN-1495 | [D38](#d38) | Спроектировать typed aggregate results | API | candidate | L | G-API |
-| 1141 | LIN-1496 | [D38](#d38) | Спроектировать typed join result mapping | API | candidate | L | G-API |
-| 1142 | LIN-1497 | [D38](#d38) | Добавить borrowed typed row views | API | candidate | M | G-API |
-| 1143 | LIN-1498 | [D38](#d38) | Добавить zero-copy text borrowing | API | candidate | M | G-API |
-| 1144 | LIN-1499 | [D38](#d38) | Добавить typed RecordBatch conversion | API | candidate | M | G-API |
-| 1145 | LIN-1500 | [D38](#d38) | Добавить typed async stream mapping | API | candidate | M | G-API |
-| 1146 | LIN-1501 | [D38](#d38) | Проверить generic struct derive | CORRECTNESS | qualification | S | G-CORRECT |
-| 1147 | LIN-1502 | [D38](#d38) | Проверить nested module derive paths | CORRECTNESS | qualification | S | G-CORRECT |
-| 1148 | LIN-1503 | [D38](#d38) | Проверить renamed crate dependency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1149 | LIN-1504 | [D38](#d38) | Проверить derive feature-disabled diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
-| 1150 | LIN-1521 | [D39](#d39) | Уточнить CLI subcommand help | API | candidate | M | G-API |
-| 1151 | LIN-1522 | [D39](#d39) | Уточнить invalid option diagnostics | API | candidate | M | G-API |
-| 1152 | LIN-1523 | [D39](#d39) | Уточнить missing argument diagnostics | API | candidate | M | G-API |
-| 1153 | LIN-1524 | [D39](#d39) | Уточнить unsupported backend diagnostics | API | candidate | M | G-API |
-| 1154 | LIN-1525 | [D39](#d39) | Добавить machine-readable CLI errors | API | candidate | M | G-API |
-| 1155 | LIN-1526 | [D39](#d39) | Добавить stable process exit codes | API | candidate | M | G-API |
-| 1156 | LIN-1527 | [D39](#d39) | Добавить JSON Lines output mode | API | candidate | M | G-API |
-| 1157 | LIN-1528 | [D39](#d39) | Добавить tabular output truncation policy | API | candidate | M | G-API |
-| 1158 | LIN-1529 | [D39](#d39) | Спроектировать interactive REPL | API | candidate | L | G-API |
-| 1159 | LIN-1530 | [D39](#d39) | Спроектировать multiline REPL input | API | candidate | L | G-API |
-| 1160 | LIN-1531 | [D39](#d39) | Спроектировать REPL history storage | API | candidate | L | G-API |
-| 1161 | LIN-1532 | [D39](#d39) | Спроектировать REPL completion metadata | API | candidate | L | G-API |
-| 1163 | LIN-1534 | [D39](#d39) | Добавить parameter file binding | API | candidate | M | G-API |
-| 1164 | LIN-1535 | [D39](#d39) | Добавить stdin streaming import | API | candidate | M | G-API |
-| 1165 | LIN-1536 | [D39](#d39) | Добавить stdout streaming export | API | candidate | M | G-API |
-| 1167 | LIN-1538 | [D39](#d39) | Добавить storage inspect command | API | candidate | M | G-API |
-| 1168 | LIN-1539 | [D39](#d39) | Добавить WAL inspect command | API | candidate | M | G-API |
-| 1169 | LIN-1540 | [D39](#d39) | Добавить index consistency command | API | candidate | M | G-API |
-| 1170 | LIN-1541 | [D39](#d39) | Проверить SIGINT query cancellation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1171 | LIN-1542 | [D39](#d39) | Проверить SIGTERM graceful shutdown | CORRECTNESS | qualification | S | G-CORRECT |
-| 1174 | LIN-1561 | [D40](#d40) | Спроектировать stable diagnostic codes | FEATURE | candidate | L | G-FEATURE |
-| 1175 | LIN-1562 | [D40](#d40) | Спроектировать error cause chains | FEATURE | candidate | L | G-FEATURE |
-| 1176 | LIN-1563 | [D40](#d40) | Спроектировать source-span attachments | FEATURE | candidate | L | G-FEATURE |
-| 1177 | LIN-1564 | [D40](#d40) | Спроектировать operation context attachments | FEATURE | candidate | L | G-FEATURE |
-| 1178 | LIN-1565 | [D40](#d40) | Различать corrupt и unsupported format | CORRECTNESS | qualification | M | G-CORRECT |
-| 1179 | LIN-1566 | [D40](#d40) | Различать not-found и missing-schema | CORRECTNESS | qualification | M | G-CORRECT |
-| 1180 | LIN-1567 | [D40](#d40) | Различать canceled и deadline-exceeded | CORRECTNESS | qualification | M | G-CORRECT |
-| 1181 | LIN-1568 | [D40](#d40) | Различать resource-limit и allocation-failure | CORRECTNESS | qualification | M | G-CORRECT |
-| 1182 | LIN-1569 | [D40](#d40) | Проверить nested error source preservation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1183 | LIN-1570 | [D40](#d40) | Проверить I/O path redaction | CORRECTNESS | qualification | S | G-CORRECT |
-| 1185 | LIN-1572 | [D40](#d40) | Проверить SQL credential redaction | CORRECTNESS | qualification | S | G-CORRECT |
-| 1186 | LIN-1573 | [D40](#d40) | Добавить constraint identity in errors | FEATURE | candidate | M | G-FEATURE |
-| 1187 | LIN-1574 | [D40](#d40) | Добавить collection/field error context | FEATURE | candidate | M | G-FEATURE |
-| 1188 | LIN-1575 | [D40](#d40) | Добавить failing WAL byte offset | FEATURE | candidate | M | G-FEATURE |
-| 1189 | LIN-1576 | [D40](#d40) | Добавить malformed vector coordinate offset | FEATURE | candidate | M | G-FEATURE |
-| 1190 | LIN-1577 | [D40](#d40) | Улучшить actionable recovery suggestions | CORRECTNESS | qualification | M | G-CORRECT |
-| 1191 | LIN-1578 | [D40](#d40) | Уточнить missing feature remediation | CORRECTNESS | qualification | M | G-CORRECT |
-| 1192 | LIN-1579 | [D40](#d40) | Уточнить stale prepared handle remediation | CORRECTNESS | qualification | M | G-CORRECT |
-| 1193 | LIN-1580 | [D40](#d40) | Уточнить incompatible model remediation | CORRECTNESS | qualification | M | G-CORRECT |
-| 1198 | LIN-1601 | [D41](#d41) | Добавить per-query execution ID | OPS | candidate | M | G-OPS |
-| 1199 | LIN-1602 | [D41](#d41) | Добавить query phase timing schema | OPS | candidate | M | G-OPS |
-| 1200 | LIN-1603 | [D41](#d41) | Добавить operator row-flow counters | OPS | candidate | M | G-OPS |
-| 1201 | LIN-1604 | [D41](#d41) | Добавить operator allocated-byte counters | OPS | candidate | M | G-OPS |
-| 1202 | LIN-1605 | [D41](#d41) | Добавить prepare latency histogram | OPS | candidate | M | G-OPS |
-| 1203 | LIN-1606 | [D41](#d41) | Добавить execute latency histogram | OPS | candidate | M | G-OPS |
-| 1204 | LIN-1607 | [D41](#d41) | Добавить commit latency histogram | OPS | candidate | M | G-OPS |
-| 1205 | LIN-1608 | [D41](#d41) | Добавить queue latency histogram | OPS | candidate | M | G-OPS |
-| 1206 | LIN-1609 | [D41](#d41) | Добавить WAL pending bytes gauge | OPS | candidate | M | G-OPS |
-| 1207 | LIN-1610 | [D41](#d41) | Добавить checkpoint debt gauge | OPS | candidate | M | G-OPS |
-| 1208 | LIN-1611 | [D41](#d41) | Добавить memory pool retained gauge | OPS | candidate | M | G-OPS |
-| 1209 | LIN-1612 | [D41](#d41) | Добавить resident GPU bytes gauge | OPS | candidate | M | G-OPS |
-| 1210 | LIN-1613 | [D41](#d41) | Спроектировать tracing opt-in integration | OPS | candidate | L | G-OPS |
-| 1211 | LIN-1614 | [D41](#d41) | Спроектировать metrics sink trait | OPS | candidate | L | G-OPS |
-| 1212 | LIN-1615 | [D41](#d41) | Спроектировать OpenTelemetry adapter | OPS | candidate | L | G-OPS |
-| 1213 | LIN-1616 | [D41](#d41) | Спроектировать Prometheus text exporter | OPS | candidate | L | G-OPS |
-| 1214 | LIN-1617 | [D41](#d41) | Проверить no-op instrumentation overhead | CORRECTNESS | qualification | S | G-CORRECT |
-| 1215 | LIN-1618 | [D41](#d41) | Проверить telemetry cardinality limits | CORRECTNESS | qualification | S | G-CORRECT |
-| 1216 | LIN-1619 | [D41](#d41) | Проверить query text redaction | CORRECTNESS | qualification | S | G-CORRECT |
-| 1217 | LIN-1620 | [D41](#d41) | Проверить high-cardinality label rejection | CORRECTNESS | qualification | S | G-CORRECT |
-| 1218 | LIN-1621 | [D41](#d41) | Добавить slow-query ring buffer | OPS | candidate | M | G-OPS |
-| 1219 | LIN-1622 | [D41](#d41) | Добавить bounded query sampling | OPS | candidate | M | G-OPS |
-| 1220 | LIN-1623 | [D41](#d41) | Добавить phase anomaly detection hints | OPS | candidate | M | G-OPS |
-| 1221 | LIN-1624 | [D41](#d41) | Добавить plan-hash correlation | OPS | candidate | M | G-OPS |
-| 1222 | LIN-1645 | [D42](#d42) | Генерировать indexed/scan equivalence cases | VERIFY | qualification | S | G-VERIFY |
-| 1223 | LIN-1646 | [D42](#d42) | Генерировать optimized/reference plan cases | VERIFY | qualification | S | G-VERIFY |
-| 1224 | LIN-1647 | [D42](#d42) | Генерировать live/rebuilt FTS cases | VERIFY | qualification | S | G-VERIFY |
-| 1225 | LIN-1648 | [D42](#d42) | Генерировать restored/live Store cases | VERIFY | qualification | S | G-VERIFY |
-| 1226 | LIN-1649 | [D42](#d42) | Генерировать mixed numeric key corpus | VERIFY | qualification | S | G-VERIFY |
-| 1227 | LIN-1650 | [D42](#d42) | Генерировать Text/SmallText scalar corpus | VERIFY | qualification | S | G-VERIFY |
-| 1228 | LIN-1651 | [D42](#d42) | Генерировать NaN payload corpus | VERIFY | qualification | S | G-VERIFY |
-| 1229 | LIN-1652 | [D42](#d42) | Генерировать Unicode normalization corpus | VERIFY | qualification | S | G-VERIFY |
-| 1230 | LIN-1653 | [D42](#d42) | Добавить mutation sequence shrinking | VERIFY | qualification | S | G-VERIFY |
-| 1231 | LIN-1654 | [D42](#d42) | Добавить WAL corruption shrinking | VERIFY | qualification | S | G-VERIFY |
-| 1232 | LIN-1655 | [D42](#d42) | Добавить graph failure shrinking | VERIFY | qualification | S | G-VERIFY |
-| 1233 | LIN-1656 | [D42](#d42) | Добавить SQL peer mismatch shrinking | VERIFY | qualification | S | G-VERIFY |
-| 1242 | LIN-1685 | [D43](#d43) | Инъецировать crash перед durable sync | VERIFY | qualification | S | G-VERIFY |
-| 1243 | LIN-1686 | [D43](#d43) | Инъецировать crash после durable sync | VERIFY | qualification | S | G-VERIFY |
-| 1244 | LIN-1687 | [D43](#d43) | Инъецировать crash перед commit acknowledgement | VERIFY | qualification | S | G-VERIFY |
-| 1245 | LIN-1688 | [D43](#d43) | Инъецировать crash после acknowledgement | VERIFY | qualification | S | G-VERIFY |
-| 1246 | LIN-1689 | [D43](#d43) | Инъецировать crash перед snapshot rename | VERIFY | qualification | S | G-VERIFY |
-| 1247 | LIN-1690 | [D43](#d43) | Инъецировать crash после snapshot rename | VERIFY | qualification | S | G-VERIFY |
-| 1248 | LIN-1691 | [D43](#d43) | Инъецировать crash перед WAL truncate | VERIFY | qualification | S | G-VERIFY |
-| 1249 | LIN-1692 | [D43](#d43) | Инъецировать crash после WAL truncate | VERIFY | qualification | S | G-VERIFY |
 | 1250 | LIN-1693 | [D43](#d43) | Инъецировать ENOSPC при append | VERIFY | qualification | S | G-VERIFY |
 | 1251 | LIN-1694 | [D43](#d43) | Инъецировать EIO при sync | VERIFY | qualification | S | G-VERIFY |
 | 1253 | LIN-1696 | [D43](#d43) | Инъецировать EMFILE при reopen | VERIFY | qualification | S | G-VERIFY |
@@ -756,207 +358,40 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1255 | LIN-1698 | [D43](#d43) | Инъецировать network drop при catch-up | VERIFY | qualification | S | G-VERIFY |
 | 1256 | LIN-1699 | [D43](#d43) | Инъецировать TLS failure при reconnect | VERIFY | qualification | S | G-VERIFY |
 | 1257 | LIN-1700 | [D43](#d43) | Инъецировать slow replica acknowledgement | VERIFY | qualification | S | G-VERIFY |
-| 1260 | LIN-1704 | [D43](#d43) | Проверить recovery idempotence after faults | VERIFY | qualification | S | G-VERIFY |
-| 1261 | LIN-1721 | [D44](#d44) | Зафиксировать Rust toolchain policy | CORRECTNESS | qualification | M | G-CORRECT |
-| 1262 | LIN-1722 | [D44](#d44) | Проверять declared MSRV build | OPS | candidate | M | G-OPS |
-| 1263 | LIN-1723 | [D44](#d44) | Проверять stable toolchain build | OPS | candidate | M | G-OPS |
-| 1264 | LIN-1724 | [D44](#d44) | Проверять nightly-specific feature use | OPS | candidate | M | G-OPS |
-| 1265 | LIN-1725 | [D44](#d44) | Добавить Linux x86_64 test job | OPS | candidate | M | G-OPS |
-| 1266 | LIN-1726 | [D44](#d44) | Добавить Linux ARM64 test job | OPS | candidate | M | G-OPS |
-| 1267 | LIN-1727 | [D44](#d44) | Добавить macOS ARM64 test job | OPS | candidate | M | G-OPS |
-| 1268 | LIN-1728 | [D44](#d44) | Добавить Windows x86_64 test job | OPS | candidate | M | G-OPS |
-| 1269 | LIN-1729 | [D44](#d44) | Проверять default feature set | OPS | candidate | M | G-OPS |
-| 1270 | LIN-1730 | [D44](#d44) | Проверять no-default feature set | OPS | candidate | M | G-OPS |
-| 1271 | LIN-1731 | [D44](#d44) | Проверять async-only compatibility | OPS | candidate | M | G-OPS |
-| 1272 | LIN-1732 | [D44](#d44) | Проверять derive-only compatibility | OPS | candidate | M | G-OPS |
-| 1273 | LIN-1733 | [D44](#d44) | Проверять gpu compile-only job | OPS | candidate | M | G-OPS |
-| 1274 | LIN-1734 | [D44](#d44) | Проверять actual GPU qualification job | OPS | candidate | M | G-OPS |
-| 1275 | LIN-1735 | [D44](#d44) | Проверять compression feature matrix | OPS | candidate | M | G-OPS |
-| 1276 | LIN-1736 | [D44](#d44) | Проверять parallel feature matrix | OPS | candidate | M | G-OPS |
-| 1277 | LIN-1737 | [D44](#d44) | Разделить deterministic и noisy benchmarks | OPS | candidate | M | G-OPS |
-| 1278 | LIN-1738 | [D44](#d44) | Разделить smoke и regression suites | OPS | candidate | M | G-OPS |
-| 1279 | LIN-1739 | [D44](#d44) | Разделить component и end-to-end gates | OPS | candidate | M | G-OPS |
-| 1280 | LIN-1740 | [D44](#d44) | Разделить hardware-required tests | OPS | candidate | M | G-OPS |
-| 1281 | LIN-1741 | [D44](#d44) | Добавить raw benchmark artifact upload | OPS | candidate | M | G-OPS |
-| 1282 | LIN-1742 | [D44](#d44) | Добавить benchmark source hash checks | OPS | candidate | M | G-OPS |
-| 1283 | LIN-1743 | [D44](#d44) | Добавить dependency lock drift checks | OPS | candidate | M | G-OPS |
-| 1284 | LIN-1744 | [D44](#d44) | Добавить baseline approval metadata | OPS | candidate | M | G-OPS |
-| 1297 | LIN-1777 | [D45](#d45) | Спроектировать read-only capabilities | FEATURE | candidate | L | G-FEATURE |
-| 1298 | LIN-1778 | [D45](#d45) | Спроектировать collection-level capabilities | FEATURE | candidate | L | G-FEATURE |
-| 1299 | LIN-1779 | [D45](#d45) | Спроектировать extension trust boundaries | FEATURE | candidate | L | G-FEATURE |
-| 1300 | LIN-1780 | [D45](#d45) | Спроектировать untrusted model isolation | FEATURE | candidate | L | G-FEATURE |
-| 1303 | LIN-1783 | [D45](#d45) | Проверить pathological UTF-8 scan cost | CORRECTNESS | qualification | S | G-CORRECT |
-| 1305 | LIN-1801 | [D46](#d46) | Спроектировать schema generation counters | FEATURE | candidate | L | G-FEATURE |
-| 1306 | LIN-1802 | [D46](#d46) | Спроектировать explicit schema version | FEATURE | candidate | L | G-FEATURE |
-| 1307 | LIN-1803 | [D46](#d46) | Спроектировать migration transaction contract | FEATURE | candidate | L | G-FEATURE |
-| 1308 | LIN-1804 | [D46](#d46) | Спроектировать migration dry-run output | FEATURE | candidate | L | G-FEATURE |
-| 1309 | LIN-1805 | [D46](#d46) | Проверить collection rename references | CORRECTNESS | qualification | S | G-CORRECT |
-| 1310 | LIN-1806 | [D46](#d46) | Проверить field rename index references | CORRECTNESS | qualification | S | G-CORRECT |
-| 1311 | LIN-1807 | [D46](#d46) | Проверить field rename FTS references | CORRECTNESS | qualification | S | G-CORRECT |
-| 1312 | LIN-1808 | [D46](#d46) | Проверить field rename prepared plans | CORRECTNESS | qualification | S | G-CORRECT |
-| 1313 | LIN-1809 | [D46](#d46) | Спроектировать add-field default policy | FEATURE | candidate | L | G-FEATURE |
-| 1314 | LIN-1810 | [D46](#d46) | Спроектировать remove-field dependency analysis | FEATURE | candidate | L | G-FEATURE |
-| 1315 | LIN-1811 | [D46](#d46) | Спроектировать field type conversion policy | FEATURE | candidate | L | G-FEATURE |
-| 1316 | LIN-1812 | [D46](#d46) | Спроектировать nullable-to-required migration | FEATURE | candidate | L | G-FEATURE |
-| 1317 | LIN-1813 | [D46](#d46) | Проверить index metadata migration | CORRECTNESS | qualification | S | G-CORRECT |
-| 1318 | LIN-1814 | [D46](#d46) | Проверить vector model metadata migration | CORRECTNESS | qualification | S | G-CORRECT |
-| 1319 | LIN-1815 | [D46](#d46) | Проверить graph relation metadata migration | CORRECTNESS | qualification | S | G-CORRECT |
-| 1320 | LIN-1816 | [D46](#d46) | Проверить persisted statistics migration | CORRECTNESS | qualification | S | G-CORRECT |
-| 1321 | LIN-1817 | [D46](#d46) | Добавить catalog introspection API | FEATURE | candidate | M | G-FEATURE |
-| 1322 | LIN-1818 | [D46](#d46) | Добавить schema diff operation | FEATURE | candidate | M | G-FEATURE |
-| 1323 | LIN-1819 | [D46](#d46) | Добавить schema compatibility report | FEATURE | candidate | M | G-FEATURE |
-| 1324 | LIN-1820 | [D46](#d46) | Добавить migration progress callbacks | FEATURE | candidate | M | G-FEATURE |
-| 1325 | LIN-1821 | [D46](#d46) | Спроектировать online index rebuild | FEATURE | candidate | L | G-FEATURE |
-| 1326 | LIN-1822 | [D46](#d46) | Спроектировать staged constraint validation | FEATURE | candidate | L | G-FEATURE |
-| 1327 | LIN-1823 | [D46](#d46) | Спроектировать migration checkpoint boundaries | FEATURE | candidate | L | G-FEATURE |
-| 1328 | LIN-1824 | [D46](#d46) | Спроектировать resumable migration receipts | FEATURE | candidate | L | G-FEATURE |
-| 1329 | LIN-1841 | [D47](#d47) | Добавить bounded JSON Lines import | FEATURE | candidate | M | G-FEATURE |
-| 1330 | LIN-1842 | [D47](#d47) | Добавить bounded CSV import | FEATURE | candidate | M | G-FEATURE |
-| 1332 | LIN-1844 | [D47](#d47) | Добавить Arrow import integration | FEATURE | candidate | M | G-FEATURE |
-| 1333 | LIN-1845 | [D47](#d47) | Добавить streaming JSON Lines export | FEATURE | candidate | M | G-FEATURE |
-| 1334 | LIN-1846 | [D47](#d47) | Добавить streaming CSV export | FEATURE | candidate | M | G-FEATURE |
-| 1335 | LIN-1847 | [D47](#d47) | Добавить Arrow export integration | FEATURE | candidate | M | G-FEATURE |
-| 1337 | LIN-1849 | [D47](#d47) | Проверить CSV quotes/newlines | CORRECTNESS | qualification | S | G-CORRECT |
-| 1338 | LIN-1850 | [D47](#d47) | Проверить CSV empty/null distinction | CORRECTNESS | qualification | S | G-CORRECT |
-| 1341 | LIN-1853 | [D47](#d47) | Спроектировать import schema inference | FEATURE | candidate | L | G-FEATURE |
-| 1342 | LIN-1854 | [D47](#d47) | Спроектировать explicit import schema mapping | FEATURE | candidate | L | G-FEATURE |
-| 1343 | LIN-1855 | [D47](#d47) | Спроектировать import field rename mapping | FEATURE | candidate | L | G-FEATURE |
-| 1344 | LIN-1856 | [D47](#d47) | Спроектировать import default mapping | FEATURE | candidate | L | G-FEATURE |
-| 1345 | LIN-1857 | [D47](#d47) | Добавить import reject-file mode | FEATURE | candidate | M | G-FEATURE |
-| 1346 | LIN-1858 | [D47](#d47) | Добавить import error row positions | FEATURE | candidate | M | G-FEATURE |
-| 1347 | LIN-1859 | [D47](#d47) | Добавить import progress byte counts | FEATURE | candidate | M | G-FEATURE |
-| 1348 | LIN-1860 | [D47](#d47) | Добавить import cancellation receipts | FEATURE | candidate | M | G-FEATURE |
-| 1352 | LIN-1864 | [D47](#d47) | Проверить imported vector dimensions | CORRECTNESS | qualification | S | G-CORRECT |
-| 1353 | LIN-1881 | [D48](#d48) | Спроектировать health command contract | OPS | candidate | L | G-OPS |
-| 1354 | LIN-1882 | [D48](#d48) | Спроектировать readiness command contract | OPS | candidate | L | G-OPS |
-| 1356 | LIN-1884 | [D48](#d48) | Спроектировать storage lock inspection | OPS | candidate | L | G-OPS |
-| 1361 | LIN-1889 | [D48](#d48) | Добавить disk-space preflight checks | OPS | candidate | M | G-OPS |
-| 1362 | LIN-1890 | [D48](#d48) | Добавить checkpoint scheduling policy | OPS | candidate | M | G-OPS |
-| 1363 | LIN-1891 | [D48](#d48) | Добавить WAL retention budget | OPS | candidate | M | G-OPS |
-| 1365 | LIN-1893 | [D48](#d48) | Спроектировать backup retention manifests | OPS | candidate | L | G-OPS |
-| 1366 | LIN-1894 | [D48](#d48) | Спроектировать backup verification command | OPS | candidate | L | G-OPS |
-| 1367 | LIN-1895 | [D48](#d48) | Спроектировать restore rehearsal command | OPS | candidate | L | G-OPS |
-| 1368 | LIN-1896 | [D48](#d48) | Спроектировать backup encryption boundary | OPS | candidate | L | G-OPS |
-| 1373 | LIN-1901 | [D48](#d48) | Добавить operator-safe maintenance mode | OPS | candidate | M | G-OPS |
-| 1374 | LIN-1902 | [D48](#d48) | Добавить maintenance cancellation policy | OPS | candidate | M | G-OPS |
-| 1375 | LIN-1903 | [D48](#d48) | Добавить background work budgets | OPS | candidate | M | G-OPS |
-| 1376 | LIN-1904 | [D48](#d48) | Добавить maintenance progress snapshots | OPS | candidate | M | G-OPS |
-| 1377 | LIN-1921 | [D49](#d49) | Проверить dependency feature minimality | CORRECTNESS | qualification | S | G-CORRECT |
-| 1379 | LIN-1923 | [D49](#d49) | Проверить public dependency leakage | CORRECTNESS | qualification | S | G-CORRECT |
-| 1380 | LIN-1924 | [D49](#d49) | Проверить dependency license inventory | CORRECTNESS | qualification | S | G-CORRECT |
 | 1381 | LIN-1925 | [D49](#d49) | Измерить default build time | PERF | candidate | M | G-PERF |
 | 1382 | LIN-1926 | [D49](#d49) | Измерить incremental build time | PERF | candidate | M | G-PERF |
 | 1383 | LIN-1927 | [D49](#d49) | Измерить release link time | PERF | candidate | M | G-PERF |
 | 1384 | LIN-1928 | [D49](#d49) | Измерить bundled DuckDB build footprint | PERF | candidate | M | G-PERF |
-| 1385 | LIN-1929 | [D49](#d49) | Спроектировать optional peer benchmark features | OPS | candidate | L | G-OPS |
-| 1386 | LIN-1930 | [D49](#d49) | Спроектировать lean CLI feature profile | OPS | candidate | L | G-OPS |
-| 1387 | LIN-1931 | [D49](#d49) | Спроектировать embedded-only feature profile | OPS | candidate | L | G-OPS |
-| 1388 | LIN-1932 | [D49](#d49) | Спроектировать compute-only feature profile | OPS | candidate | L | G-OPS |
-| 1389 | LIN-1961 | [D50](#d50) | Опубликовать stable/experimental API matrix | DOC | candidate | S | G-DOC |
-| 1390 | LIN-1962 | [D50](#d50) | Опубликовать feature support matrix | DOC | candidate | S | G-DOC |
-| 1391 | LIN-1963 | [D50](#d50) | Опубликовать storage guarantee matrix | DOC | candidate | S | G-DOC |
-| 1392 | LIN-1964 | [D50](#d50) | Опубликовать query semantics reference | DOC | candidate | S | G-DOC |
-| 1393 | LIN-1965 | [D50](#d50) | Описать exact/approximate search distinction | DOC | candidate | S | G-DOC |
-| 1394 | LIN-1966 | [D50](#d50) | Описать CPU/GPU precision differences | DOC | candidate | S | G-DOC |
-| 1395 | LIN-1967 | [D50](#d50) | Описать NULL/absent-field distinction | DOC | candidate | S | G-DOC |
-| 1396 | LIN-1968 | [D50](#d50) | Описать numeric equality boundaries | DOC | candidate | S | G-DOC |
-| 1397 | LIN-1969 | [D50](#d50) | Описать WAL version compatibility | DOC | candidate | S | G-DOC |
-| 1398 | LIN-1970 | [D50](#d50) | Описать snapshot version compatibility | DOC | candidate | S | G-DOC |
-| 1399 | LIN-1971 | [D50](#d50) | Описать replication version compatibility | DOC | candidate | S | G-DOC |
-| 1400 | LIN-1972 | [D50](#d50) | Описать downgrade support boundaries | DOC | candidate | S | G-DOC |
 
-#### P3: 516 пунктов
+#### P3: 120 пунктов
 
 | Rank | ID | Область | Задача | Тип | Статус | Объём | Gate |
 |---:|---|---|---|---|---|---|---|
-| 1401 | LIN-0185 | [D05](#d05) | Проверить checkpoint WAL truncation race | CORRECTNESS | qualification | S | G-CORRECT |
-| 1402 | LIN-0186 | [D05](#d05) | Проверить checkpoint follower pinning | CORRECTNESS | qualification | S | G-CORRECT |
-| 1404 | LIN-0188 | [D05](#d05) | Проверить checkpoint cancellation cleanup | CORRECTNESS | qualification | S | G-CORRECT |
-| 1405 | LIN-0189 | [D05](#d05) | Добавить checkpoint progress metrics | FEATURE | candidate | M | G-FEATURE |
-| 1406 | LIN-0190 | [D05](#d05) | Добавить checkpoint debt metric | FEATURE | candidate | M | G-FEATURE |
-| 1407 | LIN-0191 | [D05](#d05) | Добавить checkpoint size forecast | FEATURE | candidate | M | G-FEATURE |
-| 1408 | LIN-0192 | [D05](#d05) | Добавить checkpoint error provenance | FEATURE | candidate | M | G-FEATURE |
 | 1409 | LIN-0193 | [D05](#d05) | Сравнить cold snapshot formats | PERF | candidate | M | G-PERF |
 | 1410 | LIN-0194 | [D05](#d05) | Сравнить snapshot encode chunk sizes | PERF | candidate | M | G-PERF |
 | 1412 | LIN-0196 | [D05](#d05) | Сравнить dictionary text snapshots | PERF | candidate | M | G-PERF |
-| 1413 | LIN-0197 | [D05](#d05) | Проверить snapshot disk quota | CORRECTNESS | qualification | S | G-CORRECT |
-| 1415 | LIN-0199 | [D05](#d05) | Проверить cross-version snapshot corpus | VERIFY | qualification | S | G-VERIFY |
 | 1421 | LIN-0349 | [D09](#d09) | Ввести per-query allocation budget | PERF | candidate | M | G-PERF |
 | 1422 | LIN-0350 | [D09](#d09) | Ввести per-plan retained-memory estimate | PERF | candidate | M | G-PERF |
-| 1423 | LIN-0351 | [D09](#d09) | Ввести pool pressure telemetry | PERF | candidate | M | G-PERF |
-| 1424 | LIN-0352 | [D09](#d09) | Ввести explicit pool purge API | PERF | candidate | M | G-PERF |
 | 1425 | LIN-0353 | [D09](#d09) | Измерить allocator optional feature | PERF | candidate | M | G-PERF |
 | 1426 | LIN-0354 | [D09](#d09) | Измерить allocator cold startup | PERF | candidate | M | G-PERF |
 | 1427 | LIN-0355 | [D09](#d09) | Измерить allocator fragmentation churn | PERF | candidate | M | G-PERF |
 | 1428 | LIN-0356 | [D09](#d09) | Измерить allocator multithread contention | PERF | candidate | M | G-PERF |
 | 1429 | LIN-0357 | [D09](#d09) | Проверить OOM error boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 1432 | LIN-0360 | [D09](#d09) | Проверить memory release после cancel | CORRECTNESS | qualification | S | G-CORRECT |
-| 1436 | LIN-0428 | [D11](#d11) | Проверить FK target schema changes | CORRECTNESS | qualification | S | G-CORRECT |
 | 1437 | LIN-0429 | [D11](#d11) | Спроектировать constraint validation mode | FEATURE | candidate | L | G-FEATURE |
 | 1438 | LIN-0430 | [D11](#d11) | Спроектировать migration constraint staging | FEATURE | candidate | L | G-FEATURE |
-| 1439 | LIN-0431 | [D11](#d11) | Спроектировать constraint introspection | FEATURE | candidate | L | G-FEATURE |
 | 1440 | LIN-0432 | [D11](#d11) | Спроектировать validation progress receipts | FEATURE | candidate | L | G-FEATURE |
-| 1441 | LIN-0433 | [D11](#d11) | Ограничить complex constraint recursion | CORRECTNESS | qualification | M | G-CORRECT |
-| 1442 | LIN-0434 | [D11](#d11) | Ограничить DNF constraint expansion | CORRECTNESS | qualification | M | G-CORRECT |
-| 1443 | LIN-0435 | [D11](#d11) | Ограничить constraint diagnostic payload | CORRECTNESS | qualification | M | G-CORRECT |
-| 1444 | LIN-0436 | [D11](#d11) | Ограничить batch conflict reporting | CORRECTNESS | qualification | M | G-CORRECT |
-| 1448 | LIN-0440 | [D11](#d11) | Проверить constraint disabled-feature errors | CORRECTNESS | qualification | S | G-CORRECT |
 | 1449 | LIN-0465 | [D12](#d12) | Сократить temporary lexer strings | PERF | candidate | M | G-PERF |
 | 1450 | LIN-0466 | [D12](#d12) | Измерить zero-copy token spans | PERF | candidate | M | G-PERF |
 | 1451 | LIN-0467 | [D12](#d12) | Измерить keyword dispatch table | PERF | candidate | M | G-PERF |
 | 1452 | LIN-0468 | [D12](#d12) | Измерить parser arena allocation | PERF | candidate | M | G-PERF |
-| 1453 | LIN-0469 | [D12](#d12) | Добавить parse-only inspection API | API | candidate | M | G-API |
-| 1454 | LIN-0470 | [D12](#d12) | Добавить canonical AST formatter | API | candidate | M | G-API |
-| 1455 | LIN-0471 | [D12](#d12) | Добавить source-preserving query formatter | API | candidate | M | G-API |
-| 1456 | LIN-0472 | [D12](#d12) | Добавить syntax version declaration | API | candidate | M | G-API |
-| 1457 | LIN-0473 | [D12](#d12) | Проверить AST serde stability | CORRECTNESS | qualification | S | G-CORRECT |
-| 1459 | LIN-0475 | [D12](#d12) | Проверить AST constant fold provenance | CORRECTNESS | qualification | S | G-CORRECT |
-| 1461 | LIN-0477 | [D12](#d12) | Подготовить parser fuzz target | VERIFY | qualification | S | G-VERIFY |
-| 1462 | LIN-0478 | [D12](#d12) | Подготовить tokenizer corpus | VERIFY | qualification | S | G-VERIFY |
-| 1463 | LIN-0479 | [D12](#d12) | Подготовить grammar conformance corpus | VERIFY | qualification | S | G-VERIFY |
-| 1464 | LIN-0480 | [D12](#d12) | Подготовить malformed-query minimizer | API | candidate | M | G-API |
-| 1465 | LIN-0585 | [D15](#d15) | Спроектировать calibrated CPU cost units | FEATURE | candidate | L | G-FEATURE |
-| 1466 | LIN-0586 | [D15](#d15) | Спроектировать memory-pressure cost penalty | FEATURE | candidate | L | G-FEATURE |
-| 1467 | LIN-0587 | [D15](#d15) | Спроектировать GPU transfer cost model | FEATURE | candidate | L | G-FEATURE |
-| 1468 | LIN-0588 | [D15](#d15) | Спроектировать cold page cost model | FEATURE | candidate | L | G-FEATURE |
-| 1469 | LIN-0589 | [D15](#d15) | Добавить EXPLAIN estimates/actual comparison | FEATURE | candidate | M | G-FEATURE |
-| 1470 | LIN-0590 | [D15](#d15) | Добавить selectivity feedback receipts | FEATURE | candidate | M | G-FEATURE |
-| 1471 | LIN-0591 | [D15](#d15) | Добавить estimator confidence fields | FEATURE | candidate | M | G-FEATURE |
-| 1472 | LIN-0592 | [D15](#d15) | Добавить manual statistics inspection | FEATURE | candidate | M | G-FEATURE |
-| 1473 | LIN-0593 | [D15](#d15) | Версионировать persisted statistics | FEATURE | candidate | M | G-FEATURE |
-| 1474 | LIN-0594 | [D15](#d15) | Проверить statistics WAL lifecycle | CORRECTNESS | qualification | S | G-CORRECT |
-| 1476 | LIN-0596 | [D15](#d15) | Проверить statistics schema migration | CORRECTNESS | qualification | S | G-CORRECT |
-| 1477 | LIN-0597 | [D15](#d15) | Ограничить optimizer planning latency | CORRECTNESS | qualification | L | G-CORRECT |
-| 1478 | LIN-0598 | [D15](#d15) | Ограничить statistics memory budget | CORRECTNESS | qualification | M | G-CORRECT |
-| 1479 | LIN-0599 | [D15](#d15) | Добавить statistics reset operation | FEATURE | candidate | M | G-FEATURE |
-| 1480 | LIN-0600 | [D15](#d15) | Добавить cost-model reproducibility fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1481 | LIN-0665 | [D17](#d17) | Добавить cursor consumed-row counters | API | candidate | M | G-API |
-| 1482 | LIN-0666 | [D17](#d17) | Добавить cursor retained-byte counters | API | candidate | M | G-API |
-| 1483 | LIN-0667 | [D17](#d17) | Добавить cursor cancellation receipt | API | candidate | M | G-API |
-| 1484 | LIN-0668 | [D17](#d17) | Добавить cursor leak diagnostics | API | candidate | M | G-API |
-| 1485 | LIN-0669 | [D17](#d17) | Проверить chained cursor error propagation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1489 | LIN-0673 | [D17](#d17) | Измерить async stream chunk sizes | PERF | candidate | M | G-PERF |
 | 1490 | LIN-0674 | [D17](#d17) | Измерить cursor to RecordBatch path | PERF | candidate | M | G-PERF |
 | 1491 | LIN-0675 | [D17](#d17) | Измерить cursor iterator fusion | PERF | candidate | M | G-PERF |
 | 1492 | LIN-0676 | [D17](#d17) | Измерить cursor field-slot cache | PERF | candidate | M | G-PERF |
-| 1495 | LIN-0679 | [D17](#d17) | Проверить cross-thread cursor restrictions | CORRECTNESS | qualification | S | G-CORRECT |
-| 1496 | LIN-0680 | [D17](#d17) | Проверить cursor serialization rejection | CORRECTNESS | qualification | S | G-CORRECT |
-| 1501 | LIN-0709 | [D18](#d18) | Спроектировать Arrow C data boundary | FEATURE | candidate | L | G-FEATURE |
-| 1502 | LIN-0710 | [D18](#d18) | Спроектировать Arrow import ownership | FEATURE | candidate | L | G-FEATURE |
-| 1503 | LIN-0711 | [D18](#d18) | Спроектировать Arrow export release callbacks | FEATURE | candidate | L | G-FEATURE |
-| 1504 | LIN-0712 | [D18](#d18) | Спроектировать Arrow schema mapping | FEATURE | candidate | L | G-FEATURE |
-| 1506 | LIN-0714 | [D18](#d18) | Добавить batch allocation limits | FEATURE | candidate | M | G-FEATURE |
-| 1507 | LIN-0715 | [D18](#d18) | Добавить column memory diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1508 | LIN-0716 | [D18](#d18) | Добавить batch consistency inspector | FEATURE | candidate | M | G-FEATURE |
 | 1513 | LIN-0785 | [D20](#d20) | Измерить indirect row-index sorting | PERF | candidate | M | G-PERF |
 | 1514 | LIN-0786 | [D20](#d20) | Измерить inline sort keys | PERF | candidate | M | G-PERF |
 | 1515 | LIN-0787 | [D20](#d20) | Измерить column sort permutation | PERF | candidate | M | G-PERF |
 | 1516 | LIN-0788 | [D20](#d20) | Измерить sorting string dictionaries | PERF | candidate | M | G-PERF |
-| 1520 | LIN-0792 | [D20](#d20) | Проверить GPU sort allocation limits | CORRECTNESS | qualification | S | G-CORRECT |
-| 1521 | LIN-0793 | [D20](#d20) | Добавить sort memory estimates | FEATURE | candidate | M | G-FEATURE |
-| 1522 | LIN-0794 | [D20](#d20) | Добавить comparator evaluation counters | FEATURE | candidate | M | G-FEATURE |
-| 1523 | LIN-0795 | [D20](#d20) | Добавить Top-K rejection counters | FEATURE | candidate | M | G-FEATURE |
-| 1524 | LIN-0796 | [D20](#d20) | Добавить spill-size diagnostics | FEATURE | candidate | L | G-FEATURE |
 | 1525 | LIN-0797 | [D20](#d20) | Сравнить ordered-index scan с sort | PERF | candidate | M | G-PERF |
 | 1526 | LIN-0798 | [D20](#d20) | Сравнить prefix-sorted execution | PERF | candidate | M | G-PERF |
 | 1527 | LIN-0799 | [D20](#d20) | Сравнить radix sort для integers | PERF | candidate | M | G-PERF |
@@ -965,67 +400,17 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1530 | LIN-0826 | [D21](#d21) | Измерить bitmap semi-join filter | PERF | candidate | M | G-PERF |
 | 1531 | LIN-0827 | [D21](#d21) | Измерить bloom join prefilter | PERF | candidate | M | G-PERF |
 | 1532 | LIN-0828 | [D21](#d21) | Измерить adaptive join crossover | PERF | candidate | M | G-PERF |
-| 1533 | LIN-0829 | [D21](#d21) | Проверить join cancellation boundary | CORRECTNESS | qualification | S | G-CORRECT |
-| 1534 | LIN-0830 | [D21](#d21) | Проверить join error atomicity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1535 | LIN-0831 | [D21](#d21) | Проверить cursor join first-row latency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1539 | LIN-0835 | [D21](#d21) | Проверить tiled join boundary sizes | CORRECTNESS | qualification | S | G-CORRECT |
-| 1540 | LIN-0836 | [D21](#d21) | Проверить GPU join no-match cases | VERIFY | qualification | S | G-VERIFY |
-| 1541 | LIN-0837 | [D21](#d21) | Добавить join estimates/actual metrics | FEATURE | candidate | M | G-FEATURE |
-| 1542 | LIN-0838 | [D21](#d21) | Добавить hot-key diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1543 | LIN-0839 | [D21](#d21) | Добавить build/probe timing split | FEATURE | candidate | M | G-FEATURE |
-| 1544 | LIN-0840 | [D21](#d21) | Добавить join algorithm explain fields | FEATURE | candidate | M | G-FEATURE |
 | 1545 | LIN-0865 | [D22](#d22) | Измерить reusable partition buffers | PERF | candidate | M | G-PERF |
 | 1546 | LIN-0866 | [D22](#d22) | Измерить sorted-partition reuse | PERF | candidate | M | G-PERF |
 | 1547 | LIN-0867 | [D22](#d22) | Измерить multiple-window sharing | PERF | candidate | M | G-PERF |
 | 1548 | LIN-0868 | [D22](#d22) | Измерить monotonic deque min/max | PERF | candidate | M | G-PERF |
-| 1549 | LIN-0869 | [D22](#d22) | Спроектировать bounded streaming windows | FEATURE | candidate | L | G-FEATURE |
-| 1550 | LIN-0870 | [D22](#d22) | Спроектировать spillable partitions | FEATURE | candidate | L | G-FEATURE |
-| 1551 | LIN-0871 | [D22](#d22) | Спроектировать window cancellation checkpoints | FEATURE | candidate | L | G-FEATURE |
-| 1552 | LIN-0872 | [D22](#d22) | Спроектировать window memory estimation | FEATURE | candidate | L | G-FEATURE |
-| 1553 | LIN-0873 | [D22](#d22) | Проверить window после join | CORRECTNESS | qualification | S | G-CORRECT |
-| 1555 | LIN-0875 | [D22](#d22) | Проверить window projection aliases | CORRECTNESS | qualification | S | G-CORRECT |
-| 1556 | LIN-0876 | [D22](#d22) | Проверить nested window rejection | CORRECTNESS | qualification | S | G-CORRECT |
-| 1557 | LIN-0877 | [D22](#d22) | Проверить partition size diagnostics | CORRECTNESS | qualification | S | G-CORRECT |
-| 1558 | LIN-0878 | [D22](#d22) | Проверить frame evaluation counters | CORRECTNESS | qualification | S | G-CORRECT |
 | 1561 | LIN-0945 | [D24](#d24) | Измерить bounded candidate heaps | PERF | candidate | M | G-PERF |
 | 1562 | LIN-0946 | [D24](#d24) | Измерить score-only cursor path | PERF | candidate | M | G-PERF |
 | 1563 | LIN-0947 | [D24](#d24) | Измерить query-time allocation count | PERF | candidate | M | G-PERF |
 | 1564 | LIN-0948 | [D24](#d24) | Измерить post-filter versus prefilter | PERF | candidate | M | G-PERF |
-| 1565 | LIN-0949 | [D24](#d24) | Добавить snippet highlight offsets | FEATURE | candidate | M | G-FEATURE |
-| 1566 | LIN-0950 | [D24](#d24) | Добавить matched-term explanations | FEATURE | candidate | M | G-FEATURE |
-| 1567 | LIN-0951 | [D24](#d24) | Добавить hit-count estimation policy | FEATURE | candidate | M | G-FEATURE |
-| 1568 | LIN-0952 | [D24](#d24) | Добавить FTS query complexity budget | FEATURE | candidate | M | G-FEATURE |
-| 1569 | LIN-0953 | [D24](#d24) | Проверить query cancellation внутри postings | CORRECTNESS | qualification | S | G-CORRECT |
-| 1573 | LIN-0957 | [D24](#d24) | Добавить query term fanout metrics | FEATURE | candidate | M | G-FEATURE |
-| 1574 | LIN-0958 | [D24](#d24) | Добавить candidate pruning counters | FEATURE | candidate | M | G-FEATURE |
-| 1575 | LIN-0959 | [D24](#d24) | Добавить score distribution diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1576 | LIN-0960 | [D24](#d24) | Добавить FTS slow-query fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1577 | LIN-1025 | [D26](#d26) | Спроектировать deterministic model revision | FEATURE | candidate | L | G-FEATURE |
-| 1579 | LIN-1027 | [D26](#d26) | Спроектировать selective reembedding policy | FEATURE | candidate | L | G-FEATURE |
-| 1580 | LIN-1028 | [D26](#d26) | Спроектировать stale embedding reporting | FEATURE | candidate | L | G-FEATURE |
-| 1581 | LIN-1029 | [D26](#d26) | Проверить malformed custom batch output | CORRECTNESS | qualification | S | G-CORRECT |
-| 1582 | LIN-1030 | [D26](#d26) | Проверить custom embedder panic boundary | CORRECTNESS | qualification | S | G-CORRECT |
-| 1583 | LIN-1031 | [D26](#d26) | Проверить batch output dimension mismatch | CORRECTNESS | qualification | S | G-CORRECT |
-| 1584 | LIN-1032 | [D26](#d26) | Проверить custom embedder ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 1585 | LIN-1033 | [D26](#d26) | Добавить embed text inspection API | FEATURE | candidate | M | G-FEATURE |
-| 1586 | LIN-1034 | [D26](#d26) | Добавить per-model latency metrics | FEATURE | candidate | M | G-FEATURE |
-| 1587 | LIN-1035 | [D26](#d26) | Добавить embedded token count metrics | FEATURE | candidate | M | G-FEATURE |
-| 1588 | LIN-1036 | [D26](#d26) | Добавить model memory accounting | FEATURE | candidate | M | G-FEATURE |
-| 1589 | LIN-1037 | [D26](#d26) | Ограничить embedding text bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 1590 | LIN-1038 | [D26](#d26) | Ограничить embedding batch output bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 1591 | LIN-1039 | [D26](#d26) | Ограничить model initialization latency | CORRECTNESS | qualification | M | G-CORRECT |
-| 1592 | LIN-1040 | [D26](#d26) | Ограничить reembedding transaction size | CORRECTNESS | qualification | M | G-CORRECT |
 | 1593 | LIN-1065 | [D27](#d27) | Спроектировать background ANN rebuild | FEATURE | candidate | L | G-FEATURE |
 | 1594 | LIN-1066 | [D27](#d27) | Спроектировать bounded ANN rebuild memory | FEATURE | candidate | L | G-FEATURE |
 | 1595 | LIN-1067 | [D27](#d27) | Спроектировать ANN generation swaps | FEATURE | candidate | L | G-FEATURE |
-| 1596 | LIN-1068 | [D27](#d27) | Спроектировать ANN persistence version | FEATURE | candidate | L | G-FEATURE |
-| 1597 | LIN-1069 | [D27](#d27) | Проверить ANN concurrent snapshot reads | CORRECTNESS | qualification | L | G-CORRECT |
-| 1599 | LIN-1071 | [D27](#d27) | Проверить ANN checkpoint reopening | CORRECTNESS | qualification | L | G-CORRECT |
-| 1600 | LIN-1072 | [D27](#d27) | Проверить ANN rebuild cancellation | CORRECTNESS | qualification | L | G-CORRECT |
-| 1601 | LIN-1073 | [D27](#d27) | Добавить recall regression fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1602 | LIN-1074 | [D27](#d27) | Добавить ANN traversal counters | FEATURE | candidate | L | G-FEATURE |
-| 1603 | LIN-1075 | [D27](#d27) | Добавить graph disconnectedness diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1604 | LIN-1076 | [D27](#d27) | Добавить search expansion budget | FEATURE | candidate | M | G-FEATURE |
 | 1605 | LIN-1077 | [D27](#d27) | Сравнить HNSW с exact small-N | PERF | candidate | L | G-PERF |
 | 1606 | LIN-1078 | [D27](#d27) | Сравнить graph degree crossover | PERF | candidate | M | G-PERF |
 | 1607 | LIN-1079 | [D27](#d27) | Сравнить quantized/nonquantized candidates | PERF | candidate | M | G-PERF |
@@ -1037,354 +422,71 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 | 1613 | LIN-1109 | [D28](#d28) | Проверить ONNX model output dimensions | CORRECTNESS | qualification | S | G-CORRECT |
 | 1614 | LIN-1110 | [D28](#d28) | Проверить Ollama model output ordering | CORRECTNESS | qualification | S | G-CORRECT |
 | 1615 | LIN-1111 | [D28](#d28) | Проверить remote embedder failure cleanup | CORRECTNESS | qualification | S | G-CORRECT |
-| 1617 | LIN-1113 | [D28](#d28) | Ограничить query vector dimensions | CORRECTNESS | qualification | M | G-CORRECT |
-| 1618 | LIN-1114 | [D28](#d28) | Ограничить candidate reranking bytes | CORRECTNESS | qualification | M | G-CORRECT |
 | 1619 | LIN-1115 | [D28](#d28) | Ограничить neural embedding concurrency | CORRECTNESS | qualification | M | G-CORRECT |
 | 1620 | LIN-1116 | [D28](#d28) | Ограничить embedding RPC timeout | CORRECTNESS | qualification | M | G-CORRECT |
-| 1622 | LIN-1118 | [D28](#d28) | Добавить near-tie score corpus | VERIFY | qualification | S | G-VERIFY |
-| 1623 | LIN-1119 | [D28](#d28) | Добавить cross-platform vector golden tests | FEATURE | candidate | M | G-FEATURE |
-| 1624 | LIN-1120 | [D28](#d28) | Добавить vector cache invalidation diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1632 | LIN-1152 | [D29](#d29) | Добавить device error provenance | FEATURE | candidate | M | G-FEATURE |
-| 1633 | LIN-1153 | [D29](#d29) | Проверить Metal backend conformance | CORRECTNESS | qualification | S | G-CORRECT |
 | 1634 | LIN-1154 | [D29](#d29) | Проверить Vulkan backend conformance | CORRECTNESS | qualification | S | G-CORRECT |
 | 1635 | LIN-1155 | [D29](#d29) | Проверить DX12 backend conformance | CORRECTNESS | qualification | S | G-CORRECT |
-| 1636 | LIN-1156 | [D29](#d29) | Проверить software-adapter labeling | CORRECTNESS | qualification | S | G-CORRECT |
 | 1637 | LIN-1157 | [D29](#d29) | Спроектировать GPU admission control | FEATURE | candidate | L | G-FEATURE |
 | 1638 | LIN-1158 | [D29](#d29) | Спроектировать fair multi-client queue | FEATURE | candidate | L | G-FEATURE |
 | 1639 | LIN-1159 | [D29](#d29) | Спроектировать query cancellation fences | FEATURE | candidate | L | G-FEATURE |
-| 1640 | LIN-1160 | [D29](#d29) | Спроектировать graceful unavailable-device errors | FEATURE | candidate | L | G-FEATURE |
-| 1641 | LIN-1185 | [D30](#d30) | Спроектировать GPU execution capability matrix | FEATURE | candidate | L | G-FEATURE |
-| 1642 | LIN-1186 | [D30](#d30) | Спроектировать explicit numerical tolerance policy | FEATURE | candidate | L | G-FEATURE |
-| 1643 | LIN-1187 | [D30](#d30) | Спроектировать exact-kernel fallback rejection | FEATURE | candidate | L | G-FEATURE |
-| 1644 | LIN-1188 | [D30](#d30) | Спроектировать kernel ABI versioning | FEATURE | candidate | L | G-FEATURE |
-| 1645 | LIN-1189 | [D30](#d30) | Добавить randomized CPU/GPU differential tests | FEATURE | candidate | M | G-FEATURE |
-| 1646 | LIN-1190 | [D30](#d30) | Добавить backend-specific shader corpus | VERIFY | qualification | S | G-VERIFY |
-| 1647 | LIN-1191 | [D30](#d30) | Добавить shader complexity budgets | FEATURE | candidate | M | G-FEATURE |
-| 1648 | LIN-1192 | [D30](#d30) | Добавить shader validation artifact hashes | FEATURE | candidate | M | G-FEATURE |
 | 1649 | LIN-1193 | [D30](#d30) | Измерить small dispatch batching | PERF | candidate | M | G-PERF |
 | 1650 | LIN-1194 | [D30](#d30) | Измерить workgroup size tuning | PERF | candidate | M | G-PERF |
 | 1651 | LIN-1195 | [D30](#d30) | Измерить alignment-aware packed columns | PERF | candidate | M | G-PERF |
 | 1652 | LIN-1196 | [D30](#d30) | Измерить transfer-free scalar result path | PERF | candidate | M | G-PERF |
-| 1653 | LIN-1197 | [D30](#d30) | Проверить partial final workgroups | CORRECTNESS | qualification | S | G-CORRECT |
-| 1654 | LIN-1198 | [D30](#d30) | Проверить zero-size dispatch behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 1655 | LIN-1199 | [D30](#d30) | Проверить one-element kernel behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 1656 | LIN-1200 | [D30](#d30) | Проверить maximum supported dispatch boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 1660 | LIN-1228 | [D31](#d31) | Проверить graph index rebuild consistency | CORRECTNESS | qualification | S | G-CORRECT |
 | 1661 | LIN-1229 | [D31](#d31) | Спроектировать graph snapshot cursors | FEATURE | candidate | L | G-FEATURE |
 | 1662 | LIN-1230 | [D31](#d31) | Спроектировать streaming path results | FEATURE | candidate | L | G-FEATURE |
-| 1663 | LIN-1231 | [D31](#d31) | Спроектировать traversal cancellation points | FEATURE | candidate | L | G-FEATURE |
 | 1664 | LIN-1232 | [D31](#d31) | Спроектировать traversal continuation tokens | FEATURE | candidate | L | G-FEATURE |
-| 1665 | LIN-1233 | [D31](#d31) | Проверить CPU/GPU traversal identity sets | CORRECTNESS | qualification | S | G-CORRECT |
-| 1666 | LIN-1234 | [D31](#d31) | Проверить CPU/GPU traversal ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 1667 | LIN-1235 | [D31](#d31) | Проверить GPU path cap boundary | CORRECTNESS | qualification | S | G-CORRECT |
-| 1668 | LIN-1236 | [D31](#d31) | Проверить mixed collection graph targets | CORRECTNESS | qualification | S | G-CORRECT |
-| 1669 | LIN-1237 | [D31](#d31) | Добавить degree distribution statistics | FEATURE | candidate | M | G-FEATURE |
-| 1670 | LIN-1238 | [D31](#d31) | Добавить graph consistency checker | FEATURE | candidate | M | G-FEATURE |
-| 1671 | LIN-1239 | [D31](#d31) | Добавить traversal expansion metrics | FEATURE | candidate | M | G-FEATURE |
-| 1672 | LIN-1240 | [D31](#d31) | Добавить adversarial graph fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1673 | LIN-1265 | [D32](#d32) | Добавить cold residency diagnostics | FEATURE | candidate | M | G-FEATURE |
-| 1674 | LIN-1266 | [D32](#d32) | Добавить page-fault phase metrics | FEATURE | candidate | M | G-FEATURE |
-| 1675 | LIN-1267 | [D32](#d32) | Добавить cold working-set estimates | FEATURE | candidate | M | G-FEATURE |
-| 1676 | LIN-1268 | [D32](#d32) | Добавить cache eviction reasons | FEATURE | candidate | M | G-FEATURE |
-| 1683 | LIN-1275 | [D32](#d32) | Спроектировать cache purge inspection | FEATURE | candidate | L | G-FEATURE |
 | 1685 | LIN-1277 | [D32](#d32) | Проверить Linux mmap behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 1686 | LIN-1278 | [D32](#d32) | Проверить Darwin mmap behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1687 | LIN-1279 | [D32](#d32) | Проверить Windows mapped-file behavior | CORRECTNESS | qualification | S | G-CORRECT |
 | 1688 | LIN-1280 | [D32](#d32) | Проверить network-backed cold policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1692 | LIN-1308 | [D33](#d33) | Проверить blocking pool shutdown | CORRECTNESS | qualification | S | G-CORRECT |
-| 1693 | LIN-1309 | [D33](#d33) | Спроектировать bounded embedding requests | API | candidate | L | G-API |
-| 1696 | LIN-1312 | [D33](#d33) | Спроектировать async checkpoint API | API | candidate | L | G-API |
-| 1697 | LIN-1313 | [D33](#d33) | Проверить async Send/Sync guarantees | CORRECTNESS | qualification | S | G-CORRECT |
-| 1698 | LIN-1314 | [D33](#d33) | Проверить borrowed input lifetime restrictions | CORRECTNESS | qualification | S | G-CORRECT |
-| 1699 | LIN-1315 | [D33](#d33) | Проверить runtime-independent adapter boundaries | CORRECTNESS | qualification | S | G-CORRECT |
-| 1701 | LIN-1317 | [D33](#d33) | Добавить adversarial slow-consumer tests | API | candidate | M | G-API |
-| 1702 | LIN-1318 | [D33](#d33) | Добавить cancellation race corpus | VERIFY | qualification | S | G-VERIFY |
-| 1703 | LIN-1319 | [D33](#d33) | Добавить queue saturation benchmarks | API | candidate | M | G-API |
-| 1704 | LIN-1320 | [D33](#d33) | Добавить graceful-shutdown integration cases | VERIFY | qualification | S | G-VERIFY |
-| 1705 | LIN-1345 | [D34](#d34) | Спроектировать bounded snapshot history | FEATURE | candidate | L | G-FEATURE |
-| 1706 | LIN-1346 | [D34](#d34) | Спроектировать read transaction handles | FEATURE | candidate | L | G-FEATURE |
-| 1707 | LIN-1347 | [D34](#d34) | Спроектировать snapshot export token | FEATURE | candidate | L | G-FEATURE |
-| 1708 | LIN-1348 | [D34](#d34) | Спроектировать repeatable-read query groups | FEATURE | candidate | L | G-FEATURE |
-| 1709 | LIN-1349 | [D34](#d34) | Проверить lock acquisition ordering | CORRECTNESS | qualification | S | G-CORRECT |
-| 1710 | LIN-1350 | [D34](#d34) | Проверить poisoned lock handling | CORRECTNESS | qualification | S | G-CORRECT |
-| 1711 | LIN-1351 | [D34](#d34) | Проверить concurrent cache invalidation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1712 | LIN-1352 | [D34](#d34) | Проверить shared model initialization | CORRECTNESS | qualification | S | G-CORRECT |
 | 1713 | LIN-1353 | [D34](#d34) | Сравнить RwLock snapshot publication | PERF | candidate | M | G-PERF |
 | 1714 | LIN-1354 | [D34](#d34) | Сравнить atomic Arc publication | PERF | candidate | M | G-PERF |
 | 1715 | LIN-1355 | [D34](#d34) | Сравнить copy-on-write metadata | PERF | candidate | M | G-PERF |
 | 1716 | LIN-1356 | [D34](#d34) | Сравнить per-query borrowed metadata | PERF | candidate | M | G-PERF |
 | 1717 | LIN-1357 | [D34](#d34) | Добавить loom publication models | FEATURE | candidate | M | G-FEATURE |
-| 1718 | LIN-1358 | [D34](#d34) | Добавить deterministic concurrency harness | FEATURE | candidate | M | G-FEATURE |
-| 1719 | LIN-1359 | [D34](#d34) | Добавить linearizability history checks | FEATURE | candidate | M | G-FEATURE |
-| 1720 | LIN-1360 | [D34](#d34) | Добавить contention stress fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1721 | LIN-1385 | [D35](#d35) | Добавить replication lag time metric | FEATURE | candidate | M | G-FEATURE |
-| 1722 | LIN-1386 | [D35](#d35) | Добавить replication lag bytes metric | FEATURE | candidate | M | G-FEATURE |
-| 1723 | LIN-1387 | [D35](#d35) | Добавить handshake failure categories | FEATURE | candidate | M | G-FEATURE |
-| 1724 | LIN-1388 | [D35](#d35) | Добавить reconnect attempt counters | FEATURE | candidate | M | G-FEATURE |
 | 1725 | LIN-1389 | [D35](#d35) | Спроектировать compressed transport negotiation | FEATURE | candidate | L | G-FEATURE |
 | 1726 | LIN-1390 | [D35](#d35) | Спроектировать streamed backup transfer | FEATURE | candidate | L | G-FEATURE |
-| 1727 | LIN-1391 | [D35](#d35) | Спроектировать replication resumable offsets | FEATURE | candidate | L | G-FEATURE |
-| 1728 | LIN-1392 | [D35](#d35) | Спроектировать transport capability negotiation | FEATURE | candidate | L | G-FEATURE |
-| 1729 | LIN-1393 | [D35](#d35) | Проверить cancellation при transfer | CORRECTNESS | qualification | S | G-CORRECT |
-| 1730 | LIN-1394 | [D35](#d35) | Проверить slow follower backpressure | CORRECTNESS | qualification | S | G-CORRECT |
 | 1733 | LIN-1397 | [D35](#d35) | Добавить network fault replay corpus | VERIFY | qualification | S | G-VERIFY |
-| 1735 | LIN-1399 | [D35](#d35) | Добавить transport version compatibility fixtures | VERIFY | qualification | S | G-VERIFY |
 | 1736 | LIN-1400 | [D35](#d35) | Добавить loopback latency benchmarks | FEATURE | candidate | M | G-FEATURE |
-| 1737 | LIN-1425 | [D36](#d36) | Проверить promoted node generation identity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1738 | LIN-1426 | [D36](#d36) | Проверить split-brain prevention contract | CORRECTNESS | qualification | S | G-CORRECT |
-| 1739 | LIN-1427 | [D36](#d36) | Проверить old-primary write rejection | CORRECTNESS | qualification | S | G-CORRECT |
-| 1740 | LIN-1428 | [D36](#d36) | Проверить resync после divergent history | CORRECTNESS | qualification | S | G-CORRECT |
-| 1742 | LIN-1430 | [D36](#d36) | Добавить catch-up ETA uncertainty | FEATURE | candidate | M | G-FEATURE |
-| 1743 | LIN-1431 | [D36](#d36) | Добавить retention pressure metrics | FEATURE | candidate | M | G-FEATURE |
-| 1744 | LIN-1432 | [D36](#d36) | Добавить failed-generation diagnostics | FEATURE | candidate | M | G-FEATURE |
 | 1745 | LIN-1433 | [D36](#d36) | Измерить live-query catch-up impact | PERF | candidate | M | G-PERF |
 | 1746 | LIN-1434 | [D36](#d36) | Измерить replay/index pipeline crossover | PERF | candidate | M | G-PERF |
 | 1747 | LIN-1435 | [D36](#d36) | Измерить batched follower fsync | PERF | candidate | M | G-PERF |
 | 1748 | LIN-1436 | [D36](#d36) | Измерить initial bootstrap RSS | PERF | candidate | M | G-PERF |
 | 1749 | LIN-1437 | [D36](#d36) | Добавить follower chaos scenarios | FEATURE | candidate | M | G-FEATURE |
-| 1751 | LIN-1439 | [D36](#d36) | Добавить reconnect idempotence corpus | VERIFY | qualification | S | G-VERIFY |
-| 1752 | LIN-1440 | [D36](#d36) | Добавить promotion recovery playbook | FEATURE | candidate | M | G-FEATURE |
-| 1753 | LIN-1465 | [D37](#d37) | Проверить query reentrancy rules | CORRECTNESS | qualification | S | G-CORRECT |
-| 1754 | LIN-1466 | [D37](#d37) | Проверить async wrapper parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1755 | LIN-1467 | [D37](#d37) | Проверить ReadDb handle ergonomics | CORRECTNESS | qualification | S | G-CORRECT |
-| 1756 | LIN-1468 | [D37](#d37) | Проверить external embedder ownership | CORRECTNESS | qualification | S | G-CORRECT |
-| 1757 | LIN-1469 | [D37](#d37) | Разделить stable и experimental exports | API | candidate | M | G-API |
-| 1758 | LIN-1470 | [D37](#d37) | Разделить internal/public storage types | API | candidate | M | G-API |
-| 1759 | LIN-1471 | [D37](#d37) | Разделить unsafe extension boundaries | API | candidate | M | G-API |
-| 1760 | LIN-1472 | [D37](#d37) | Разделить backend-specific option types | API | candidate | M | G-API |
-| 1761 | LIN-1473 | [D37](#d37) | Добавить semver compile-test suite | API | candidate | M | G-API |
-| 1762 | LIN-1474 | [D37](#d37) | Добавить downstream allocator coexistence test | API | candidate | M | G-API |
-| 1763 | LIN-1475 | [D37](#d37) | Добавить public API size regression check | API | candidate | M | G-API |
-| 1764 | LIN-1476 | [D37](#d37) | Добавить rustdoc runnable examples | API | candidate | M | G-API |
-| 1765 | LIN-1477 | [D37](#d37) | Спроектировать C ABI feasibility boundary | API | candidate | L | G-API |
-| 1766 | LIN-1478 | [D37](#d37) | Спроектировать Python binding ownership | API | candidate | L | G-API |
-| 1767 | LIN-1479 | [D37](#d37) | Спроектировать WASM storage limitations | API | candidate | L | G-API |
-| 1768 | LIN-1480 | [D37](#d37) | Спроектировать extension provider lifecycle | API | candidate | L | G-API |
-| 1769 | LIN-1505 | [D38](#d38) | Спроектировать transparent newtype mapping | API | candidate | L | G-API |
-| 1770 | LIN-1506 | [D38](#d38) | Спроектировать enum scalar mapping | API | candidate | L | G-API |
-| 1771 | LIN-1507 | [D38](#d38) | Спроектировать decimal mapping policy | API | candidate | L | G-API |
-| 1772 | LIN-1508 | [D38](#d38) | Спроектировать UUID mapping policy | API | candidate | L | G-API |
-| 1773 | LIN-1509 | [D38](#d38) | Добавить compile-fail diagnostic snapshots | VERIFY | qualification | S | G-VERIFY |
-| 1774 | LIN-1510 | [D38](#d38) | Добавить downstream integration examples | API | candidate | M | G-API |
-| 1775 | LIN-1511 | [D38](#d38) | Добавить derive MSRV checks | API | candidate | M | G-API |
-| 1776 | LIN-1512 | [D38](#d38) | Добавить proc-macro expansion size checks | API | candidate | M | G-API |
 | 1777 | LIN-1513 | [D38](#d38) | Измерить typed row decode overhead | PERF | candidate | M | G-PERF |
 | 1778 | LIN-1514 | [D38](#d38) | Измерить derive-generated allocation count | PERF | candidate | M | G-PERF |
 | 1779 | LIN-1515 | [D38](#d38) | Измерить typed batch encode throughput | PERF | candidate | M | G-PERF |
 | 1780 | LIN-1516 | [D38](#d38) | Измерить schema descriptor reuse | PERF | candidate | M | G-PERF |
-| 1781 | LIN-1517 | [D38](#d38) | Проверить typed/raw roundtrip values | CORRECTNESS | qualification | S | G-CORRECT |
-| 1782 | LIN-1518 | [D38](#d38) | Проверить typed/null schema compatibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 1783 | LIN-1519 | [D38](#d38) | Проверить typed query schema drift | CORRECTNESS | qualification | S | G-CORRECT |
-| 1784 | LIN-1520 | [D38](#d38) | Проверить typed error field provenance | CORRECTNESS | qualification | S | G-CORRECT |
-| 1785 | LIN-1545 | [D39](#d39) | Улучшить backup CLI progress | API | candidate | M | G-API |
-| 1786 | LIN-1546 | [D39](#d39) | Улучшить follower CLI status | API | candidate | M | G-API |
-| 1787 | LIN-1547 | [D39](#d39) | Улучшить checkpoint CLI status | API | candidate | M | G-API |
-| 1788 | LIN-1548 | [D39](#d39) | Улучшить recover CLI guidance | API | candidate | M | G-API |
-| 1789 | LIN-1549 | [D39](#d39) | Добавить stable statistics schema | API | candidate | M | G-API |
-| 1790 | LIN-1550 | [D39](#d39) | Добавить version capability output | API | candidate | M | G-API |
-| 1791 | LIN-1551 | [D39](#d39) | Добавить feature availability output | API | candidate | M | G-API |
-| 1792 | LIN-1552 | [D39](#d39) | Добавить endpoint redaction in errors | API | candidate | M | G-API |
-| 1793 | LIN-1553 | [D39](#d39) | Проверить shell quoting examples | CORRECTNESS | qualification | S | G-CORRECT |
-| 1794 | LIN-1554 | [D39](#d39) | Проверить Unicode terminal output | CORRECTNESS | qualification | S | G-CORRECT |
 | 1795 | LIN-1555 | [D39](#d39) | Проверить Windows path arguments | CORRECTNESS | qualification | S | G-CORRECT |
-| 1796 | LIN-1556 | [D39](#d39) | Проверить symlink data directory policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1797 | LIN-1557 | [D39](#d39) | Добавить CLI smoke fixture packs | API | candidate | M | G-API |
-| 1798 | LIN-1558 | [D39](#d39) | Добавить CLI JSON schema validation | API | candidate | M | G-API |
-| 1799 | LIN-1559 | [D39](#d39) | Добавить CLI backwards compatibility checks | API | candidate | M | G-API |
-| 1800 | LIN-1560 | [D39](#d39) | Добавить completion generation command | API | candidate | M | G-API |
-| 1801 | LIN-1585 | [D40](#d40) | Спроектировать structured warning channel | FEATURE | candidate | L | G-FEATURE |
-| 1802 | LIN-1586 | [D40](#d40) | Спроектировать warning severity policy | FEATURE | candidate | L | G-FEATURE |
-| 1803 | LIN-1587 | [D40](#d40) | Спроектировать warning suppression scopes | FEATURE | candidate | L | G-FEATURE |
-| 1804 | LIN-1588 | [D40](#d40) | Спроектировать warning aggregation budget | FEATURE | candidate | L | G-FEATURE |
-| 1805 | LIN-1589 | [D40](#d40) | Добавить error-code compatibility corpus | VERIFY | qualification | S | G-VERIFY |
-| 1806 | LIN-1590 | [D40](#d40) | Добавить parser diagnostic golden corpus | VERIFY | qualification | S | G-VERIFY |
-| 1807 | LIN-1591 | [D40](#d40) | Добавить storage diagnostic golden corpus | VERIFY | qualification | S | G-VERIFY |
-| 1808 | LIN-1592 | [D40](#d40) | Добавить replication diagnostic golden corpus | VERIFY | qualification | S | G-VERIFY |
 | 1809 | LIN-1593 | [D40](#d40) | Измерить cold error path allocation | PERF | candidate | M | G-PERF |
 | 1810 | LIN-1594 | [D40](#d40) | Измерить success-path diagnostic overhead | PERF | candidate | M | G-PERF |
 | 1811 | LIN-1595 | [D40](#d40) | Измерить verbose trace opt-in cost | PERF | candidate | M | G-PERF |
 | 1812 | LIN-1596 | [D40](#d40) | Измерить batch error aggregation cost | PERF | candidate | M | G-PERF |
-| 1813 | LIN-1597 | [D40](#d40) | Проверить CLI/library error parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1814 | LIN-1598 | [D40](#d40) | Проверить async/library error parity | CORRECTNESS | qualification | S | G-CORRECT |
-| 1815 | LIN-1599 | [D40](#d40) | Проверить GPU/CPU error classification | CORRECTNESS | qualification | S | G-CORRECT |
-| 1816 | LIN-1600 | [D40](#d40) | Проверить retryability error classification | CORRECTNESS | qualification | S | G-CORRECT |
-| 1817 | LIN-1625 | [D41](#d41) | Добавить replica reconnect metrics | OPS | candidate | M | G-OPS |
-| 1818 | LIN-1626 | [D41](#d41) | Добавить stale snapshot metrics | OPS | candidate | M | G-OPS |
-| 1819 | LIN-1627 | [D41](#d41) | Добавить embedding failure metrics | OPS | candidate | M | G-OPS |
-| 1820 | LIN-1628 | [D41](#d41) | Добавить compaction pause metrics | OPS | candidate | M | G-OPS |
-| 1821 | LIN-1629 | [D41](#d41) | Спроектировать health status snapshot | OPS | candidate | L | G-OPS |
-| 1822 | LIN-1630 | [D41](#d41) | Спроектировать readiness status semantics | OPS | candidate | L | G-OPS |
-| 1823 | LIN-1631 | [D41](#d41) | Спроектировать per-collection statistics export | OPS | candidate | L | G-OPS |
-| 1824 | LIN-1632 | [D41](#d41) | Спроектировать resettable diagnostic counters | OPS | candidate | L | G-OPS |
-| 1825 | LIN-1633 | [D41](#d41) | Проверить telemetry during panic unwind | CORRECTNESS | qualification | S | G-CORRECT |
-| 1826 | LIN-1634 | [D41](#d41) | Проверить concurrent counter consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1827 | LIN-1635 | [D41](#d41) | Проверить metrics sink failure isolation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1828 | LIN-1636 | [D41](#d41) | Проверить instrumentation after shutdown | CORRECTNESS | qualification | S | G-CORRECT |
-| 1829 | LIN-1637 | [D41](#d41) | Добавить observability schema version | OPS | candidate | M | G-OPS |
-| 1830 | LIN-1638 | [D41](#d41) | Добавить telemetry integration fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1831 | LIN-1639 | [D41](#d41) | Добавить profiler command cookbook | OPS | candidate | M | G-OPS |
-| 1832 | LIN-1640 | [D41](#d41) | Добавить trace-to-benchmark provenance links | OPS | candidate | M | G-OPS |
-| 1833 | LIN-1665 | [D42](#d42) | Спроектировать seeded replayable fuzz runs | VERIFY | qualification | L | G-VERIFY |
-| 1834 | LIN-1666 | [D42](#d42) | Спроектировать persisted failure corpus | VERIFY | qualification | L | G-VERIFY |
-| 1835 | LIN-1667 | [D42](#d42) | Спроектировать cross-platform corpus exchange | VERIFY | qualification | L | G-VERIFY |
-| 1836 | LIN-1668 | [D42](#d42) | Спроектировать minimized-case metadata | VERIFY | qualification | L | G-VERIFY |
-| 1837 | LIN-1669 | [D42](#d42) | Добавить libFuzzer parser target | VERIFY | qualification | S | G-VERIFY |
-| 1838 | LIN-1670 | [D42](#d42) | Добавить libFuzzer WAL target | VERIFY | qualification | S | G-VERIFY |
-| 1839 | LIN-1671 | [D42](#d42) | Добавить libFuzzer snapshot target | VERIFY | qualification | S | G-VERIFY |
-| 1840 | LIN-1672 | [D42](#d42) | Добавить libFuzzer replication target | VERIFY | qualification | S | G-VERIFY |
-| 1841 | LIN-1673 | [D42](#d42) | Ограничить fuzz resource usage | VERIFY | qualification | S | G-VERIFY |
-| 1842 | LIN-1674 | [D42](#d42) | Исключить flaky time assertions | VERIFY | qualification | S | G-VERIFY |
-| 1843 | LIN-1675 | [D42](#d42) | Выявлять order-dependent tests | VERIFY | qualification | S | G-VERIFY |
-| 1844 | LIN-1676 | [D42](#d42) | Проверять cleanup после injected errors | VERIFY | qualification | S | G-VERIFY |
-| 1845 | LIN-1677 | [D42](#d42) | Добавить coverage-gap reporting | VERIFY | qualification | S | G-VERIFY |
-| 1846 | LIN-1678 | [D42](#d42) | Добавить corpus retention policy | VERIFY | qualification | S | G-VERIFY |
-| 1847 | LIN-1679 | [D42](#d42) | Добавить deterministic test clock | VERIFY | qualification | S | G-VERIFY |
-| 1848 | LIN-1680 | [D42](#d42) | Добавить deterministic test RNG injection | VERIFY | qualification | S | G-VERIFY |
 | 1849 | LIN-1705 | [D43](#d43) | Спроектировать pluggable filesystem shim | VERIFY | qualification | L | G-VERIFY |
-| 1850 | LIN-1706 | [D43](#d43) | Спроектировать deterministic I/O fault schedule | VERIFY | qualification | L | G-VERIFY |
 | 1851 | LIN-1707 | [D43](#d43) | Спроектировать crash subprocess harness | VERIFY | qualification | L | G-VERIFY |
-| 1852 | LIN-1708 | [D43](#d43) | Спроектировать durable oracle journal | VERIFY | qualification | L | G-VERIFY |
-| 1853 | LIN-1709 | [D43](#d43) | Проверить short write всех frame segments | VERIFY | qualification | S | G-VERIFY |
 | 1854 | LIN-1710 | [D43](#d43) | Проверить sync failure на group commit | VERIFY | qualification | S | G-VERIFY |
-| 1855 | LIN-1711 | [D43](#d43) | Проверить interrupted temp-file cleanup | VERIFY | qualification | S | G-VERIFY |
 | 1856 | LIN-1712 | [D43](#d43) | Проверить failed directory sync recovery | VERIFY | qualification | S | G-VERIFY |
-| 1857 | LIN-1713 | [D43](#d43) | Добавить power-loss simulation scenarios | VERIFY | qualification | S | G-VERIFY |
-| 1858 | LIN-1714 | [D43](#d43) | Добавить checkpoint chaos matrix | VERIFY | qualification | S | G-VERIFY |
 | 1859 | LIN-1715 | [D43](#d43) | Добавить replication chaos matrix | VERIFY | qualification | S | G-VERIFY |
 | 1860 | LIN-1716 | [D43](#d43) | Добавить cross-version crash fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1861 | LIN-1717 | [D43](#d43) | Сохранять fault schedule artifacts | VERIFY | qualification | S | G-VERIFY |
-| 1862 | LIN-1718 | [D43](#d43) | Сохранять failed frame hexdumps | VERIFY | qualification | S | G-VERIFY |
-| 1863 | LIN-1719 | [D43](#d43) | Сохранять recovery decision logs | VERIFY | qualification | S | G-VERIFY |
-| 1864 | LIN-1720 | [D43](#d43) | Сохранять minimized crash reproducers | VERIFY | qualification | S | G-VERIFY |
-| 1865 | LIN-1745 | [D44](#d44) | Проверять fixture cleanup in CI | OPS | candidate | M | G-OPS |
-| 1866 | LIN-1746 | [D44](#d44) | Проверять orphan child processes | OPS | candidate | M | G-OPS |
-| 1867 | LIN-1747 | [D44](#d44) | Проверять hanging test time budgets | OPS | candidate | M | G-OPS |
-| 1868 | LIN-1748 | [D44](#d44) | Проверять artifact schema compatibility | OPS | candidate | M | G-OPS |
-| 1869 | LIN-1749 | [D44](#d44) | Добавить Miri safe-core job | OPS | candidate | M | G-OPS |
-| 1870 | LIN-1750 | [D44](#d44) | Добавить sanitizer memory job | OPS | candidate | M | G-OPS |
-| 1871 | LIN-1751 | [D44](#d44) | Добавить fuzz smoke job | VERIFY | qualification | S | G-VERIFY |
-| 1872 | LIN-1752 | [D44](#d44) | Добавить cargo audit policy review | OPS | candidate | M | G-OPS |
-| 1873 | LIN-1753 | [D44](#d44) | Ограничить CI concurrency interference | CORRECTNESS | qualification | M | G-CORRECT |
-| 1874 | LIN-1754 | [D44](#d44) | Кэшировать bundled peer build correctly | OPS | candidate | M | G-OPS |
-| 1875 | LIN-1755 | [D44](#d44) | Проверять reproducible release build | OPS | candidate | M | G-OPS |
-| 1876 | LIN-1756 | [D44](#d44) | Проверять clean-checkout test execution | OPS | candidate | M | G-OPS |
-| 1877 | LIN-1757 | [D44](#d44) | Добавить regression bisect command | OPS | candidate | M | G-OPS |
-| 1878 | LIN-1758 | [D44](#d44) | Добавить stale baseline detection | OPS | candidate | M | G-OPS |
-| 1879 | LIN-1759 | [D44](#d44) | Добавить platform support badges evidence | OPS | candidate | M | G-OPS |
-| 1880 | LIN-1760 | [D44](#d44) | Добавить skipped-test reason reporting | OPS | candidate | M | G-OPS |
-| 1881 | LIN-1785 | [D45](#d45) | Добавить resource-limit receipts | FEATURE | candidate | M | G-FEATURE |
-| 1882 | LIN-1786 | [D45](#d45) | Добавить deny-by-default unsafe operations | FEATURE | candidate | M | G-FEATURE |
-| 1883 | LIN-1787 | [D45](#d45) | Добавить explicit network model permissions | FEATURE | candidate | M | G-FEATURE |
-| 1884 | LIN-1788 | [D45](#d45) | Добавить import file-root restrictions | FEATURE | candidate | M | G-FEATURE |
-| 1885 | LIN-1789 | [D45](#d45) | Проверить C ABI pointer validation design | CORRECTNESS | qualification | S | G-CORRECT |
-| 1889 | LIN-1793 | [D45](#d45) | Добавить security regression corpus | VERIFY | qualification | S | G-VERIFY |
-| 1890 | LIN-1794 | [D45](#d45) | Добавить responsible disclosure guidance | FEATURE | candidate | M | G-FEATURE |
-| 1891 | LIN-1795 | [D45](#d45) | Добавить dependency provenance inventory | FEATURE | candidate | M | G-FEATURE |
-| 1892 | LIN-1796 | [D45](#d45) | Добавить offline execution qualification | FEATURE | candidate | M | G-FEATURE |
-| 1897 | LIN-1825 | [D46](#d46) | Проверить unknown catalog versions | CORRECTNESS | qualification | S | G-CORRECT |
-| 1898 | LIN-1826 | [D46](#d46) | Проверить duplicate collection declarations | CORRECTNESS | qualification | S | G-CORRECT |
-| 1899 | LIN-1827 | [D46](#d46) | Проверить reserved field policy | CORRECTNESS | qualification | S | G-CORRECT |
-| 1900 | LIN-1828 | [D46](#d46) | Проверить cyclic schema references | CORRECTNESS | qualification | S | G-CORRECT |
 | 1901 | LIN-1829 | [D46](#d46) | Измерить catalog clone footprint | PERF | candidate | M | G-PERF |
 | 1902 | LIN-1830 | [D46](#d46) | Измерить interned catalog identifiers | PERF | candidate | M | G-PERF |
 | 1903 | LIN-1831 | [D46](#d46) | Измерить schema lookup cache | PERF | candidate | M | G-PERF |
 | 1904 | LIN-1832 | [D46](#d46) | Измерить prepared schema invalidation | PERF | candidate | M | G-PERF |
-| 1905 | LIN-1833 | [D46](#d46) | Проверить catalog replay consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1906 | LIN-1834 | [D46](#d46) | Проверить catalog snapshot roundtrip | CORRECTNESS | qualification | S | G-CORRECT |
-| 1907 | LIN-1835 | [D46](#d46) | Проверить catalog follower propagation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1908 | LIN-1836 | [D46](#d46) | Проверить catalog rollback consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1909 | LIN-1837 | [D46](#d46) | Добавить migration fixture archive | FEATURE | candidate | M | G-FEATURE |
-| 1910 | LIN-1838 | [D46](#d46) | Добавить downgrade feasibility report | FEATURE | candidate | M | G-FEATURE |
-| 1911 | LIN-1839 | [D46](#d46) | Добавить irreversible migration labels | FEATURE | candidate | M | G-FEATURE |
-| 1912 | LIN-1840 | [D46](#d46) | Добавить schema evolution compatibility matrix | FEATURE | candidate | L | G-FEATURE |
-| 1913 | LIN-1865 | [D47](#d47) | Спроектировать resumable import offsets | FEATURE | candidate | L | G-FEATURE |
-| 1914 | LIN-1866 | [D47](#d47) | Спроектировать atomic import batches | FEATURE | candidate | L | G-FEATURE |
-| 1915 | LIN-1867 | [D47](#d47) | Спроектировать idempotent import identities | FEATURE | candidate | L | G-FEATURE |
-| 1916 | LIN-1868 | [D47](#d47) | Спроектировать deterministic export ordering | FEATURE | candidate | L | G-FEATURE |
-| 1917 | LIN-1869 | [D47](#d47) | Ограничить import row bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 1918 | LIN-1870 | [D47](#d47) | Ограничить import nesting depth | CORRECTNESS | qualification | M | G-CORRECT |
-| 1919 | LIN-1871 | [D47](#d47) | Ограничить import decompressed bytes | CORRECTNESS | qualification | M | G-CORRECT |
-| 1920 | LIN-1872 | [D47](#d47) | Ограничить import queued batches | CORRECTNESS | qualification | M | G-CORRECT |
 | 1921 | LIN-1873 | [D47](#d47) | Измерить columnar import throughput | PERF | candidate | M | G-PERF |
 | 1922 | LIN-1874 | [D47](#d47) | Измерить CSV parser allocation | PERF | candidate | M | G-PERF |
 | 1923 | LIN-1875 | [D47](#d47) | Измерить large export memory bound | PERF | candidate | M | G-PERF |
 | 1924 | LIN-1876 | [D47](#d47) | Измерить import index maintenance cost | PERF | candidate | M | G-PERF |
-| 1925 | LIN-1877 | [D47](#d47) | Добавить peer dataset exchange fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1926 | LIN-1878 | [D47](#d47) | Добавить format roundtrip fixtures | VERIFY | qualification | S | G-VERIFY |
-| 1927 | LIN-1879 | [D47](#d47) | Добавить cross-version logical export checks | FEATURE | candidate | M | G-FEATURE |
-| 1928 | LIN-1880 | [D47](#d47) | Добавить import provenance manifest | FEATURE | candidate | M | G-FEATURE |
 | 1929 | LIN-1905 | [D48](#d48) | Измерить open/close churn | PERF | candidate | M | G-PERF |
 | 1930 | LIN-1906 | [D48](#d48) | Измерить long-running RSS growth | PERF | candidate | M | G-PERF |
 | 1931 | LIN-1907 | [D48](#d48) | Измерить repeated checkpoint fragmentation | PERF | candidate | M | G-PERF |
 | 1932 | LIN-1908 | [D48](#d48) | Измерить repeated replica reconnect leakage | PERF | candidate | M | G-PERF |
-| 1933 | LIN-1909 | [D48](#d48) | Добавить config effective-value report | OPS | candidate | M | G-OPS |
-| 1934 | LIN-1910 | [D48](#d48) | Добавить config validation command | OPS | candidate | M | G-OPS |
-| 1935 | LIN-1911 | [D48](#d48) | Добавить config schema version | OPS | candidate | M | G-OPS |
-| 1936 | LIN-1912 | [D48](#d48) | Добавить environment override provenance | OPS | candidate | M | G-OPS |
-| 1937 | LIN-1913 | [D48](#d48) | Создать disk-full runbook | OPS | candidate | M | G-OPS |
-| 1938 | LIN-1914 | [D48](#d48) | Создать corruption investigation runbook | OPS | candidate | M | G-OPS |
-| 1939 | LIN-1915 | [D48](#d48) | Создать follower lag runbook | OPS | candidate | M | G-OPS |
-| 1940 | LIN-1916 | [D48](#d48) | Создать safe upgrade runbook | OPS | candidate | M | G-OPS |
-| 1941 | LIN-1917 | [D48](#d48) | Проверить system suspend/resume behavior | CORRECTNESS | qualification | S | G-CORRECT |
-| 1942 | LIN-1918 | [D48](#d48) | Проверить clock discontinuity handling | CORRECTNESS | qualification | S | G-CORRECT |
-| 1943 | LIN-1919 | [D48](#d48) | Проверить timezone-independent storage | CORRECTNESS | qualification | S | G-CORRECT |
-| 1944 | LIN-1920 | [D48](#d48) | Проверить crash-after-shutdown-request recovery | CORRECTNESS | qualification | S | G-CORRECT |
-| 1945 | LIN-1933 | [D49](#d49) | Проверить cross-compilation target matrix | CORRECTNESS | qualification | S | G-CORRECT |
-| 1946 | LIN-1934 | [D49](#d49) | Проверить libc/platform conditional imports | CORRECTNESS | qualification | S | G-CORRECT |
-| 1947 | LIN-1935 | [D49](#d49) | Проверить optional compression isolation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1948 | LIN-1936 | [D49](#d49) | Проверить optional neural backend isolation | CORRECTNESS | qualification | S | G-CORRECT |
 | 1949 | LIN-1937 | [D49](#d49) | Измерить binary size sections | PERF | candidate | M | G-PERF |
 | 1950 | LIN-1938 | [D49](#d49) | Измерить LTO variants | PERF | candidate | M | G-PERF |
 | 1951 | LIN-1939 | [D49](#d49) | Измерить codegen-units variants | PERF | candidate | M | G-PERF |
 | 1952 | LIN-1940 | [D49](#d49) | Измерить PGO workload sensitivity | PERF | candidate | M | G-PERF |
-| 1953 | LIN-1941 | [D49](#d49) | Проверить reproducible artifact hashes | CORRECTNESS | qualification | S | G-CORRECT |
-| 1954 | LIN-1942 | [D49](#d49) | Проверить release debug-symbol separation | CORRECTNESS | qualification | S | G-CORRECT |
-| 1955 | LIN-1943 | [D49](#d49) | Проверить source archive completeness | CORRECTNESS | qualification | S | G-CORRECT |
-| 1956 | LIN-1944 | [D49](#d49) | Проверить cargo package contents | CORRECTNESS | qualification | S | G-CORRECT |
-| 1957 | LIN-1945 | [D49](#d49) | Добавить signed release manifest | OPS | candidate | M | G-OPS |
-| 1958 | LIN-1946 | [D49](#d49) | Добавить SBOM generation | OPS | candidate | M | G-OPS |
-| 1959 | LIN-1947 | [D49](#d49) | Добавить build provenance receipts | OPS | candidate | M | G-OPS |
-| 1960 | LIN-1948 | [D49](#d49) | Добавить checksum verification instructions | OPS | candidate | M | G-OPS |
 | 1961 | LIN-1949 | [D49](#d49) | Спроектировать native Python wheel matrix | OPS | candidate | L | G-OPS |
 | 1962 | LIN-1950 | [D49](#d49) | Спроектировать C library packaging | OPS | candidate | L | G-OPS |
 | 1963 | LIN-1951 | [D49](#d49) | Спроектировать WASM package split | OPS | candidate | L | G-OPS |
-| 1964 | LIN-1952 | [D49](#d49) | Спроектировать static linking support policy | OPS | candidate | L | G-OPS |
-| 1965 | LIN-1953 | [D49](#d49) | Проверить downstream global allocator compatibility | CORRECTNESS | qualification | S | G-CORRECT |
-| 1966 | LIN-1954 | [D49](#d49) | Проверить target CPU feature portability | CORRECTNESS | qualification | S | G-CORRECT |
-| 1967 | LIN-1955 | [D49](#d49) | Проверить runtime SIMD dispatch gates | CORRECTNESS | qualification | S | G-CORRECT |
-| 1968 | LIN-1956 | [D49](#d49) | Проверить compile-time cfg consistency | CORRECTNESS | qualification | S | G-CORRECT |
-| 1969 | LIN-1957 | [D49](#d49) | Добавить clean-room installation smoke | OPS | candidate | M | G-OPS |
-| 1970 | LIN-1958 | [D49](#d49) | Добавить offline dependency build guide | OPS | candidate | M | G-OPS |
-| 1971 | LIN-1959 | [D49](#d49) | Добавить toolchain rollback procedure | OPS | candidate | M | G-OPS |
-| 1972 | LIN-1960 | [D49](#d49) | Добавить release regression checklist | OPS | candidate | M | G-OPS |
-| 1973 | LIN-1973 | [D50](#d50) | Создать benchmark interpretation guide | DOC | candidate | S | G-DOC |
-| 1974 | LIN-1974 | [D50](#d50) | Создать matched-peer fixture guide | DOC | candidate | S | G-DOC |
-| 1975 | LIN-1975 | [D50](#d50) | Создать raw artifact navigation | DOC | candidate | S | G-DOC |
-| 1976 | LIN-1976 | [D50](#d50) | Создать current performance gap dashboard | DOC | candidate | S | G-DOC |
-| 1977 | LIN-1977 | [D50](#d50) | Создать query migration cookbook | DOC | candidate | S | G-DOC |
-| 1978 | LIN-1978 | [D50](#d50) | Создать schema migration cookbook | DOC | candidate | S | G-DOC |
-| 1979 | LIN-1979 | [D50](#d50) | Создать embedding migration cookbook | DOC | candidate | S | G-DOC |
-| 1980 | LIN-1980 | [D50](#d50) | Создать backup migration cookbook | DOC | candidate | S | G-DOC |
-| 1981 | LIN-1981 | [D50](#d50) | Описать memory ownership API | DOC | candidate | S | G-DOC |
-| 1982 | LIN-1982 | [D50](#d50) | Описать cancellation behavior API | DOC | candidate | S | G-DOC |
-| 1983 | LIN-1983 | [D50](#d50) | Описать async thread usage | DOC | candidate | S | G-DOC |
-| 1984 | LIN-1984 | [D50](#d50) | Описать cursor snapshot semantics | DOC | candidate | S | G-DOC |
-| 1985 | LIN-1985 | [D50](#d50) | Добавить runnable ingestion examples | DOC | candidate | S | G-DOC |
-| 1986 | LIN-1986 | [D50](#d50) | Добавить runnable analytics examples | DOC | candidate | S | G-DOC |
-| 1987 | LIN-1987 | [D50](#d50) | Добавить runnable graph examples | DOC | candidate | S | G-DOC |
-| 1988 | LIN-1988 | [D50](#d50) | Добавить runnable hybrid-search examples | DOC | candidate | S | G-DOC |
-| 1989 | LIN-1989 | [D50](#d50) | Описать optional backend requirements | DOC | candidate | S | G-DOC |
-| 1990 | LIN-1990 | [D50](#d50) | Описать dedicated benchmark server setup | DOC | candidate | S | G-DOC |
-| 1991 | LIN-1991 | [D50](#d50) | Описать air-gapped deployment | DOC | candidate | S | G-DOC |
-| 1992 | LIN-1992 | [D50](#d50) | Описать resource sizing methodology | DOC | candidate | S | G-DOC |
-| 1993 | LIN-1993 | [D50](#d50) | Связать roadmap items с evidence | DOC | candidate | S | G-DOC |
-| 1994 | LIN-1994 | [D50](#d50) | Связать fixed defects с regressions | DOC | candidate | S | G-DOC |
-| 1995 | LIN-1995 | [D50](#d50) | Связать releases с benchmark sources | DOC | candidate | S | G-DOC |
-| 1996 | LIN-1996 | [D50](#d50) | Связать claims с validation scope | DOC | candidate | S | G-DOC |
-| 1997 | LIN-1997 | [D50](#d50) | Ввести roadmap triage policy | DOC | candidate | S | G-DOC |
-| 1998 | LIN-1998 | [D50](#d50) | Ввести rejected-experiment registry | DOC | candidate | S | G-DOC |
-| 1999 | LIN-1999 | [D50](#d50) | Ввести architecture decision records | DOC | candidate | S | G-DOC |
-| 2000 | LIN-2000 | [D50](#d50) | Ввести completion evidence checklist | DOC | candidate | S | G-DOC |
 
 ### Области и привязка к коду
 
@@ -1392,200 +494,200 @@ ID `LIN-xxxx` и `Rank` стабильны и не перенумеровыва�
 
 <a id="d01"></a>
 
-**D01. Бенчмарки и доказательства** — открыто 29 из 40. Модули: [benches/compare.rs](../benches/compare.rs), [scripts/bench-peers.py](../scripts/bench-peers.py), [docs/benchmark-contract.md](../docs/benchmark-contract.md).
+**D01. Бенчмарки и доказательства** — открыто 27 из 40. Модули: [benches/compare.rs](../benches/compare.rs), [scripts/bench-peers.py](../scripts/bench-peers.py), [docs/benchmark-contract.md](../docs/benchmark-contract.md).
 
 <a id="d02"></a>
 
-**D02. Формат WAL и checksum** — открыто 10 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01).
+**D02. Формат WAL и checksum** — открыто 4 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/crc.rs](../src/crc.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01).
 
 <a id="d03"></a>
 
-**D03. Durable I/O и sync** — открыто 23 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
+**D03. Durable I/O и sync** — открыто 15 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D01](#d01), [D02](#d02).
 
 <a id="d04"></a>
 
-**D04. Replay и восстановление** — открыто 11 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D03](#d03).
+**D04. Replay и восстановление** — открыто 4 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D03](#d03).
 
 <a id="d05"></a>
 
-**D05. Snapshot и checkpoint** — открыто 21 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/disk/mod.rs](../src/disk/mod.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
+**D05. Snapshot и checkpoint** — открыто 6 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/disk/mod.rs](../src/disk/mod.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
 <a id="d06"></a>
 
-**D06. Транзакции и atomicity** — открыто 7 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D02](#d02), [D04](#d04).
+**D06. Транзакции и atomicity** — открыто 2 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D02](#d02), [D04](#d04).
 
 <a id="d07"></a>
 
-**D07. Mutations и bulk ingestion** — открыто 18 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D06](#d06), [D08](#d08), [D10](#d10).
+**D07. Mutations и bulk ingestion** — открыто 12 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D06](#d06), [D08](#d08), [D10](#d10).
 
 <a id="d08"></a>
 
-**D08. Cell и строковое представление** — открыто 16 из 40. Модули: [src/store/mod.rs](../src/store/mod.rs), [src/row.rs](../src/row.rs), [src/ast.rs](../src/ast.rs). Контекст: [D01](#d01).
+**D08. Cell и строковое представление** — открыто 15 из 40. Модули: [src/store/mod.rs](../src/store/mod.rs), [src/row.rs](../src/row.rs), [src/ast.rs](../src/ast.rs). Контекст: [D01](#d01).
 
 <a id="d09"></a>
 
-**D09. Владение и пулы памяти** — открыто 24 из 40. Модули: [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D08](#d08).
+**D09. Владение и пулы памяти** — открыто 19 из 40. Модули: [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D08](#d08).
 
 <a id="d10"></a>
 
-**D10. Scalar indexes** — открыто 22 из 40. Модули: [src/index.rs](../src/index.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D11](#d11).
+**D10. Scalar indexes** — открыто 14 из 40. Модули: [src/index.rs](../src/index.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D11](#d11).
 
 <a id="d11"></a>
 
-**D11. Ограничения и числовые ключи** — открыто 13 из 40. Модули: [src/index.rs](../src/index.rs), [src/check.rs](../src/check.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D08](#d08), [D13](#d13).
+**D11. Ограничения и числовые ключи** — открыто 6 из 40. Модули: [src/index.rs](../src/index.rs), [src/check.rs](../src/check.rs), [tests/exec.rs](../tests/exec.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d12"></a>
 
-**D12. Парсер и синтаксис** — открыто 22 из 40. Модули: [src/parse.rs](../src/parse.rs), [src/ast.rs](../src/ast.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D13](#d13).
+**D12. Парсер и синтаксис** — открыто 6 из 40. Модули: [src/parse.rs](../src/parse.rs), [src/ast.rs](../src/ast.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D13](#d13).
 
 <a id="d13"></a>
 
-**D13. Type checking и semantics** — открыто 22 из 40. Модули: [src/check.rs](../src/check.rs), [src/catalog.rs](../src/catalog.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D08](#d08), [D46](#d46).
+**D13. Type checking и semantics** — открыто 7 из 40. Модули: [src/check.rs](../src/check.rs), [src/catalog.rs](../src/catalog.rs), [tests/lang.rs](../tests/lang.rs). Контекст: [D08](#d08), [D46](#d46).
 
 <a id="d14"></a>
 
-**D14. Логический planner** — открыто 21 из 40. Модули: [src/plan.rs](../src/plan.rs), [src/explain.rs](../src/explain.rs), [tests/query.rs](../tests/query.rs). Контекст: [D13](#d13).
+**D14. Логический planner** — открыто 2 из 40. Модули: [src/plan.rs](../src/plan.rs), [src/explain.rs](../src/explain.rs), [tests/query.rs](../tests/query.rs). Контекст: [D13](#d13).
 
 <a id="d15"></a>
 
-**D15. Статистика и cost model** — открыто 39 из 40. Модули: [src/plan.rs](../src/plan.rs), [src/catalog.rs](../src/catalog.rs), [src/index.rs](../src/index.rs). Контекст: [D14](#d14), [D10](#d10).
+**D15. Статистика и cost model** — открыто 0 из 40. Модули: [src/plan.rs](../src/plan.rs), [src/catalog.rs](../src/catalog.rs), [src/index.rs](../src/index.rs). Контекст: [D14](#d14), [D10](#d10).
 
 <a id="d16"></a>
 
-**D16. Execution pipeline** — открыто 32 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). Контекст: [D13](#d13), [D14](#d14).
+**D16. Execution pipeline** — открыто 16 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). Контекст: [D13](#d13), [D14](#d14).
 
 <a id="d17"></a>
 
-**D17. Cursors и streaming** — открыто 27 из 40. Модули: [src/cursor.rs](../src/cursor.rs), [src/query.rs](../src/query.rs), [src/async_db.rs](../src/async_db.rs). Контекст: [D16](#d16), [D34](#d34).
+**D17. Cursors и streaming** — открыто 8 из 40. Модули: [src/cursor.rs](../src/cursor.rs), [src/query.rs](../src/query.rs), [src/async_db.rs](../src/async_db.rs). Контекст: [D16](#d16), [D34](#d34).
 
 <a id="d18"></a>
 
-**D18. Колонки и RecordBatch** — открыто 21 из 40. Модули: [src/batch.rs](../src/batch.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). Контекст: [D08](#d08).
+**D18. Колонки и RecordBatch** — открыто 9 из 40. Модули: [src/batch.rs](../src/batch.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). Контекст: [D08](#d08).
 
 <a id="d19"></a>
 
-**D19. Aggregations и GROUP BY** — открыто 11 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D13](#d13).
+**D19. Aggregations и GROUP BY** — открыто 5 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d20"></a>
 
-**D20. Sorting и Top-K** — открыто 25 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/store/mod.rs](../src/store/mod.rs). Контекст: [D08](#d08), [D13](#d13).
+**D20. Sorting и Top-K** — открыто 12 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/store/mod.rs](../src/store/mod.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d21"></a>
 
-**D21. Joins и relational composition** — открыто 30 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/batch.rs](../src/batch.rs). Контекст: [D08](#d08), [D14](#d14).
+**D21. Joins и relational composition** — открыто 11 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs), [src/batch.rs](../src/batch.rs). Контекст: [D08](#d08), [D14](#d14).
 
 <a id="d22"></a>
 
-**D22. Window functions** — открыто 17 из 40. Модули: [src/window.rs](../src/window.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D19](#d19), [D20](#d20).
+**D22. Window functions** — открыто 4 из 40. Модули: [src/window.rs](../src/window.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D19](#d19), [D20](#d20).
 
 <a id="d23"></a>
 
-**D23. FTS build и tokenizer** — открыто 25 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/catalog.rs](../src/catalog.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D46](#d46).
+**D23. FTS build и tokenizer** — открыто 8 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/catalog.rs](../src/catalog.rs), [tests/query.rs](../tests/query.rs). Контекст: [D08](#d08), [D46](#d46).
 
 <a id="d24"></a>
 
-**D24. FTS query и scoring** — открыто 25 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D23](#d23).
+**D24. FTS query и scoring** — открыто 7 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D23](#d23).
 
 <a id="d25"></a>
 
-**D25. FTS mutation и compaction** — открыто 22 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/delete_readback.rs](../tests/delete_readback.rs). Контекст: [D06](#d06), [D23](#d23).
+**D25. FTS mutation и compaction** — открыто 8 из 40. Модули: [src/fts.rs](../src/fts.rs), [src/store/mod.rs](../src/store/mod.rs), [tests/delete_readback.rs](../tests/delete_readback.rs). Контекст: [D06](#d06), [D23](#d23).
 
 <a id="d26"></a>
 
-**D26. Hashing embeddings** — открыто 34 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/embed.rs](../tests/embed.rs). Контекст: [D08](#d08), [D13](#d13).
+**D26. Hashing embeddings** — открыто 12 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [tests/embed.rs](../tests/embed.rs). Контекст: [D08](#d08), [D13](#d13).
 
 <a id="d27"></a>
 
-**D27. ANN и HNSW** — открыто 23 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/store/mod.rs](../src/store/mod.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D26](#d26), [D28](#d28).
+**D27. ANN и HNSW** — открыто 11 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/store/mod.rs](../src/store/mod.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D26](#d26), [D28](#d28).
 
 <a id="d28"></a>
 
-**D28. Vector search semantics** — открыто 22 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D26](#d26).
+**D28. Vector search semantics** — открыто 9 из 40. Модули: [src/embed.rs](../src/embed.rs), [src/exec/mod.rs](../src/exec/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D26](#d26).
 
 <a id="d29"></a>
 
-**D29. GPU resources и residency** — открыто 23 из 40. Модули: [src/gpu.rs](../src/gpu.rs), [src/gpu_regex.rs](../src/gpu_regex.rs), [tests/gpu.rs](../tests/gpu.rs). Контекст: [D18](#d18).
+**D29. GPU resources и residency** — открыто 14 из 40. Модули: [src/gpu.rs](../src/gpu.rs), [src/gpu_regex.rs](../src/gpu_regex.rs), [tests/gpu.rs](../tests/gpu.rs). Контекст: [D18](#d18).
 
 <a id="d30"></a>
 
-**D30. GPU kernels и equivalence** — открыто 20 из 40. Модули: [src/gpu.rs](../src/gpu.rs), [src/shaders/compare.wgsl](../src/shaders/compare.wgsl), [tests/shaders.rs](../tests/shaders.rs). Контекст: [D29](#d29).
+**D30. GPU kernels и equivalence** — открыто 8 из 40. Модули: [src/gpu.rs](../src/gpu.rs), [src/shaders/compare.wgsl](../src/shaders/compare.wgsl), [tests/shaders.rs](../tests/shaders.rs). Контекст: [D29](#d29).
 
 <a id="d31"></a>
 
-**D31. Graph queries** — открыто 26 из 40. Модули: [src/graph.rs](../src/graph.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D08](#d08), [D06](#d06).
+**D31. Graph queries** — открыто 7 из 40. Модули: [src/graph.rs](../src/graph.rs), [src/store/mod.rs](../src/store/mod.rs), [src/cursor.rs](../src/cursor.rs). Контекст: [D08](#d08), [D06](#d06).
 
 <a id="d32"></a>
 
-**D32. Cold storage и mmap** — открыто 22 из 40. Модули: [src/disk/mod.rs](../src/disk/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs). Контекст: [D04](#d04), [D05](#d05).
+**D32. Cold storage и mmap** — открыто 15 из 40. Модули: [src/disk/mod.rs](../src/disk/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs). Контекст: [D04](#d04), [D05](#d05).
 
 <a id="d33"></a>
 
-**D33. Async execution и backpressure** — открыто 28 из 40. Модули: [src/async_db.rs](../src/async_db.rs), [src/query.rs](../src/query.rs), [tests/query.rs](../tests/query.rs). Контекст: [D16](#d16), [D34](#d34).
+**D33. Async execution и backpressure** — открыто 4 из 40. Модули: [src/async_db.rs](../src/async_db.rs), [src/query.rs](../src/query.rs), [tests/query.rs](../tests/query.rs). Контекст: [D16](#d16), [D34](#d34).
 
 <a id="d34"></a>
 
-**D34. Concurrency и read snapshots** — открыто 28 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/async_db.rs](../src/async_db.rs). Контекст: [D06](#d06).
+**D34. Concurrency и read snapshots** — открыто 9 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/store/mod.rs](../src/store/mod.rs), [src/async_db.rs](../src/async_db.rs). Контекст: [D06](#d06).
 
 <a id="d35"></a>
 
-**D35. Replication transport** — открыто 22 из 40. Модули: [src/ship.rs](../src/ship.rs), [src/main.rs](../src/main.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D04](#d04).
+**D35. Replication transport** — открыто 11 из 40. Модули: [src/ship.rs](../src/ship.rs), [src/main.rs](../src/main.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D04](#d04).
 
 <a id="d36"></a>
 
-**D36. Followers и catch-up** — открыто 19 из 40. Модули: [src/ship.rs](../src/ship.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/main.rs](../src/main.rs). Контекст: [D35](#d35).
+**D36. Followers и catch-up** — открыто 6 из 40. Модули: [src/ship.rs](../src/ship.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/main.rs](../src/main.rs). Контекст: [D35](#d35).
 
 <a id="d37"></a>
 
-**D37. Public Rust API** — открыто 37 из 40. Модули: [src/lib.rs](../src/lib.rs), [src/query.rs](../src/query.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D13](#d13).
+**D37. Public Rust API** — открыто 0 из 40. Модули: [src/lib.rs](../src/lib.rs), [src/query.rs](../src/query.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D13](#d13).
 
 <a id="d38"></a>
 
-**D38. Typed queries и derive** — открыто 32 из 40. Модули: [lin-derive/src/lib.rs](../lin-derive/src/lib.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). Контекст: [D37](#d37).
+**D38. Typed queries и derive** — открыто 4 из 40. Модули: [lin-derive/src/lib.rs](../lin-derive/src/lib.rs), [src/row.rs](../src/row.rs), [src/query.rs](../src/query.rs). Контекст: [D37](#d37).
 
 <a id="d39"></a>
 
-**D39. CLI и интерактивность** — открыто 36 из 40. Модули: [src/main.rs](../src/main.rs), [src/explain.rs](../src/explain.rs), [tests/compute_cli.rs](../tests/compute_cli.rs). Контекст: [D37](#d37).
+**D39. CLI и интерактивность** — открыто 1 из 40. Модули: [src/main.rs](../src/main.rs), [src/explain.rs](../src/explain.rs), [tests/compute_cli.rs](../tests/compute_cli.rs). Контекст: [D37](#d37).
 
 <a id="d40"></a>
 
-**D40. Errors и диагностика** — открыто 35 из 40. Модули: [src/error.rs](../src/error.rs), [src/parse.rs](../src/parse.rs), [src/check.rs](../src/check.rs). Контекст: [D13](#d13).
+**D40. Errors и диагностика** — открыто 4 из 40. Модули: [src/error.rs](../src/error.rs), [src/parse.rs](../src/parse.rs), [src/check.rs](../src/check.rs). Контекст: [D13](#d13).
 
 <a id="d41"></a>
 
-**D41. Observability** — открыто 40 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/explain.rs](../src/explain.rs). Контекст: [D40](#d40).
+**D41. Observability** — открыто 0 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/explain.rs](../src/explain.rs). Контекст: [D40](#d40).
 
 <a id="d42"></a>
 
-**D42. Property и differential testing** — открыто 28 из 40. Модули: [tests/lang.rs](../tests/lang.rs), [tests/query.rs](../tests/query.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D13](#d13).
+**D42. Property и differential testing** — открыто 0 из 40. Модули: [tests/lang.rs](../tests/lang.rs), [tests/query.rs](../tests/query.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D13](#d13).
 
 <a id="d43"></a>
 
-**D43. Crash и fault injection** — открыто 32 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
+**D43. Crash и fault injection** — открыто 13 из 40. Модули: [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs), [tests/persist.rs](../tests/persist.rs). Контекст: [D02](#d02), [D03](#d03), [D04](#d04).
 
 <a id="d44"></a>
 
-**D44. CI и платформы** — открыто 40 из 40. Модули: [.github/workflows/bench.yml](../.github/workflows/bench.yml), [scripts/ci-bench.sh](../scripts/ci-bench.sh), [tests/shaders.rs](../tests/shaders.rs). Контекст: [D01](#d01), [D42](#d42).
+**D44. CI и платформы** — открыто 0 из 40. Модули: [.github/workflows/bench.yml](../.github/workflows/bench.yml), [scripts/ci-bench.sh](../scripts/ci-bench.sh), [tests/shaders.rs](../tests/shaders.rs). Контекст: [D01](#d01), [D42](#d42).
 
 <a id="d45"></a>
 
-**D45. Безопасность и resource limits** — открыто 14 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). Контекст: [D40](#d40).
+**D45. Безопасность и resource limits** — открыто 0 из 40. Модули: [src/exec/mod.rs](../src/exec/mod.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). Контекст: [D40](#d40).
 
 <a id="d46"></a>
 
-**D46. Catalog и schema evolution** — открыто 40 из 40. Модули: [src/catalog.rs](../src/catalog.rs), [src/check.rs](../src/check.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D06](#d06).
+**D46. Catalog и schema evolution** — открыто 4 из 40. Модули: [src/catalog.rs](../src/catalog.rs), [src/check.rs](../src/check.rs), [src/exec/mod.rs](../src/exec/mod.rs). Контекст: [D06](#d06).
 
 <a id="d47"></a>
 
-**D47. Import и export** — открыто 33 из 40. Модули: [src/main.rs](../src/main.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). Контекст: [D18](#d18), [D46](#d46).
+**D47. Import и export** — открыто 4 из 40. Модули: [src/main.rs](../src/main.rs), [src/row.rs](../src/row.rs), [src/batch.rs](../src/batch.rs). Контекст: [D18](#d18), [D46](#d46).
 
 <a id="d48"></a>
 
-**D48. Operations и lifecycle** — открыто 30 из 40. Модули: [src/main.rs](../src/main.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). Контекст: [D03](#d03), [D04](#d04), [D05](#d05).
+**D48. Operations и lifecycle** — открыто 4 из 40. Модули: [src/main.rs](../src/main.rs), [src/persist/mod.rs](../src/persist/mod.rs), [src/ship.rs](../src/ship.rs). Контекст: [D03](#d03), [D04](#d04), [D05](#d05).
 
 <a id="d49"></a>
 
-**D49. Build и distribution** — открыто 39 из 40. Модули: [Cargo.toml](../Cargo.toml), [Cargo.lock](../Cargo.lock), [src/lib.rs](../src/lib.rs). Контекст: [D44](#d44).
+**D49. Build и distribution** — открыто 11 из 40. Модули: [Cargo.toml](../Cargo.toml), [Cargo.lock](../Cargo.lock), [src/lib.rs](../src/lib.rs). Контекст: [D44](#d44).
 
 <a id="d50"></a>
 
-**D50. Документация и продуктовый контракт** — открыто 40 из 40. Модули: [README.md](../README.md), [CHANGELOG.md](../CHANGELOG.md), [docs/benchmark-contract.md](../docs/benchmark-contract.md). Контекст: [D01](#d01), [D37](#d37).
+**D50. Документация и продуктовый контракт** — открыто 0 из 40. Модули: [README.md](../README.md), [CHANGELOG.md](../CHANGELOG.md), [docs/benchmark-contract.md](../docs/benchmark-contract.md). Контекст: [D01](#d01), [D37](#d37).

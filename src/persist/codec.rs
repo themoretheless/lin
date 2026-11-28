@@ -2476,7 +2476,7 @@ pub(super) fn decode_column_record_mode(
                         let idx = out.len() as u32;
                         out.push(arc_from_validated_str(s_str));
                         slots[h] = (raw, idx);
-                        if state.0 == 32 && state.1 == 0 {
+                        if state.0 == N as u32 && state.1 == 0 {
                             state.2 = false;
                         }
                     } else {
