@@ -14,6 +14,7 @@ use crate::disk::{
     TOMBSTONES_FILE, WAL_FILE, infer_schema_from_rows, is_disk_dir,
 };
 use crate::error::Error;
+pub use crate::persist::{CheckpointMetrics, CheckpointStageError, RecoveryProgress};
 use crate::persist::{
     self, ColSnap, Head, IndexSnap, LogRecord, OpenMemOpts, Pack, Persist, Snapshot, SnapshotRef,
 };
@@ -318,6 +319,240 @@ impl Store {
         opts: impl Into<persist::OpenConfig>,
     ) -> Result<(Self, Persist), Error> {
         let (store, persist, _) = Self::open_with_profiled(path, cat, opts.into())?;
+        Ok((store, persist))
+    }
+
+    /// Open durable data dir with per-frame recovery progress callbacks and cooperative
+    /// cancellation (`LIN-0149`, `LIN-0150`).
+    ///
+    /// If `is_cancelled()` returns `true` before or during WAL replay, recovery aborts
+    /// immediately with `Error::runtime("recovery canceled")` **without** truncating `log`,
+    /// rewriting `head`, or mutating any files on disk.
+    pub fn open_with_recovery_hooks<P, FProg, FCancel>(
+        path: P,
+        cat: &Catalog,
+        opts: impl Into<persist::OpenConfig>,
+        mut on_progress: FProg,
+        mut is_cancelled: FCancel,
+    ) -> Result<(Self, Persist), Error>
+    where
+        P: AsRef<Path>,
+        FProg: FnMut(RecoveryProgress),
+        FCancel: FnMut() -> bool,
+    {
+        let cfg = opts.into();
+        let mem_opts = cfg.opts;
+        let dir = path.as_ref();
+        persist::validate_data_dir(dir)?;
+        if is_cancelled() {
+            return Err(Error::runtime("recovery canceled"));
+        }
+
+        // If `LOCK` already exists on disk, take the non-blocking exclusive flock without
+        // creating or modifying any files so another live writer is rejected upfront while a
+        // cancelled recovery leaves directory contents 100% untouched.
+        let existing_lock = if dir.exists() && persist::lock_path(dir).exists() {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(false)
+                .open(persist::lock_path(dir))
+                .map_err(persist::io_err)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        return Err(Error::runtime("data dir locked by another writer"));
+                    }
+                    return Err(persist::io_err(e));
+                }
+            }
+            Some(f)
+        } else {
+            None
+        };
+
+        let fixture_hash = catalog_hash(cat);
+        let snap = if dir.exists() {
+            persist::read_snapshot(dir)?
+        } else {
+            None
+        };
+        if is_cancelled() {
+            return Err(Error::runtime("recovery canceled"));
+        }
+
+        let start = snap.as_ref().map(|s| s.log_offset).unwrap_or(0);
+        let snap_catalog_hash = snap.as_ref().map(|s| s.catalog_hash.clone());
+        let snap_has_extras = snap
+            .as_ref()
+            .map(|s| {
+                !s.extra_collections.is_empty()
+                    || !s.extra_rels.is_empty()
+                    || !s.extra_indexes.is_empty()
+                    || !s.extra_filters.is_empty()
+                    || !s.extra_owned.is_empty()
+            })
+            .unwrap_or(false);
+
+        let mut store = match snap {
+            Some(s) => Self::from_snapshot_unindexed(dir, s)?,
+            None => {
+                let embed = if dir.exists() {
+                    persist::read_head(dir)?
+                        .map(|h| h.embed_id)
+                        .unwrap_or_else(|| cat.embed_id.clone())
+                } else {
+                    cat.embed_id.clone()
+                };
+                let mut st = Self::empty(embed);
+                st.data_dir = Some(dir.to_path_buf());
+                st
+            }
+        };
+        store.rebuild_indexes();
+        store.rebuild_row_maps();
+        if dir.exists() {
+            let mut fts_cat = cat.clone();
+            store.merge_extras_into(&mut fts_cat);
+            store.try_load_fts(dir, &fts_cat);
+        }
+
+        let min_gen = store.r#gen;
+        let mut wal_index = Vec::new();
+        let hash_now = |store: &Store| -> String {
+            let mut seen = cat.clone();
+            store.merge_extras_into(&mut seen);
+            catalog_hash(&seen)
+        };
+        let mut replay_hashes: Vec<String> = vec![hash_now(&store)];
+        let mut order = ReplayOrder::new(min_gen);
+        let mut has_segment_packs = false;
+        let mut frames_replayed = 0usize;
+
+        let end = if dir.exists()
+            && let Some(mut ro_log) = persist::open_log_read(dir)?
+        {
+            persist::replay_log_indexed_with_offset(
+                &mut ro_log,
+                min_gen,
+                start,
+                Some(&mut wal_index),
+                &mut |rec, bytes_offset| {
+                    if is_cancelled() {
+                        return Err(Error::runtime("recovery canceled"));
+                    }
+                    if !order.admit(rec.r#gen)? {
+                        return Ok(());
+                    }
+                    if pack_has_segment(&rec.pack) {
+                        has_segment_packs = true;
+                    }
+                    store.apply_record(&rec);
+                    if pack_changes_schema(&rec.pack) {
+                        replay_hashes.push(hash_now(&store));
+                    }
+                    frames_replayed += 1;
+                    on_progress(RecoveryProgress {
+                        frames_replayed,
+                        current_gen: store.r#gen,
+                        bytes_offset,
+                    });
+                    if is_cancelled() {
+                        return Err(Error::runtime("recovery canceled"));
+                    }
+                    Ok(())
+                },
+            )?
+        } else {
+            0
+        };
+
+        if is_cancelled() {
+            return Err(Error::runtime("recovery canceled"));
+        }
+
+        let mut live = cat.clone();
+        store.merge_extras_into(&mut live);
+        let live_hash = catalog_hash(&live);
+
+        let head_disk = if dir.exists() {
+            persist::read_head(dir)?
+        } else {
+            None
+        };
+        let head_is_stale = head_disk.as_ref().is_some_and(|h| h.r#gen < min_gen);
+        let mut caller_embed = live.clone();
+        caller_embed.set_embed_id(cat.embed_id.clone());
+        replay_hashes.push(catalog_hash(&caller_embed));
+        if let Some(ref head) = head_disk
+            && !head_is_stale
+            && head.catalog_hash != live_hash
+            && !replay_hashes.contains(&head.catalog_hash)
+        {
+            return Err(Error::runtime(format!(
+                "catalog_hash mismatch: store={} catalog={}",
+                head.catalog_hash, live_hash
+            )));
+        }
+        if let Some(snap_hash) = snap_catalog_hash
+            && snap_hash != live_hash
+            && !snap_has_extras
+            && snap_hash != fixture_hash
+            && !replay_hashes.contains(&snap_hash)
+        {
+            return Err(Error::runtime(format!(
+                "catalog_hash mismatch: snapshot={} catalog={}",
+                snap_hash, live_hash
+            )));
+        }
+
+        // Recovery succeeded and was not cancelled: finalize lock, WAL truncation, and `head`.
+        drop(existing_lock);
+        persist::ensure_dir(dir)?;
+        let lock = persist::acquire_writer_lock(dir)?;
+        let mut log = persist::open_log_unreserved(dir)?;
+        persist::truncate_log_with_sync(&mut log, end, mem_opts.sync)?;
+
+        let head_needs_write = match &head_disk {
+            Some(head) => {
+                head.r#gen != store.r#gen
+                    || head.catalog_hash != live_hash
+                    || head.embed_id != store.embed_id
+            }
+            None => true,
+        };
+        if head_needs_write {
+            persist::write_head(
+                dir,
+                &Head {
+                    r#gen: store.r#gen,
+                    catalog_hash: live_hash.clone(),
+                    embed_id: store.embed_id.clone(),
+                },
+            )?;
+        }
+        store.ensure_fts(&live);
+
+        let persist = Persist {
+            dir: dir.to_path_buf(),
+            log,
+            lock,
+            lock_owner_pid: std::process::id(),
+            catalog_hash: live_hash,
+            writes_since_snapshot: 0,
+            encode_buf: Vec::with_capacity(64 * 1024),
+            encoder: persist::acquire_encoder(),
+            sync: mem_opts.sync,
+            cold: mem_opts.cold,
+            wal_dictionary: cfg.wal_dictionary,
+            log_bytes: end,
+            wal_index,
+            has_segment_packs,
+        };
         Ok((store, persist))
     }
 
@@ -962,17 +1197,121 @@ impl Store {
         Ok(())
     }
 
+    /// Return current uncheckpointed WAL byte debt accumulated since the last snapshot (`LIN-0190`).
+    pub fn checkpoint_debt_bytes(&self, persist: &Persist) -> u64 {
+        let _ = self;
+        persist.log_bytes
+    }
+
+    /// Estimate the serialized `0x03` snapshot byte size without allocating or mutating state (`LIN-0191`).
+    pub fn forecast_checkpoint_bytes(&self) -> u64 {
+        // 0x03 magic (5) + header_len (4) + base msgpack header (~96) + chunk_count (4) + LCRC trailer (8)
+        let mut est: u64 = 117;
+        est = est.saturating_add((self.edges.len() as u64).saturating_mul(48));
+        est = est.saturating_add((self.extra_collections.len() as u64).saturating_mul(64));
+        est = est.saturating_add((self.extra_rels.len() as u64).saturating_mul(32));
+        est = est.saturating_add((self.extra_indexes.len() as u64).saturating_mul(48));
+        est = est.saturating_add((self.extra_filters.len() as u64).saturating_mul(48));
+        est = est.saturating_add((self.extra_owned.len() as u64).saturating_mul(48));
+
+        for (name, rows) in &self.collections {
+            let chunk_hdr = 6u64 + name.len() as u64;
+            if self.is_disk_backed(name) {
+                est = est.saturating_add(chunk_hdr);
+                continue;
+            }
+            if name == "facts" && rows.is_empty() && self.facts_rows_stale && !self.facts_s.is_empty()
+            {
+                let n = self.facts_s.len();
+                let sample_n = n.min(16);
+                let mut sample_bytes = 0usize;
+                for i in 0..sample_n {
+                    sample_bytes += self.facts_s[i].len()
+                        + self.facts_p[i].len()
+                        + self.facts_o[i].len()
+                        + 18;
+                }
+                let avg = (sample_bytes / sample_n).max(24) as u64;
+                let chunks = n.div_ceil(512).max(1) as u64;
+                let raw = (n as u64).saturating_mul(avg);
+                let encoded = if cfg!(feature = "compress-zstd") {
+                    (raw / 2).max(16)
+                } else {
+                    raw
+                };
+                est = est
+                    .saturating_add(chunks.saturating_mul(chunk_hdr))
+                    .saturating_add(encoded);
+                continue;
+            }
+            if rows.is_empty() {
+                est = est.saturating_add(chunk_hdr);
+                continue;
+            }
+            let sample_n = rows.len().min(16);
+            let step = (rows.len() / sample_n).max(1);
+            let mut sample_bytes = 0usize;
+            let mut taken = 0usize;
+            let mut idx = 0usize;
+            while idx < rows.len() && taken < sample_n {
+                sample_bytes += crate::store::row_byte_size(&rows[idx]).saturating_add(16);
+                taken += 1;
+                idx += step;
+            }
+            let avg = (sample_bytes / taken.max(1)).max(16) as u64;
+            let chunks = rows.len().div_ceil(512).max(1) as u64;
+            let raw = (rows.len() as u64).saturating_mul(avg);
+            let encoded = if cfg!(feature = "compress-zstd") {
+                (raw * 3 / 5).max(16)
+            } else {
+                raw
+            };
+            est = est
+                .saturating_add(chunks.saturating_mul(chunk_hdr))
+                .saturating_add(encoded);
+        }
+        est
+    }
+
     /// Force a durable checkpoint (snapshot + head fsync).
     pub fn checkpoint(&mut self, persist: &mut Persist) -> Result<(), Error> {
         self.write_snapshot(persist)
     }
 
+    /// Force a durable checkpoint and return execution, size, and tiering metrics (`LIN-0189`, `LIN-0192`).
+    pub fn checkpoint_with_metrics(
+        &mut self,
+        persist: &mut Persist,
+    ) -> Result<CheckpointMetrics, Error> {
+        let t0 = Instant::now();
+        let wal_bytes_before = self.checkpoint_debt_bytes(persist);
+        let forecast_snapshot_bytes = self.forecast_checkpoint_bytes();
+        let (cold_tables, in_memory_rows) = self.write_snapshot_staged(persist)?;
+        let duration_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        Ok(CheckpointMetrics {
+            generation: self.r#gen,
+            wal_bytes_before,
+            forecast_snapshot_bytes,
+            duration_ms,
+            cold_tables,
+            in_memory_rows,
+        })
+    }
+
     pub fn write_snapshot(&mut self, persist: &mut Persist) -> Result<(), Error> {
+        self.checkpoint_with_metrics(persist).map(|_| ())
+    }
+
+    fn write_snapshot_staged(&mut self, persist: &mut Persist) -> Result<(usize, usize), Error> {
+        let stage_err = |stage: &'static str| move |e: Error| CheckpointStageError::new(stage, e).into_error();
+
         // Exclude open_read processes while publishing snapshot + compacting log.
-        let _fence = persist::acquire_fence_exclusive(&persist.dir)?;
+        let _fence = persist::acquire_fence_exclusive(&persist.dir)
+            .map_err(stage_err("fence_acquire"))?;
         persist::durable_sync(&persist.log)
             .or_else(|_| persist.log.sync_all())
-            .map_err(persist::io_err)?;
+            .map_err(persist::io_err)
+            .map_err(stage_err("wal_sync"))?;
         self.ensure_facts_rows();
 
         let mut cold_names = Vec::new();
@@ -993,237 +1332,242 @@ impl Store {
                 cleanup_disk_files(&persist.dir);
             }
         } else {
-            // Preserve already-unmodified (or overlay-dirty) disk-backed tables without re-materializing them!
-            let untouched_disk: FxHashSet<String> = self
-                .disk
-                .as_ref()
-                .map(|d| {
-                    d.tables
-                        .iter()
-                        .filter(|(_, lazy)| lazy.row_count >= COLD_MIN_ROWS)
-                        .map(|(k, _)| k.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
+            (|| -> Result<(), Error> {
+                // Preserve already-unmodified (or overlay-dirty) disk-backed tables without re-materializing them!
+                let untouched_disk: FxHashSet<String> = self
+                    .disk
+                    .as_ref()
+                    .map(|d| {
+                        d.tables
+                            .iter()
+                            .filter(|(_, lazy)| lazy.row_count >= COLD_MIN_ROWS)
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-            // Promote any tiny (< COLD_MIN_ROWS) disk-backed table back into inline snapshot.
-            let tiny_disk: Vec<String> = self
-                .disk
-                .as_ref()
-                .map(|d| {
-                    d.tables
-                        .iter()
-                        .filter(|(_, lazy)| lazy.row_count < COLD_MIN_ROWS)
-                        .map(|(k, _)| k.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            for name in &tiny_disk {
-                self.promote_disk_col(name);
-            }
-
-            // Drain any cold overlay mutations (new/updated memtable rows + tombstones) before releasing `ro`.
-            let (mut dirty_mem_rows, dirty_tombstones) = if let Some(d) = self.disk.as_mut()
-                && d.engine.has_dirty_overlay()
-            {
-                let (mr, ts) = d.engine_mut().drain_dirty_overlays();
-                (mr, Some(ts))
-            } else {
-                (BTreeMap::new(), None)
-            };
-            for name in &tiny_disk {
-                dirty_mem_rows.remove(name);
-            }
-
-            // Close read-only mmap handles before opening DiskEngine writer to rewrite segments.
-            self.disk = None;
-            self.cold_fts_disk.retain(|k, _| untouched_disk.contains(k));
-            self.overlay_savepoint_fts = None;
-            self.overlay_savepoint_edges = None;
-
-            for (name, rows) in &self.collections {
-                if untouched_disk.contains(name) || rows.len() >= COLD_MIN_ROWS {
-                    cold_names.push(name.clone());
+                // Promote any tiny (< COLD_MIN_ROWS) disk-backed table back into inline snapshot.
+                let tiny_disk: Vec<String> = self
+                    .disk
+                    .as_ref()
+                    .map(|d| {
+                        d.tables
+                            .iter()
+                            .filter(|(_, lazy)| lazy.row_count < COLD_MIN_ROWS)
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for name in &tiny_disk {
+                    self.promote_disk_col(name);
                 }
-            }
 
-            if cold_names.is_empty() {
-                if is_disk_dir(&persist.dir) {
-                    cleanup_disk_files(&persist.dir);
+                // Drain any cold overlay mutations (new/updated memtable rows + tombstones) before releasing `ro`.
+                let (mut dirty_mem_rows, dirty_tombstones) = if let Some(d) = self.disk.as_mut()
+                    && d.engine.has_dirty_overlay()
+                {
+                    let (mr, ts) = d.engine_mut().drain_dirty_overlays();
+                    (mr, Some(ts))
+                } else {
+                    (BTreeMap::new(), None)
+                };
+                for name in &tiny_disk {
+                    dirty_mem_rows.remove(name);
                 }
-            } else {
-                let mut eng = DiskEngine::open(&persist.dir, false)?;
-                eng.manifest.embed_id = self.embed_id.clone();
 
-                // Cluster keys already in the manifest must survive a table being dropped
-                // and spilled again below; keys declared this session win. An empty string
-                // records an explicit "no key".
-                for (t, schema) in &eng.manifest.tables {
-                    if let Some(k) = &schema.cluster_by {
-                        self.disk_cluster_keys
-                            .entry(t.clone())
-                            .or_insert_with(|| k.clone());
+                // Close read-only mmap handles before opening DiskEngine writer to rewrite segments.
+                self.disk = None;
+                self.cold_fts_disk.retain(|k, _| untouched_disk.contains(k));
+                self.overlay_savepoint_fts = None;
+                self.overlay_savepoint_edges = None;
+
+                for (name, rows) in &self.collections {
+                    if untouched_disk.contains(name) || rows.len() >= COLD_MIN_ROWS {
+                        cold_names.push(name.clone());
                     }
                 }
-                let cluster_keys = self.disk_cluster_keys.clone();
-                let apply_cluster_keys = |eng: &mut DiskEngine| {
-                    for (t, key) in &cluster_keys {
-                        if let Some(schema) = eng.manifest.tables.get_mut(t) {
-                            schema.cluster_by = (!key.is_empty()
-                                && schema.columns.iter().any(|c| &c.name == key))
-                            .then(|| key.clone());
+
+                if cold_names.is_empty() {
+                    if is_disk_dir(&persist.dir) {
+                        cleanup_disk_files(&persist.dir);
+                    }
+                } else {
+                    let mut eng = DiskEngine::open(&persist.dir, false)?;
+                    eng.manifest.embed_id = self.embed_id.clone();
+
+                    // Cluster keys already in the manifest must survive a table being dropped
+                    // and spilled again below; keys declared this session win. An empty string
+                    // records an explicit "no key".
+                    for (t, schema) in &eng.manifest.tables {
+                        if let Some(k) = &schema.cluster_by {
+                            self.disk_cluster_keys
+                                .entry(t.clone())
+                                .or_insert_with(|| k.clone());
                         }
                     }
-                };
-                apply_cluster_keys(&mut eng);
-
-                // Drop any stale table from DiskEngine that is no longer cold or was promoted & modified in RAM.
-                let existing_tables: Vec<String> = eng.manifest.tables.keys().cloned().collect();
-                for t in existing_tables {
-                    if !untouched_disk.contains(&t) {
-                        eng.drop_table(&t)?;
-                    }
-                }
-
-                // Flush incremental cold overlay mutations (delta segments + tombstones) for untouched disk tables.
-                if let Some(ts) = dirty_tombstones {
-                    let filtered_rows: BTreeMap<String, _> = dirty_mem_rows
-                        .into_iter()
-                        .filter(|(k, _)| untouched_disk.contains(k))
-                        .collect();
-                    eng.merge_overlay_and_flush(filtered_rows, &ts)?;
-                }
-
-                // Spill newly hot/modified large collections into columnar mmap segments.
-                for name in &cold_names {
-                    if untouched_disk.contains(name) {
-                        continue;
-                    }
-                    let Some(rows) = self.collections.get(name) else {
-                        continue;
+                    let cluster_keys = self.disk_cluster_keys.clone();
+                    let apply_cluster_keys = |eng: &mut DiskEngine| {
+                        for (t, key) in &cluster_keys {
+                            if let Some(schema) = eng.manifest.tables.get_mut(t) {
+                                schema.cluster_by = (!key.is_empty()
+                                    && schema.columns.iter().any(|c| &c.name == key))
+                                .then(|| key.clone());
+                            }
+                        }
                     };
-                    if rows.is_empty() {
-                        continue;
+                    apply_cluster_keys(&mut eng);
+
+                    // Drop any stale table from DiskEngine that is no longer cold or was promoted & modified in RAM.
+                    let existing_tables: Vec<String> = eng.manifest.tables.keys().cloned().collect();
+                    for t in existing_tables {
+                        if !untouched_disk.contains(&t) {
+                            eng.drop_table(&t)?;
+                        }
                     }
-                    let mut schema = infer_schema_from_rows(name, rows);
-                    if name == "docs" && !schema.indexed_fields.iter().any(|f| f == "uri") {
-                        schema.indexed_fields.push("uri".to_string());
+
+                    // Flush incremental cold overlay mutations (delta segments + tombstones) for untouched disk tables.
+                    if let Some(ts) = dirty_tombstones {
+                        let filtered_rows: BTreeMap<String, _> = dirty_mem_rows
+                            .into_iter()
+                            .filter(|(k, _)| untouched_disk.contains(k))
+                            .collect();
+                        eng.merge_overlay_and_flush(filtered_rows, &ts)?;
                     }
-                    if name == "orders" && !schema.indexed_fields.iter().any(|f| f == "user_id") {
-                        schema.indexed_fields.push("user_id".to_string());
-                    }
-                    for idx_snap in self.extra_indexes.values() {
-                        if idx_snap.collection == *name {
-                            for f in &idx_snap.fields {
-                                if f != "id" && !schema.indexed_fields.contains(f) {
-                                    schema.indexed_fields.push(f.clone());
+
+                    // Spill newly hot/modified large collections into columnar mmap segments.
+                    for name in &cold_names {
+                        if untouched_disk.contains(name) {
+                            continue;
+                        }
+                        let Some(rows) = self.collections.get(name) else {
+                            continue;
+                        };
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let mut schema = infer_schema_from_rows(name, rows);
+                        if name == "docs" && !schema.indexed_fields.iter().any(|f| f == "uri") {
+                            schema.indexed_fields.push("uri".to_string());
+                        }
+                        if name == "orders" && !schema.indexed_fields.iter().any(|f| f == "user_id") {
+                            schema.indexed_fields.push("user_id".to_string());
+                        }
+                        for idx_snap in self.extra_indexes.values() {
+                            if idx_snap.collection == *name {
+                                for f in &idx_snap.fields {
+                                    if f != "id" && !schema.indexed_fields.contains(f) {
+                                        schema.indexed_fields.push(f.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let cluster_key = cluster_keys
+                            .get(name)
+                            .filter(|k| !k.is_empty() && schema.columns.iter().any(|c| &c.name == *k))
+                            .cloned();
+                        schema.cluster_by = cluster_key.clone();
+                        eng.manifest.tables.insert(name.clone(), schema);
+                        match cluster_key {
+                            // Spill a clustered collection in key order (the in-memory copy
+                            // keeps its own order).
+                            Some(key) => {
+                                // Sort positions, then copy one segment's worth of rows
+                                // at a time instead of cloning the whole collection.
+                                let order = crate::disk::cluster_key_order(rows, &key);
+                                let mut chunk: Vec<crate::Row> = Vec::new();
+                                for positions in order.chunks(65_536) {
+                                    chunk.clear();
+                                    chunk.extend(positions.iter().map(|&i| rows[i as usize].clone()));
+                                    eng.write_bulk_segment(name, &chunk)?;
+                                }
+                            }
+                            None => {
+                                for chunk in rows.chunks(65_536) {
+                                    eng.write_bulk_segment(name, chunk)?;
                                 }
                             }
                         }
                     }
-                    let cluster_key = cluster_keys
-                        .get(name)
-                        .filter(|k| !k.is_empty() && schema.columns.iter().any(|c| &c.name == *k))
-                        .cloned();
-                    schema.cluster_by = cluster_key.clone();
-                    eng.manifest.tables.insert(name.clone(), schema);
-                    match cluster_key {
-                        // Spill a clustered collection in key order (the in-memory copy
-                        // keeps its own order).
-                        Some(key) => {
-                            // Sort positions, then copy one segment's worth of rows
-                            // at a time instead of cloning the whole collection.
-                            let order = crate::disk::cluster_key_order(rows, &key);
-                            let mut chunk: Vec<crate::Row> = Vec::new();
-                            for positions in order.chunks(65_536) {
-                                chunk.clear();
-                                chunk.extend(positions.iter().map(|&i| rows[i as usize].clone()));
-                                eng.write_bulk_segment(name, &chunk)?;
-                            }
+                    apply_cluster_keys(&mut eng);
+
+                    // Requested compactions: reclaim dead rows and merge segments; a clustered
+                    // table comes out globally ordered by its key.
+                    for t in std::mem::take(&mut self.disk_compact_requests) {
+                        let key = eng.manifest.tables.get(&t).and_then(|s| s.cluster_by.clone());
+                        if eng.manifest.tables.contains_key(&t) {
+                            match key {
+                                Some(key) => eng.compact_table_clustered(&t, &key)?,
+                                None => eng.compact_table(&t, true)?,
+                            };
                         }
-                        None => {
-                            for chunk in rows.chunks(65_536) {
-                                eng.write_bulk_segment(name, chunk)?;
-                            }
+                    }
+
+                    eng.manifest.generation = self.r#gen;
+                    eng.save_tombstones_and_manifest()?;
+                    persist::sync_dir_checked(&persist.dir.join(SEGMENTS_DIR))?;
+                    drop(eng);
+
+                    // Re-attach read-only mmap view for any previously untouched disk tables!
+                    if !untouched_disk.is_empty() {
+                        let ro = DiskEngine::open_read_only(&persist.dir)?;
+                        let mut tables = BTreeMap::new();
+                        for name in &untouched_disk {
+                            let nrows = ro.count_table(name);
+                            self.col_counts.insert(name.clone(), nrows);
+                            tables.insert(
+                                name.clone(),
+                                DiskColLazy {
+                                    row_count: nrows,
+                                    materialized: OnceLock::new(),
+                                },
+                            );
                         }
+                        let dirty_fts = std::mem::take(&mut self.dirty_fts_disk);
+                        for (name, fields) in dirty_fts {
+                            if !untouched_disk.contains(&name) {
+                                continue;
+                            }
+                            let mut proj: Vec<&str> = Vec::with_capacity(fields.len() + 1);
+                            proj.push("id");
+                            for f in &fields {
+                                if f != "id" {
+                                    proj.push(f.as_str());
+                                }
+                            }
+                            let mut rows = Vec::new();
+                            ro.scan_projected(&name, Some(&proj), |row| {
+                                rows.push(row.clone());
+                                Ok(true)
+                            })?;
+                            let idx = crate::fts::FtsIndex::build(&rows, &fields);
+                            let nrows = ro.count_table(&name) as u64;
+                            self.cold_fts_disk.insert(
+                                name,
+                                crate::store::ColdFtsDisk {
+                                    dir: persist.dir.clone(),
+                                    generation: self.r#gen,
+                                    expected_rows: nrows,
+                                    fields,
+                                    index: OnceLock::from(Arc::new(idx)),
+                                },
+                            );
+                        }
+                        self.disk = Some(StoreDiskTier {
+                            engine: Arc::new(ro),
+                            tables,
+                            native_disk: false,
+                            writer_lock: None,
+                        });
                     }
                 }
-                apply_cluster_keys(&mut eng);
-
-                // Requested compactions: reclaim dead rows and merge segments; a clustered
-                // table comes out globally ordered by its key.
-                for t in std::mem::take(&mut self.disk_compact_requests) {
-                    let key = eng.manifest.tables.get(&t).and_then(|s| s.cluster_by.clone());
-                    if eng.manifest.tables.contains_key(&t) {
-                        match key {
-                            Some(key) => eng.compact_table_clustered(&t, &key)?,
-                            None => eng.compact_table(&t, true)?,
-                        };
-                    }
-                }
-
-                eng.manifest.generation = self.r#gen;
-                eng.save_tombstones_and_manifest()?;
-                persist::sync_dir_checked(&persist.dir.join(SEGMENTS_DIR))?;
-                drop(eng);
-
-                // Re-attach read-only mmap view for any previously untouched disk tables!
-                if !untouched_disk.is_empty() {
-                    let ro = DiskEngine::open_read_only(&persist.dir)?;
-                    let mut tables = BTreeMap::new();
-                    for name in &untouched_disk {
-                        let nrows = ro.count_table(name);
-                        self.col_counts.insert(name.clone(), nrows);
-                        tables.insert(
-                            name.clone(),
-                            DiskColLazy {
-                                row_count: nrows,
-                                materialized: OnceLock::new(),
-                            },
-                        );
-                    }
-                    let dirty_fts = std::mem::take(&mut self.dirty_fts_disk);
-                    for (name, fields) in dirty_fts {
-                        if !untouched_disk.contains(&name) {
-                            continue;
-                        }
-                        let mut proj: Vec<&str> = Vec::with_capacity(fields.len() + 1);
-                        proj.push("id");
-                        for f in &fields {
-                            if f != "id" {
-                                proj.push(f.as_str());
-                            }
-                        }
-                        let mut rows = Vec::new();
-                        ro.scan_projected(&name, Some(&proj), |row| {
-                            rows.push(row.clone());
-                            Ok(true)
-                        })?;
-                        let idx = crate::fts::FtsIndex::build(&rows, &fields);
-                        let nrows = ro.count_table(&name) as u64;
-                        self.cold_fts_disk.insert(
-                            name,
-                            crate::store::ColdFtsDisk {
-                                dir: persist.dir.clone(),
-                                generation: self.r#gen,
-                                expected_rows: nrows,
-                                fields,
-                                index: OnceLock::from(Arc::new(idx)),
-                            },
-                        );
-                    }
-                    self.disk = Some(StoreDiskTier {
-                        engine: Arc::new(ro),
-                        tables,
-                        native_disk: false,
-                        writer_lock: None,
-                    });
-                }
-            }
+                Ok(())
+            })()
+            .map_err(stage_err("cold_spill"))?;
         }
 
         // Write FTS files after all promoted/dirty tables have rebuilt indexes and accurate counts.
-        self.write_fts_files(&persist.dir)?;
+        self.write_fts_files(&persist.dir)
+            .map_err(stage_err("fts_write"))?;
 
         let head = Head {
             r#gen: self.r#gen,
@@ -1247,23 +1591,36 @@ impl Store {
                 extra_owned: &self.extra_owned,
                 cold_collections: &cold_names,
             };
-            persist::write_snapshot_ref_to_file_ext(&snap_path, &snap_ref, false)?;
+            persist::write_snapshot_ref_to_file_ext(&snap_path, &snap_ref, false)
+                .map_err(stage_err("snapshot_write"))?;
         } else {
             write_snapshot_stubbing_cold(
                 &snap_path,
                 self,
                 &persist.catalog_hash,
                 &cold_names,
-            )?;
+            )
+            .map_err(stage_err("snapshot_write"))?;
         }
-        persist::write_head_no_dir_sync(&persist.dir, &head)?;
-        persist::sync_dir_checked(&persist.dir)?;
-        persist::compact_log(&mut persist.log)?;
+        persist::write_head_no_dir_sync(&persist.dir, &head)
+            .map_err(stage_err("head_write"))?;
+        persist::sync_dir_checked(&persist.dir)
+            .map_err(stage_err("head_write"))?;
+        persist::compact_log(&mut persist.log)
+            .map_err(stage_err("log_compact"))?;
         persist.writes_since_snapshot = 0;
         persist.log_bytes = 0;
         persist.wal_index.clear();
         persist.has_segment_packs = false;
-        Ok(())
+
+        let cold_set: FxHashSet<&str> = cold_names.iter().map(String::as_str).collect();
+        let in_memory_rows: usize = self
+            .collections
+            .iter()
+            .filter(|(name, _)| !cold_set.contains(name.as_str()))
+            .map(|(_, rows)| rows.len())
+            .sum();
+        Ok((cold_names.len(), in_memory_rows))
     }
 
     pub(super) fn apply_record(&mut self, rec: &LogRecord) {

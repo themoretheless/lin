@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::ast::{ExplainKind, Stmt};
@@ -6,7 +8,11 @@ use crate::catalog::Catalog;
 use crate::check;
 use crate::error::Error;
 use crate::parse;
-use crate::persist::{ColData, Pack};
+use crate::persist::{
+    ColData, Pack, RollbackReasonCounters, TxPhaseDiagnostics, inc_rollback_commit_err,
+    inc_rollback_dropped, inc_rollback_explicit, inc_rollback_stmt_err, reset_rollback_counters,
+    rollback_counters,
+};
 use crate::plan::{self, Backend, Effect, Node, NodeKind, Plan};
 use crate::store::{Cell, Row, Store, now_ms};
 
@@ -14,6 +20,54 @@ use super::dml::{stmt_append_only, stmt_schema, stmt_writes};
 use super::eval::{bind_stmt_params, value_cell};
 use super::prepared::{ExecPlan, Prepared};
 use super::{Db, Done, Handle, pack_affect_n};
+
+static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
+
+const TX_META_SHARDS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct TxRuntimeState {
+    tx_id: u64,
+    started_at: Instant,
+    statements_run: usize,
+    had_stmt_error: bool,
+}
+
+static TX_RUNTIME_TABLE: [Mutex<smallvec::SmallVec<[(usize, TxRuntimeState); 2]>>; TX_META_SHARDS] =
+    [const { Mutex::new(smallvec::SmallVec::new_const()) }; TX_META_SHARDS];
+
+#[inline]
+fn tx_shard_idx(db_key: usize) -> usize {
+    ((db_key >> 6) ^ (db_key >> 14)) & (TX_META_SHARDS - 1)
+}
+
+fn with_tx_runtime_state<R>(db_key: usize, f: impl FnOnce(&mut TxRuntimeState) -> R) -> R {
+    let mut guard = TX_RUNTIME_TABLE[tx_shard_idx(db_key)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((_, st)) = guard.iter_mut().find(|(k, _)| *k == db_key) {
+        return f(st);
+    }
+    guard.push((
+        db_key,
+        TxRuntimeState {
+            tx_id: NEXT_TX_ID.fetch_add(1, Ordering::Relaxed),
+            started_at: Instant::now(),
+            statements_run: 0,
+            had_stmt_error: false,
+        },
+    ));
+    let last = guard.len() - 1;
+    f(&mut guard[last].1)
+}
+
+fn take_tx_runtime_state(db_key: usize) -> Option<TxRuntimeState> {
+    let mut guard = TX_RUNTIME_TABLE[tx_shard_idx(db_key)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let pos = guard.iter().position(|(k, _)| *k == db_key)?;
+    Some(guard.swap_remove(pos).1)
+}
 
 pub(crate) enum Undo {
     None,
@@ -229,7 +283,104 @@ fn coalesce_tx_packs(mut packs: Vec<Pack>) -> Option<Pack> {
     }
 }
 
+impl Undo {
+    fn has_full_backup(&self) -> bool {
+        matches!(self, Undo::Full(_) | Undo::Layered { .. })
+    }
+
+    fn entry_count(&self) -> usize {
+        match self {
+            Undo::None => 0,
+            Undo::Append(_) | Undo::Full(_) => 1,
+            Undo::Rows(events) | Undo::Mixed { events } => events.len(),
+            Undo::Layered { prior, .. } => 1 + prior.entry_count(),
+        }
+    }
+}
+
 impl<'a> Transaction<'a> {
+    #[inline]
+    fn db_key(&self) -> usize {
+        std::ptr::from_ref::<Db>(self.db) as usize
+    }
+
+    #[inline]
+    fn track_stmt_result<T>(&self, was_committed: bool, res: Result<T, Error>) -> Result<T, Error> {
+        if was_committed {
+            return res;
+        }
+        let is_err = res.is_err();
+        with_tx_runtime_state(self.db_key(), |st| {
+            st.statements_run = st.statements_run.saturating_add(1);
+            if is_err {
+                st.had_stmt_error = true;
+            }
+        });
+        if is_err {
+            inc_rollback_stmt_err();
+        }
+        res
+    }
+
+    /// Unique monotonic replay/diagnostic identifier assigned to this transaction (`LIN-0240`).
+    pub fn tx_id(&self) -> u64 {
+        with_tx_runtime_state(self.db_key(), |st| st.tx_id)
+    }
+
+    /// Snapshot live execution, journal, backup, and wall-time diagnostics for this transaction (`LIN-0237`).
+    pub fn diagnostics(&self) -> TxPhaseDiagnostics {
+        let (tx_id, statements_run, elapsed_micros) =
+            with_tx_runtime_state(self.db_key(), |st| {
+                (
+                    st.tx_id,
+                    st.statements_run,
+                    u64::try_from(st.started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                )
+            });
+        let journal_entries = self
+            .undo
+            .entry_count()
+            .max(self.packs.len())
+            .max(usize::from(self.cat_backup.is_some()))
+            .max(usize::from(self.disk_savepoint));
+        TxPhaseDiagnostics {
+            tx_id,
+            statements_run,
+            journal_entries,
+            has_full_backup: self.undo.has_full_backup(),
+            disk_savepoint: self.disk_savepoint,
+            elapsed_micros,
+        }
+    }
+
+    /// Return global monotonic rollback reason counters across transactions (`LIN-0238`).
+    pub fn rollback_counters() -> RollbackReasonCounters {
+        rollback_counters()
+    }
+
+    /// Reset global rollback reason counters to zero (`LIN-0238`).
+    pub fn reset_rollback_counters() {
+        reset_rollback_counters();
+    }
+
+    /// Construct an explicit runtime rejection error for nested interactive transactions (`LIN-0220`).
+    ///
+    /// Note: Rust's `&mut Db` borrow rules already prevent opening two simultaneous
+    /// [`Db::transaction`] handles on the same database at compile time; dynamic query routers
+    /// and scripting bindings can call [`Self::begin_nested`] / [`Self::reject_nested`] to surface
+    /// a deterministic runtime diagnostic.
+    pub fn reject_nested(&self) -> Error {
+        Error::runtime(format!(
+            "nested interactive transactions are unsupported (active tx_id={}); commit or roll back the outer transaction first",
+            self.tx_id()
+        ))
+    }
+
+    /// Explicitly reject dynamic attempts to open a nested interactive transaction (`LIN-0220`).
+    pub fn begin_nested(&mut self) -> Result<(), Error> {
+        Err(self.reject_nested())
+    }
+
     /// Execute a source string statement within this transaction.
     pub fn run(&mut self, src: &str) -> Result<Handle, Error> {
         self.run_src_ext(src, true)
@@ -251,6 +402,12 @@ impl<'a> Transaction<'a> {
     }
 
     fn run_src_ext(&mut self, src: &str, want_rows: bool) -> Result<Handle, Error> {
+        let was_committed = self.committed;
+        let res = self.run_src_ext_inner(src, want_rows);
+        self.track_stmt_result(was_committed, res)
+    }
+
+    fn run_src_ext_inner(&mut self, src: &str, want_rows: bool) -> Result<Handle, Error> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
@@ -1144,19 +1301,21 @@ impl<'a> Transaction<'a> {
         if !prep.has_params || params.is_empty() {
             return self.run_prepared_ext(prep, true);
         }
+        let was_committed = self.committed;
         let bound: smallvec::SmallVec<[Stmt; 2]> = prep
             .stmts
             .iter()
             .map(|s| bind_stmt_params(s, params))
             .collect();
-        self.run_stmts_direct(
+        let res = self.run_stmts_direct(
             &bound,
             Arc::clone(&prep.plan),
             prep.writes,
             prep.append_only,
             prep.schema,
             true,
-        )
+        );
+        self.track_stmt_result(was_committed, res)
     }
 
     /// Execute a parameterized pre-compiled statement returning `Done`.
@@ -1168,12 +1327,13 @@ impl<'a> Transaction<'a> {
         if !prep.has_params || params.is_empty() {
             return self.execute_prepared(prep);
         }
+        let was_committed = self.committed;
         let bound: smallvec::SmallVec<[Stmt; 2]> = prep
             .stmts
             .iter()
             .map(|s| bind_stmt_params(s, params))
             .collect();
-        Ok(self
+        let res = self
             .run_stmts_direct(
                 &bound,
                 Arc::clone(&prep.plan),
@@ -1181,8 +1341,9 @@ impl<'a> Transaction<'a> {
                 prep.append_only,
                 prep.schema,
                 false,
-            )?
-            .done)
+            )
+            .map(|h| h.done);
+        self.track_stmt_result(was_committed, res)
     }
 
     #[inline]
@@ -1191,8 +1352,10 @@ impl<'a> Transaction<'a> {
         prep: &Prepared,
         want_rows: bool,
     ) -> Result<Handle, Error> {
+        let was_committed = self.committed;
         let ep = prep.exec_plan();
-        self.run_exec_plan_ext(&ep, want_rows)
+        let res = self.run_exec_plan_ext(&ep, want_rows);
+        self.track_stmt_result(was_committed, res)
     }
 
     pub(crate) fn run_exec_plan_ext(
@@ -1352,9 +1515,13 @@ impl<'a> Transaction<'a> {
         if self.committed {
             return Ok(());
         }
+        if take_tx_runtime_state(self.db_key()).is_none() {
+            NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err(e) = self.db.check_quotas() {
             self.abort_into_rollback();
             self.committed = true;
+            inc_rollback_commit_err();
             return Err(e);
         }
         if !self.packs.is_empty() {
@@ -1367,6 +1534,7 @@ impl<'a> Transaction<'a> {
                 {
                     self.abort_into_rollback();
                     self.committed = true;
+                    inc_rollback_commit_err();
                     return Err(e);
                 }
                 if self.db.persist.is_some() {
@@ -1383,6 +1551,7 @@ impl<'a> Transaction<'a> {
                         Err(e) => {
                             self.abort_into_rollback();
                             self.committed = true;
+                            inc_rollback_commit_err();
                             return Err(e);
                         }
                     };
@@ -1406,6 +1575,7 @@ impl<'a> Transaction<'a> {
                     if let Err(e) = self.db.store.commit_pack_to_native_disk(&combined) {
                         self.abort_into_rollback();
                         self.committed = true;
+                        inc_rollback_commit_err();
                         return Err(e);
                     }
                     self.db.store.r#gen = self.base_gen + 1;
@@ -1426,8 +1596,12 @@ impl<'a> Transaction<'a> {
         if self.committed {
             return Err(Error::runtime("transaction already committed"));
         }
+        if take_tx_runtime_state(self.db_key()).is_none() {
+            NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+        }
         self.abort_into_rollback();
         self.committed = true;
+        inc_rollback_explicit();
         Ok(())
     }
 
@@ -1440,7 +1614,17 @@ impl<'a> Transaction<'a> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
+            let had_stmt_err = match take_tx_runtime_state(self.db_key()) {
+                Some(st) => st.had_stmt_error,
+                None => {
+                    NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            };
             self.abort_into_rollback();
+            if !had_stmt_err {
+                inc_rollback_dropped();
+            }
         }
     }
 }

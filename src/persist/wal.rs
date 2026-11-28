@@ -863,8 +863,20 @@ pub(crate) fn replay_log_indexed(
     log: &mut File,
     min_gen: u64,
     start_offset: u64,
-    mut wal_index: Option<&mut Vec<(u64, u64)>>,
+    wal_index: Option<&mut Vec<(u64, u64)>>,
     on_rec: &mut impl FnMut(LogRecord) -> Result<(), Error>,
+) -> Result<u64, Error> {
+    replay_log_indexed_with_offset(log, min_gen, start_offset, wal_index, &mut |rec, _end| {
+        on_rec(rec)
+    })
+}
+
+pub(crate) fn replay_log_indexed_with_offset(
+    log: &mut File,
+    min_gen: u64,
+    start_offset: u64,
+    mut wal_index: Option<&mut Vec<(u64, u64)>>,
+    on_rec: &mut impl FnMut(LogRecord, u64) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     let file_len = log.metadata().map_err(io_err)?.len();
     let start = if start_offset <= file_len {
@@ -883,11 +895,11 @@ pub(crate) fn replay_log_indexed(
             }
             replay_from(log, min_gen, 0, file_len, wal_index, on_rec).map_err(|e| match e {
                 ReplayFail::Io(err) => err,
-                ReplayFail::BadStart => io_err("corrupt log"),
+                ReplayFail::BadStart => io_err("corrupt log at byte offset 0"),
             })
         }
         Err(ReplayFail::Io(e)) => Err(e),
-        Err(ReplayFail::BadStart) => Err(io_err("corrupt log")),
+        Err(ReplayFail::BadStart) => Err(io_err("corrupt log at byte offset 0")),
     }
 }
 
@@ -902,7 +914,7 @@ pub(super) fn replay_from(
     start: u64,
     file_len: u64,
     mut wal_index: Option<&mut Vec<(u64, u64)>>,
-    on_rec: &mut impl FnMut(LogRecord) -> Result<(), Error>,
+    on_rec: &mut impl FnMut(LogRecord, u64) -> Result<(), Error>,
 ) -> Result<u64, ReplayFail> {
     log.seek(SeekFrom::Start(start))
         .map_err(|e| ReplayFail::Io(io_err(e)))?;
@@ -919,7 +931,11 @@ pub(super) fn replay_from(
         match read_one_reader(&mut reader, file_len, pos, skip_up_to, &mut buf) {
             ReadOne::Eof | ReadOne::Truncated => break,
             ReadOne::Corrupt if !saw_any && start > 0 => return Err(ReplayFail::BadStart),
-            ReadOne::Corrupt => return Err(ReplayFail::Io(io_err("corrupt log record"))),
+            ReadOne::Corrupt => {
+                return Err(ReplayFail::Io(io_err(format!(
+                    "corrupt log record at byte offset {pos}"
+                ))));
+            }
             ReadOne::Io(e) => return Err(ReplayFail::Io(e)),
             ReadOne::Skipped { rec_gen, next } => {
                 saw_any = true;
@@ -934,7 +950,7 @@ pub(super) fn replay_from(
                     idx.push((rec.r#gen, pos));
                 }
                 if rec.r#gen > min_gen {
-                    on_rec(rec).map_err(ReplayFail::Io)?;
+                    on_rec(rec, next).map_err(ReplayFail::Io)?;
                 }
                 pos = next;
             }
@@ -1400,6 +1416,9 @@ pub(super) fn decode_frame(magic: &[u8; 4], payload: &[u8]) -> Result<LogRecord,
         if hw_crc != expected && crc32fast::hash(&payload[..end]) != expected {
             return Err(io_err("wal checksum mismatch"));
         }
+        if !super::inspect::CodecCapabilities::supports_wal_codec(payload[0]) {
+            return Err(io_err("unknown wal codec"));
+        }
         let codec = match payload[0] {
             1 => LOG_MAGIC_V1,
             2 => LOG_MAGIC_V2,
@@ -1459,16 +1478,18 @@ pub fn for_each_wal_frame_raw<'a>(
     let mut n = 0usize;
     while pos < frames.len() {
         if pos + 8 > frames.len() {
-            return Err(io_err("truncated wal frame"));
+            return Err(io_err(format!("truncated wal frame at byte offset {pos}")));
         }
         let magic: [u8; 4] = frames[pos..pos + 4].try_into().unwrap();
         let len = u32::from_le_bytes(frames[pos + 4..pos + 8].try_into().unwrap()) as usize;
         if len == 0 || len > MAX_RECORD as usize || pos + 8 + len > frames.len() {
-            return Err(io_err("bad wal frame length"));
+            return Err(io_err(format!("bad wal frame length at byte offset {pos}")));
         }
         let end = pos + 8 + len;
         let payload = &frames[pos + 8..end];
-        let rec = decode_frame(&magic, payload)?;
+        let rec = decode_frame(&magic, payload).map_err(|e| {
+            Error::runtime(format!("{} (at wal byte offset {pos})", e.message))
+        })?;
         on_frame(&frames[pos..end], rec)?;
         n += 1;
         pos = end;

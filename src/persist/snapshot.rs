@@ -57,6 +57,13 @@ thread_local! {
     static SNAP_TLS_DEC: RefCell<SnapTlsDecode> = const { RefCell::new(SnapTlsDecode::new()) };
 }
 
+/// Maximum distinct collections permitted when decoding a snapshot (`LIN-0172`).
+pub const MAX_SNAPSHOT_COLLECTIONS: usize = 65_536;
+/// Maximum graph edges permitted when decoding a snapshot (`LIN-0172`).
+pub const MAX_SNAPSHOT_EDGES: usize = 67_108_864;
+/// Maximum byte length permitted for any single snapshot header or compressed/uncompressed section (`LIN-0171`).
+pub const MAX_SNAPSHOT_SECTION_BYTES: usize = 256 * 1024 * 1024;
+
 pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
     let path = snapshot_path(dir);
     let file = match fs::File::open(&path) {
@@ -73,21 +80,25 @@ pub fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, Error> {
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io_err)?;
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
-        decode_snapshot_bytes(&mmap)
-            .map(Some)
-            .ok_or_else(|| io_err("corrupt snapshot"))
+        match decode_snapshot_bytes_inner(&mmap) {
+            Ok(s) => Ok(Some(s)),
+            Err(SnapshotDecodeFail::Limit(e)) => Err(e),
+            Err(SnapshotDecodeFail::Corrupt) => Err(io_err("corrupt snapshot")),
+        }
     } else {
         use std::io::Read;
         let mut bytes = Vec::with_capacity(len as usize);
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut bytes).map_err(io_err)?;
-        decode_snapshot_bytes(&bytes)
-            .map(Some)
-            .ok_or_else(|| io_err("corrupt snapshot"))
+        match decode_snapshot_bytes_inner(&bytes) {
+            Ok(s) => Ok(Some(s)),
+            Err(SnapshotDecodeFail::Limit(e)) => Err(e),
+            Err(SnapshotDecodeFail::Corrupt) => Err(io_err("corrupt snapshot")),
+        }
     }
 }
 
-const SNAPSHOT_CRC_MAGIC: [u8; 4] = *b"LCRC";
+pub(super) const SNAPSHOT_CRC_MAGIC: [u8; 4] = *b"LCRC";
 
 /// Encode a snapshot ref to a writer using the chunked parallel snapshot format (`0x03` + `LIN\x04`).
 ///
@@ -403,13 +414,21 @@ pub fn read_backup(path: &Path) -> Result<Snapshot, Error> {
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io_err)?;
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
-        decode_snapshot_bytes(&mmap).ok_or_else(|| io_err("corrupt backup"))
+        match decode_snapshot_bytes_inner(&mmap) {
+            Ok(s) => Ok(s),
+            Err(SnapshotDecodeFail::Limit(e)) => Err(e),
+            Err(SnapshotDecodeFail::Corrupt) => Err(io_err("corrupt backup")),
+        }
     } else {
         use std::io::Read;
         let mut bytes = Vec::with_capacity(len as usize);
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut bytes).map_err(io_err)?;
-        decode_snapshot_bytes(&bytes).ok_or_else(|| io_err("corrupt backup"))
+        match decode_snapshot_bytes_inner(&bytes) {
+            Ok(s) => Ok(s),
+            Err(SnapshotDecodeFail::Limit(e)) => Err(e),
+            Err(SnapshotDecodeFail::Corrupt) => Err(io_err("corrupt backup")),
+        }
     }
 }
 
@@ -490,7 +509,328 @@ pub fn encode_snapshot_compressed(snap: &Snapshot) -> Result<Vec<u8>, Error> {
     }
 }
 
+enum SnapshotDecodeFail {
+    Corrupt,
+    Limit(Error),
+}
+
+fn msgpack_read_map_len(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    let tag = *bytes.get(*pos)?;
+    *pos += 1;
+    match tag {
+        0x80..=0x8f => Some((tag & 0x0f) as usize),
+        0xde => {
+            let n = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos += 2;
+            Some(n)
+        }
+        0xdf => {
+            let n = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos += 4;
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
+fn msgpack_read_array_len(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    let tag = *bytes.get(*pos)?;
+    *pos += 1;
+    match tag {
+        0x90..=0x9f => Some((tag & 0x0f) as usize),
+        0xdc => {
+            let n = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos += 2;
+            Some(n)
+        }
+        0xdd => {
+            let n = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos += 4;
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
+fn msgpack_read_str<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+    let tag = *bytes.get(*pos)?;
+    *pos += 1;
+    let len = match tag {
+        0xa0..=0xbf => (tag & 0x1f) as usize,
+        0xd9 => {
+            let n = *bytes.get(*pos)? as usize;
+            *pos += 1;
+            n
+        }
+        0xda => {
+            let n = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos += 2;
+            n
+        }
+        0xdb => {
+            let n = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos += 4;
+            n
+        }
+        _ => return None,
+    };
+    let s = std::str::from_utf8(bytes.get(*pos..*pos + len)?).ok()?;
+    *pos += len;
+    Some(s)
+}
+
+fn msgpack_skip_value(bytes: &[u8], pos: &mut usize, depth: usize) -> Option<()> {
+    if depth > 32 {
+        return None;
+    }
+    let tag = *bytes.get(*pos)?;
+    *pos += 1;
+    match tag {
+        0x00..=0x7f | 0xc0 | 0xc2 | 0xc3 | 0xe0..=0xff => {}
+        0x80..=0x8f => {
+            let n = (tag & 0x0f) as usize;
+            for _ in 0..n {
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+            }
+        }
+        0x90..=0x9f => {
+            let n = (tag & 0x0f) as usize;
+            for _ in 0..n {
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+            }
+        }
+        0xa0..=0xbf => {
+            let len = (tag & 0x1f) as usize;
+            *pos = pos.checked_add(len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xc4 | 0xd9 => {
+            let len = *bytes.get(*pos)? as usize;
+            *pos = pos.checked_add(1 + len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xc5 | 0xda => {
+            let len = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos = pos.checked_add(2 + len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xc6 | 0xdb => {
+            let len = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos = pos.checked_add(4 + len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xc7 => {
+            let len = *bytes.get(*pos)? as usize;
+            *pos = pos.checked_add(2 + len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xc8 => {
+            let len = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos = pos.checked_add(3 + len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xc9 => {
+            let len = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos = pos.checked_add(5 + len)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xcc | 0xd0 => {
+            *pos = pos.checked_add(1)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xcd | 0xd1 | 0xd4 => {
+            *pos = pos.checked_add(2)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xd5 => {
+            *pos = pos.checked_add(3)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xca | 0xce | 0xd2 => {
+            *pos = pos.checked_add(4)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xd6 => {
+            *pos = pos.checked_add(5)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xcb | 0xcf | 0xd3 => {
+            *pos = pos.checked_add(8)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xd7 => {
+            *pos = pos.checked_add(9)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xd8 => {
+            *pos = pos.checked_add(17)?;
+            if *pos > bytes.len() {
+                return None;
+            }
+        }
+        0xdc => {
+            let n = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos += 2;
+            for _ in 0..n {
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+            }
+        }
+        0xdd => {
+            let n = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos += 4;
+            for _ in 0..n {
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+            }
+        }
+        0xde => {
+            let n = u16::from_be_bytes(bytes.get(*pos..*pos + 2)?.try_into().ok()?) as usize;
+            *pos += 2;
+            for _ in 0..n {
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+            }
+        }
+        0xdf => {
+            let n = u32::from_be_bytes(bytes.get(*pos..*pos + 4)?.try_into().ok()?) as usize;
+            *pos += 4;
+            for _ in 0..n {
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+                msgpack_skip_value(bytes, pos, depth + 1)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Pre-validate top-level MessagePack header counts before `rmp_serde` allocates huge `Vec`/`Map`
+/// capacities on crafted headers (`LIN-0171`, `LIN-0172`).
+pub(super) fn validate_msgpack_header_limits(bytes: &[u8]) -> Result<(), Error> {
+    let mut pos = 0usize;
+    let Some(fields) = msgpack_read_map_len(bytes, &mut pos) else {
+        return Ok(());
+    };
+    if fields > 64 {
+        return Err(Error::runtime(format!(
+            "snapshot header field count {fields} exceeds supported schema bounds"
+        )));
+    }
+    for _ in 0..fields {
+        let Some(key) = msgpack_read_str(bytes, &mut pos) else {
+            return Ok(());
+        };
+        match key {
+            "edges" => {
+                let mut peek = pos;
+                if let Some(edge_len) = msgpack_read_array_len(bytes, &mut peek)
+                    && edge_len > MAX_SNAPSHOT_EDGES
+                {
+                    return Err(Error::runtime(format!(
+                        "snapshot edges count {edge_len} exceeds MAX_SNAPSHOT_EDGES ({MAX_SNAPSHOT_EDGES})"
+                    )));
+                }
+            }
+            "collections" | "extra_collections" => {
+                let mut peek = pos;
+                if let Some(col_len) = msgpack_read_map_len(bytes, &mut peek)
+                    && col_len > MAX_SNAPSHOT_COLLECTIONS
+                {
+                    return Err(Error::runtime(format!(
+                        "snapshot {key} count {col_len} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})"
+                    )));
+                }
+            }
+            "cold_collections" => {
+                let mut peek = pos;
+                if let Some(col_len) = msgpack_read_array_len(bytes, &mut peek)
+                    && col_len > MAX_SNAPSHOT_COLLECTIONS
+                {
+                    return Err(Error::runtime(format!(
+                        "snapshot cold_collections count {col_len} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})"
+                    )));
+                }
+            }
+            _ => {}
+        }
+        if msgpack_skip_value(bytes, &mut pos, 0).is_none() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoded_snapshot_limits(snap: &Snapshot) -> Result<(), SnapshotDecodeFail> {
+    if snap.collections.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            snap.collections.len()
+        ))));
+    }
+    if snap.extra_collections.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot extra_collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            snap.extra_collections.len()
+        ))));
+    }
+    if snap.cold_collections.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot cold_collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            snap.cold_collections.len()
+        ))));
+    }
+    if snap.edges.len() > MAX_SNAPSHOT_EDGES {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot edges count {} exceeds MAX_SNAPSHOT_EDGES ({MAX_SNAPSHOT_EDGES})",
+            snap.edges.len()
+        ))));
+    }
+    Ok(())
+}
+
+/// Decode raw snapshot bytes with explicit section and collection/edge bounds enforcement
+/// (`LIN-0171`, `LIN-0172`).
+pub fn decode_snapshot_bytes_checked(bytes: &[u8]) -> Result<Snapshot, Error> {
+    match decode_snapshot_bytes_inner(bytes) {
+        Ok(s) => Ok(s),
+        Err(SnapshotDecodeFail::Limit(e)) => Err(e),
+        Err(SnapshotDecodeFail::Corrupt) => Err(io_err("corrupt snapshot")),
+    }
+}
+
 pub(crate) fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
+    decode_snapshot_bytes_inner(bytes).ok()
+}
+
+fn decode_snapshot_bytes_inner(bytes: &[u8]) -> Result<Snapshot, SnapshotDecodeFail> {
     if bytes.len() >= 5 && bytes[1..5] == SNAPSHOT_MAGIC {
         let compressor = bytes[0];
         let compressed_data = &bytes[5..];
@@ -503,61 +843,115 @@ pub(crate) fn decode_snapshot_bytes(bytes: &[u8]) -> Option<Snapshot> {
 
                     let decoder = GzDecoder::new(compressed_data);
                     let mut result = Vec::new();
-                    let mut limited = decoder.take(256 * 1024 * 1024 + 1);
-                    limited.read_to_end(&mut result).ok()?;
-                    if result.len() > 256 * 1024 * 1024 {
-                        return None;
+                    let mut limited = decoder.take((MAX_SNAPSHOT_SECTION_BYTES as u64) + 1);
+                    limited
+                        .read_to_end(&mut result)
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    if result.len() > MAX_SNAPSHOT_SECTION_BYTES {
+                        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                            "snapshot decompressed section exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+                        ))));
                     }
-                    return rmp_serde::from_slice(&result).ok();
+                    validate_msgpack_header_limits(&result).map_err(SnapshotDecodeFail::Limit)?;
+                    let snap: Snapshot = rmp_serde::from_slice(&result)
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    validate_decoded_snapshot_limits(&snap)?;
+                    return Ok(snap);
                 }
                 #[cfg(not(feature = "compress-flate"))]
                 {
                     let _ = compressed_data;
-                    return None;
+                    return Err(SnapshotDecodeFail::Corrupt);
                 }
             }
             0x02 => {
                 #[cfg(feature = "compress-lz4")]
                 {
-                    let decompressed =
-                        lz4::block::decompress(compressed_data, Some(256 * 1024 * 1024)).ok()?;
-                    return rmp_serde::from_slice(&decompressed).ok();
+                    let max_i32 = i32::try_from(MAX_SNAPSHOT_SECTION_BYTES).unwrap_or(i32::MAX);
+                    let decompressed = lz4::block::decompress(compressed_data, Some(max_i32))
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    if decompressed.len() > MAX_SNAPSHOT_SECTION_BYTES {
+                        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                            "snapshot decompressed section exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+                        ))));
+                    }
+                    validate_msgpack_header_limits(&decompressed)
+                        .map_err(SnapshotDecodeFail::Limit)?;
+                    let snap: Snapshot = rmp_serde::from_slice(&decompressed)
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    validate_decoded_snapshot_limits(&snap)?;
+                    return Ok(snap);
                 }
                 #[cfg(not(feature = "compress-lz4"))]
                 {
                     let _ = compressed_data;
-                    return None;
+                    return Err(SnapshotDecodeFail::Corrupt);
                 }
             }
-            0x03 => return decode_chunked_snapshot(compressed_data, Some(bytes)),
+            0x03 => return decode_chunked_snapshot_checked(compressed_data, Some(bytes)),
             0x04 => {
                 #[cfg(feature = "compress-zstd")]
                 {
                     use std::io::Read;
-                    let decoder = zstd::Decoder::new(compressed_data).ok()?;
-                    let mut limited = decoder.take(256 * 1024 * 1024 + 1);
-                    let mut result = Vec::new();
-                    limited.read_to_end(&mut result).ok()?;
-                    if result.len() > 256 * 1024 * 1024 {
-                        return None;
+                    if let Some(exact_len) = zstd_frame_content_size(compressed_data)
+                        && exact_len > MAX_SNAPSHOT_SECTION_BYTES
+                    {
+                        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                            "snapshot zstd frame size {exact_len} exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+                        ))));
                     }
-                    return rmp_serde::from_slice(&result).ok();
+                    let decoder = zstd::Decoder::new(compressed_data)
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    let mut limited = decoder.take((MAX_SNAPSHOT_SECTION_BYTES as u64) + 1);
+                    let mut result = Vec::new();
+                    limited
+                        .read_to_end(&mut result)
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    if result.len() > MAX_SNAPSHOT_SECTION_BYTES {
+                        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                            "snapshot decompressed section exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+                        ))));
+                    }
+                    validate_msgpack_header_limits(&result).map_err(SnapshotDecodeFail::Limit)?;
+                    let snap: Snapshot = rmp_serde::from_slice(&result)
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+                    validate_decoded_snapshot_limits(&snap)?;
+                    return Ok(snap);
                 }
                 #[cfg(not(feature = "compress-zstd"))]
                 {
                     let _ = compressed_data;
-                    return None;
+                    return Err(SnapshotDecodeFail::Corrupt);
                 }
             }
-            _ => return None,
+            _ => return Err(SnapshotDecodeFail::Corrupt),
         }
     }
 
     // Uncompressed snapshot or legacy JSON backup
     if bytes.len() >= 4 && bytes[..4] == SNAPSHOT_MAGIC {
-        return rmp_serde::from_slice(&bytes[4..]).ok();
+        let body = &bytes[4..];
+        if body.len() > MAX_SNAPSHOT_SECTION_BYTES {
+            return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                "snapshot body size {} exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})",
+                body.len()
+            ))));
+        }
+        validate_msgpack_header_limits(body).map_err(SnapshotDecodeFail::Limit)?;
+        let snap: Snapshot =
+            rmp_serde::from_slice(body).map_err(|_| SnapshotDecodeFail::Corrupt)?;
+        validate_decoded_snapshot_limits(&snap)?;
+        return Ok(snap);
     }
-    serde_json::from_slice(bytes).ok()
+    if bytes.len() > MAX_SNAPSHOT_SECTION_BYTES {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot json size {} exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})",
+            bytes.len()
+        ))));
+    }
+    let snap: Snapshot = serde_json::from_slice(bytes).map_err(|_| SnapshotDecodeFail::Corrupt)?;
+    validate_decoded_snapshot_limits(&snap)?;
+    Ok(snap)
 }
 
 pub(super) struct ChunkSlice<'a> {
@@ -672,42 +1066,133 @@ pub(super) fn decode_snapshot_chunk<'a>(c: &ChunkSlice<'a>) -> Result<(&'a str, 
     })
 }
 
+#[allow(dead_code)]
 pub(super) fn decode_chunked_snapshot(
     data: &[u8],
     full_bytes: Option<&[u8]>,
 ) -> Option<Snapshot> {
+    decode_chunked_snapshot_checked(data, full_bytes).ok()
+}
+
+fn decode_chunked_snapshot_checked(
+    data: &[u8],
+    full_bytes: Option<&[u8]>,
+) -> Result<Snapshot, SnapshotDecodeFail> {
     if data.len() < 8 {
-        return None;
+        return Err(SnapshotDecodeFail::Corrupt);
     }
-    let header_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let header_len = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .map_err(|_| SnapshotDecodeFail::Corrupt)?,
+    ) as usize;
+    if header_len > MAX_SNAPSHOT_SECTION_BYTES {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot header size {header_len} exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+        ))));
+    }
     if data.len() < 4 + header_len + 4 {
-        return None;
+        return Err(SnapshotDecodeFail::Corrupt);
     }
     let header_bytes = &data[4..4 + header_len];
-    let header: SnapshotHeader = rmp_serde::from_slice(header_bytes).ok()?;
+    validate_msgpack_header_limits(header_bytes).map_err(SnapshotDecodeFail::Limit)?;
+    let header: SnapshotHeader =
+        rmp_serde::from_slice(header_bytes).map_err(|_| SnapshotDecodeFail::Corrupt)?;
+    if header.edges.len() > MAX_SNAPSHOT_EDGES {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot edges count {} exceeds MAX_SNAPSHOT_EDGES ({MAX_SNAPSHOT_EDGES})",
+            header.edges.len()
+        ))));
+    }
+    if header.extra_collections.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot extra_collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            header.extra_collections.len()
+        ))));
+    }
+    if header.cold_collections.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot cold_collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            header.cold_collections.len()
+        ))));
+    }
 
     let mut offset = 4 + header_len;
-    let chunk_count = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+    let chunk_count = u32::from_le_bytes(
+        data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| SnapshotDecodeFail::Corrupt)?,
+    ) as usize;
     offset += 4;
+    if chunk_count > MAX_SNAPSHOT_COLLECTIONS.saturating_mul(1024) {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot chunk count {chunk_count} exceeds maximum section count"
+        ))));
+    }
 
-    let mut chunk_slices = Vec::with_capacity(chunk_count);
+    let mut chunk_slices = Vec::with_capacity(chunk_count.min(4096));
+    let mut distinct_names: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+    for k in header.extra_collections.keys() {
+        distinct_names.insert(k.as_str());
+    }
+    for k in &header.cold_collections {
+        distinct_names.insert(k.as_str());
+    }
+    if distinct_names.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            distinct_names.len()
+        ))));
+    }
+
     for _ in 0..chunk_count {
         if data.len() < offset + 2 {
-            return None;
+            return Err(SnapshotDecodeFail::Corrupt);
         }
-        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize;
+        let name_len = u16::from_le_bytes(
+            data[offset..offset + 2]
+                .try_into()
+                .map_err(|_| SnapshotDecodeFail::Corrupt)?,
+        ) as usize;
         offset += 2;
         if data.len() < offset + name_len + 4 {
-            return None;
+            return Err(SnapshotDecodeFail::Corrupt);
         }
-        let name = std::str::from_utf8(&data[offset..offset + name_len]).ok()?;
+        let name = std::str::from_utf8(&data[offset..offset + name_len])
+            .map_err(|_| SnapshotDecodeFail::Corrupt)?;
+        distinct_names.insert(name);
+        if distinct_names.len() > MAX_SNAPSHOT_COLLECTIONS {
+            return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                "snapshot collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+                distinct_names.len()
+            ))));
+        }
         offset += name_len;
-        let data_len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        let data_len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .map_err(|_| SnapshotDecodeFail::Corrupt)?,
+        ) as usize;
         offset += 4;
+        if data_len > MAX_SNAPSHOT_SECTION_BYTES {
+            return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                "snapshot chunk section size {data_len} exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+            ))));
+        }
         if data.len() < offset + data_len {
-            return None;
+            return Err(SnapshotDecodeFail::Corrupt);
         }
         let chunk_data = &data[offset..offset + data_len];
+        #[cfg(feature = "compress-zstd")]
+        if chunk_data.len() >= 4
+            && chunk_data[0..4] == ZSTD_MAGIC
+            && let Some(exact_len) = zstd_frame_content_size(chunk_data)
+            && exact_len > MAX_SNAPSHOT_SECTION_BYTES
+        {
+            return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+                "snapshot chunk decompressed size {exact_len} exceeds MAX_SNAPSHOT_SECTION_BYTES ({MAX_SNAPSHOT_SECTION_BYTES})"
+            ))));
+        }
         offset += data_len;
         chunk_slices.push(ChunkSlice {
             name,
@@ -720,15 +1205,19 @@ pub(super) fn decode_chunked_snapshot(
             0 => {}
             8 if full[5 + offset..5 + offset + 4] == SNAPSHOT_CRC_MAGIC => {
                 let crc_off = 5 + offset + 4;
-                let stored = u32::from_le_bytes(full[crc_off..crc_off + 4].try_into().ok()?);
+                let stored = u32::from_le_bytes(
+                    full[crc_off..crc_off + 4]
+                        .try_into()
+                        .map_err(|_| SnapshotDecodeFail::Corrupt)?,
+                );
                 if crate::crc::hardware_crc32c(&full[..crc_off]) != stored {
-                    return None;
+                    return Err(SnapshotDecodeFail::Corrupt);
                 }
             }
-            _ => return None,
+            _ => return Err(SnapshotDecodeFail::Corrupt),
         }
     } else if offset != data.len() {
-        return None;
+        return Err(SnapshotDecodeFail::Corrupt);
     }
 
     let decoded_chunks: Vec<Result<(&str, Vec<Row>), ()>> = if chunk_slices.len() > 1 {
@@ -744,7 +1233,7 @@ pub(super) fn decode_chunked_snapshot(
                 .unwrap_or(4)
                 .min(chunk_slices.len());
             if num_workers > 1 {
-                let chunk_size = (chunk_slices.len() + num_workers - 1) / num_workers;
+                let chunk_size = chunk_slices.len().div_ceil(num_workers);
                 let chunk_blocks: Vec<&[ChunkSlice]> = chunk_slices.chunks(chunk_size).collect();
                 std::thread::scope(|s| {
                     let mut handles = Vec::with_capacity(chunk_blocks.len());
@@ -777,7 +1266,7 @@ pub(super) fn decode_chunked_snapshot(
 
     let mut ok_chunks: Vec<(&str, Vec<Row>)> = Vec::with_capacity(decoded_chunks.len());
     for res in decoded_chunks {
-        ok_chunks.push(res.ok()?);
+        ok_chunks.push(res.map_err(|_| SnapshotDecodeFail::Corrupt)?);
     }
 
     let mut collections: std::collections::BTreeMap<String, Vec<Row>> =
@@ -809,7 +1298,14 @@ pub(super) fn decode_chunked_snapshot(
         idx = end;
     }
 
-    Some(Snapshot {
+    if collections.len() > MAX_SNAPSHOT_COLLECTIONS {
+        return Err(SnapshotDecodeFail::Limit(Error::runtime(format!(
+            "snapshot collections count {} exceeds MAX_SNAPSHOT_COLLECTIONS ({MAX_SNAPSHOT_COLLECTIONS})",
+            collections.len()
+        ))));
+    }
+
+    Ok(Snapshot {
         r#gen: header.r#gen,
         embed_id: header.embed_id,
         next_id: header.next_id,

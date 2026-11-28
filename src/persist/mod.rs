@@ -24,8 +24,10 @@
 
 
 mod codec;
+pub mod inspect;
 mod snapshot;
 pub(crate) mod spill;
+pub use inspect::*;
 pub use spill::Spillable;
 mod types;
 mod wal;
@@ -45,9 +47,11 @@ pub(crate) use codec::{
 };
 
 pub use snapshot::{
-    encode_snapshot_ref_to_writer, read_backup, read_snapshot, write_backup, write_snapshot,
-    write_snapshot_ref, write_snapshot_ref_to_file,
+    MAX_SNAPSHOT_COLLECTIONS, MAX_SNAPSHOT_EDGES, MAX_SNAPSHOT_SECTION_BYTES,
+    decode_snapshot_bytes_checked, encode_snapshot_ref_to_writer, read_backup, read_snapshot,
+    write_backup, write_snapshot, write_snapshot_ref, write_snapshot_ref_to_file,
 };
+#[allow(unused_imports)]
 pub(crate) use snapshot::{decode_snapshot_bytes, write_snapshot_ref_to_file_ext};
 #[cfg(test)]
 pub use snapshot::encode_snapshot_ref_bytes;
@@ -79,8 +83,8 @@ pub use wal::append_batch_records;
 pub(crate) use wal::{
     append_record_v1_ref, append_validated_frame_slices, append_validated_frames,
     compute_frame_checksum, durable_sync, open_log_unreserved, prune_bins, replay_log_indexed,
-    reserve_wal_space, sync_dir_checked, truncate_log_with_sync, write_frame,
-    write_frame_precomputed, write_head_no_dir_sync,
+    replay_log_indexed_with_offset, reserve_wal_space, sync_dir_checked, truncate_log_with_sync,
+    write_frame, write_frame_precomputed, write_head_no_dir_sync,
 };
 #[allow(unused_imports)]
 pub(crate) use wal::{
