@@ -9,18 +9,18 @@ use std::time::Instant;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 
-mod agg;
+pub mod agg;
 mod cold;
 mod dml;
 mod gpu_ops;
-mod graph_ops;
-mod join;
+pub mod graph_ops;
+pub mod join;
 mod matview;
 mod mirror;
-mod prepared;
-mod search;
+pub mod prepared;
+pub mod search;
 pub(crate) mod shared;
-mod tx;
+pub mod tx;
 
 #[cfg(test)]
 mod tests;

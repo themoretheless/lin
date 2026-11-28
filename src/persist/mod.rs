@@ -26,7 +26,7 @@
 mod codec;
 pub mod inspect;
 mod snapshot;
-pub(crate) mod spill;
+pub mod spill;
 pub use inspect::*;
 pub use spill::Spillable;
 mod types;

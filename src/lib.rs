@@ -44,14 +44,14 @@
 //! Follower: [`Db::bootstrap_follower`] + [`ship::pull`] + [`Db::apply_wal`].
 //! Concurrent readers: [`Db::open_read`] on the follower dir. Not multi-writer.
 
-mod ast;
-mod batch;
-mod catalog;
+pub mod ast;
+pub mod batch;
+pub mod catalog;
 mod check;
 pub mod crc;
-mod cursor;
+pub mod cursor;
 pub mod disk;
-mod embed;
+pub mod embed;
 #[cfg(feature = "embed-ollama")]
 mod embed_ollama;
 #[cfg(feature = "embed-onnx")]
@@ -59,18 +59,18 @@ mod embed_onnx;
 pub mod error;
 mod eval;
 mod exact_sum;
-mod exec;
+pub mod exec;
 mod explain;
-mod fts;
+pub mod fts;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-mod graph;
-mod index;
+pub mod graph;
+pub mod index;
 mod parse;
 pub mod persist;
 mod plan;
-mod store;
-mod window;
+pub mod store;
+pub mod window;
 mod work_steal;
 
 pub mod cache;
