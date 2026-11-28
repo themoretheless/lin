@@ -2,7 +2,7 @@ name: Compare native embedded Rust clients
 
 on:
   push:
-    branches: [codex/main-wal-short-text-prefix]
+    branches: [codex/prefix-caller-first-chunk]
 
 permissions:
   contents: read
@@ -39,13 +39,14 @@ jobs:
           build_worker() {
             cargo rustc --no-default-features --locked --release -p lin-peer-worker --bin embedded-native "$@" -- "${link[@]}"
           }
+          git restore --source=HEAD^ -- src/exec/dml.rs
           git show 3b967b4c5:src/persist/codec.rs > src/persist/codec.rs
           build_worker
           cp target/release/embedded-native target/release/typed-baseline
-          git show 91837f13229463b1c1bf279379208c6eeec4353f:src/persist/codec.rs > src/persist/codec.rs
+          git restore src/persist/codec.rs
           build_worker --features lin/wal-delta-trial
           cp target/release/embedded-native target/release/typed-two-pass
-          git restore src/persist/codec.rs
+          git restore src/exec/dml.rs
           build_worker --features lin/wal-delta-trial
           for n in 1000 10000; do
             LIN_BENCH_EXPORT_WAL="$RUNNER_TEMP/wal-$n" target/release/embedded-native lin-wal "$n" 1 "$(mktemp -d)"
@@ -58,7 +59,7 @@ jobs:
               data = (Path(os.environ["RUNNER_TEMP"]) / f"wal-{size}").read_bytes()
               start = 8 + int.from_bytes(data[4:8], "little")
               assert len(data) == {1000: 113697, 10000: 1174118}[size]
-              assert (Path(os.environ["RUNNER_TEMP"]) / f"scalar-{size}").stat().st_size == {1000: 164383, 10000: 1721159}[size]
+              assert (Path(os.environ["RUNNER_TEMP"]) / f"scalar-{size}").stat().st_size == {1000: 113697, 10000: 1174118}[size]
               assert data[start + 8] == codec
               assert start + 8 + int.from_bytes(data[start+4:start+8], "little") == len(data)
           PYCODE

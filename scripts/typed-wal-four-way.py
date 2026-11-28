@@ -7,8 +7,8 @@ from tempfile import TemporaryDirectory
 
 workers = {
     "baseline": ("typed-baseline", "lin-wal"),
-    "two_pass": ("typed-two-pass", "lin-wal"),
-    "prefix": ("embedded-native", "lin-wal"),
+    "prefix": ("typed-two-pass", "lin-wal"),
+    "caller": ("embedded-native", "lin-wal"),
     "sqlite": ("embedded-native", "sqlite"),
 }
 orders = list(permutations(workers))

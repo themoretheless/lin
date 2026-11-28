@@ -2314,7 +2314,7 @@ pub(crate) fn build_batch_insert_rows(
     };
 
     let build_range = |start: usize, end: usize| -> Vec<Row> {
-        let mut out = Vec::with_capacity(end - start);
+        let mut out = Vec::with_capacity(if start == 0 { n } else { end - start });
         let mut fill_with = |mut embed_batch: Option<&mut crate::embed::HashingBatch<'_>>| {
             for i in start..end {
                 let mut emb_vec = embed_batch.as_deref_mut().map(|eb| {
@@ -2368,9 +2368,9 @@ pub(crate) fn build_batch_insert_rows(
         if threads > 1 {
             let chunk_size = (n + threads - 1) / threads;
             let build_range = &build_range;
-            let chunks: Vec<Vec<Row>> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(threads);
-                for c in 0..threads {
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(threads - 1);
+                for c in 1..threads {
                     let start = c * chunk_size;
                     if start >= n {
                         break;
@@ -2378,13 +2378,12 @@ pub(crate) fn build_batch_insert_rows(
                     let end = (start + chunk_size).min(n);
                     handles.push(scope.spawn(move || build_range(start, end)));
                 }
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            let mut out = Vec::with_capacity(n);
-            for chunk in chunks {
-                out.extend(chunk);
-            }
-            out
+                let mut out = build_range(0, chunk_size);
+                for handle in handles {
+                    out.extend(handle.join().unwrap());
+                }
+                out
+            })
         } else {
             build_range(0, n)
         }
