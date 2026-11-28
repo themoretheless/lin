@@ -916,9 +916,17 @@ pub fn content_hash_inline(body: &str) -> InlineStr {
     buf[0] = b'h';
     buf[1] = b':';
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        buf[2 + i] = HEX[((h >> shift) & 0xf) as usize];
+    const PAIRS: [[u8; 2]; 256] = {
+        let mut pairs = [[0; 2]; 256];
+        let mut i = 0;
+        while i < pairs.len() {
+            pairs[i] = [HEX[i >> 4], HEX[i & 15]];
+            i += 1;
+        }
+        pairs
+    };
+    for (digits, byte) in buf[2..18].chunks_exact_mut(2).zip(h.to_be_bytes()) {
+        digits.copy_from_slice(&PAIRS[usize::from(byte)]);
     }
     InlineStr { len: 18, buf }
 }
