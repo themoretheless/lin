@@ -41,6 +41,7 @@ fn main() -> Result<()> {
                     Db::empty()
                 };
                 db.run("index docs [wing, ts]")?;
+                eprintln!("begin timed insert");
                 start = Instant::now();
                 let names = ["id", "uri", "wing", "title", "ts", "body", "layer"].map(String::from);
                 let mut batch = RecordBatch::with_capacity(names.to_vec(), n);
@@ -57,6 +58,7 @@ fn main() -> Result<()> {
                 }
                 let done = db.insert_batch("docs", &batch)?;
                 elapsed = start.elapsed();
+                eprintln!("end timed insert");
                 assert_eq!(done.n, n);
                 if durable {
                     if let Some(target) = std::env::var_os("LIN_BENCH_EXPORT_WAL") {
