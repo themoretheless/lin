@@ -570,3 +570,720 @@ fn write_head(
 fn short_name(kind: &NodeKind) -> &'static str {
     kind.short_name()
 }
+
+// ============================================================================
+// Structured EXPLAIN Output (`LIN-0507`, `LIN-0557`..`LIN-0560`, `LIN-0589`, `LIN-1463`)
+// ============================================================================
+
+use serde::{Deserialize, Serialize};
+
+use crate::catalog::Catalog;
+use crate::error::Error;
+use crate::stats::{
+    CostEstimator, SelectivityFeedbackReceipt, StatsCatalog, compare_estimate_actual,
+};
+
+/// Selected physical execution backend reported by [`StructuredExplain`] (`LIN-0557`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExplainBackend {
+    InMemoryRow,
+    ColumnarBatch,
+    ColdDisk,
+    GpuCandidate,
+}
+
+/// Exactness contract of a query plan (`LIN-0559`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanAccuracy {
+    Exact,
+    Approximate,
+}
+
+/// Machine-readable operator node in [`StructuredExplain`] (`LIN-1463`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplainNode {
+    pub operator: String,
+    pub detail: String,
+    pub backend: ExplainBackend,
+    pub effect: String,
+    pub estimated_rows: Option<usize>,
+    pub estimated_bytes: Option<usize>,
+    pub confidence: Option<f64>,
+    pub notes: Vec<String>,
+    pub children: Vec<ExplainNode>,
+}
+
+/// Machine-readable `EXPLAIN` summary with fingerprints, output column types, backend/GPU
+/// eligibility reasoning, accuracy labels, and calibrated cardinality/memory estimates
+/// (`LIN-0507`, `LIN-0557`..`LIN-0560`, `LIN-1463`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructuredExplain {
+    pub plan_fingerprint: String,
+    pub backend: ExplainBackend,
+    pub gpu_eligibility: String,
+    pub accuracy: PlanAccuracy,
+    pub output_fields: Vec<(String, String)>,
+    pub estimated_rows: Option<usize>,
+    pub estimated_bytes: Option<usize>,
+    pub steps: Vec<ExplainNode>,
+}
+
+/// Compare a [`StructuredExplain`] cardinality estimate against actual execution rows (`LIN-0589`, `LIN-0590`).
+pub fn compare_explain_with_actual(
+    explain: &StructuredExplain,
+    actual_rows: usize,
+) -> SelectivityFeedbackReceipt {
+    compare_estimate_actual(explain.estimated_rows.unwrap_or(0), actual_rows)
+}
+
+/// Build a [`StructuredExplain`] against the default fixture catalog (`LIN-1463`).
+pub fn explain_structured(
+    src: &str,
+    stats: Option<&StatsCatalog>,
+    gpu_attached: bool,
+) -> Result<StructuredExplain, Error> {
+    let cat = crate::catalog::fixture();
+    explain_structured_with_catalog(src, &cat, stats, gpu_attached, &[])
+}
+
+/// Build a [`StructuredExplain`] against an explicit [`Catalog`], optional [`StatsCatalog`],
+/// GPU attachment flag, and cold-disk collection list (`LIN-0507`, `LIN-0557`..`LIN-0560`, `LIN-1463`).
+pub fn explain_structured_with_catalog(
+    src: &str,
+    cat: &Catalog,
+    stats: Option<&StatsCatalog>,
+    gpu_attached: bool,
+    cold_collections: &[&str],
+) -> Result<StructuredExplain, Error> {
+    let stmts = crate::parse::parse_program(src)?;
+    let (staged, output_fields) = crate::check::check_program_output_fields(&stmts, cat)?;
+    let effective_cat = staged.as_ref().unwrap_or(cat);
+    let plan = crate::plan::plan_program(&stmts, effective_cat)?;
+
+    let fp = crate::plan::plan_fingerprint(&plan);
+    let plan_fingerprint = format!("p:{fp:016x}");
+    let accuracy = classify_plan_accuracy(&plan.root);
+
+    let estimator = CostEstimator::default();
+    let fallback_sizes = CollectionSizes::fixture();
+
+    let (scan_collection, scan_rows, has_write, has_graph_or_point, has_gpu_incompatible_op) =
+        inspect_plan_properties(&plan.root, stats, &fallback_sizes);
+
+    let is_cold = scan_collection
+        .as_deref()
+        .is_some_and(|c| cold_collections.contains(&c));
+
+    let (backend, gpu_eligibility) = classify_backend_and_gpu(
+        &plan.root,
+        is_cold,
+        gpu_attached,
+        scan_rows,
+        has_write,
+        has_graph_or_point,
+        has_gpu_incompatible_op,
+    );
+
+    let root_explained = build_explain_tree(
+        &plan.root,
+        effective_cat,
+        stats,
+        &estimator,
+        &fallback_sizes,
+        backend,
+        scan_collection.as_deref(),
+    );
+
+    let estimated_rows = root_explained.estimated_rows;
+    let estimated_bytes = root_explained.estimated_bytes;
+    let mut steps = Vec::new();
+    flatten_pipeline_spine(root_explained, &mut steps);
+
+    Ok(StructuredExplain {
+        plan_fingerprint,
+        backend,
+        gpu_eligibility,
+        accuracy,
+        output_fields,
+        estimated_rows,
+        estimated_bytes,
+        steps,
+    })
+}
+
+fn classify_plan_accuracy(node: &Node) -> PlanAccuracy {
+    match &node.kind {
+        NodeKind::Search {
+            mode: SearchMode::Vec | SearchMode::Hybrid,
+            ..
+        }
+        | NodeKind::Rrf { .. } => PlanAccuracy::Approximate,
+        _ => {
+            for c in &node.children {
+                if classify_plan_accuracy(c) == PlanAccuracy::Approximate {
+                    return PlanAccuracy::Approximate;
+                }
+            }
+            PlanAccuracy::Exact
+        }
+    }
+}
+
+fn inspect_plan_properties(
+    node: &Node,
+    stats: Option<&StatsCatalog>,
+    fallback: &CollectionSizes,
+) -> (Option<String>, usize, bool, bool, bool) {
+    let mut scan_col: Option<String> = None;
+    let mut scan_rows = 0usize;
+    let mut has_write = node.effect != Effect::Read;
+    let mut has_graph_or_point = false;
+    let mut has_gpu_incompat = false;
+
+    fn walk(
+        n: &Node,
+        stats: Option<&StatsCatalog>,
+        fallback: &CollectionSizes,
+        scan_col: &mut Option<String>,
+        scan_rows: &mut usize,
+        has_write: &mut bool,
+        has_graph_or_point: &mut bool,
+        has_gpu_incompat: &mut bool,
+    ) {
+        if n.effect != Effect::Read {
+            *has_write = true;
+        }
+        if n.backend == crate::plan::Backend::Idb && !matches!(n.kind, NodeKind::Get { .. }) {
+            *has_gpu_incompat = true;
+        }
+        match &n.kind {
+            NodeKind::Reduce { effects, .. } => {
+                if effects.iter().any(|e| *e != Effect::Read) {
+                    *has_write = true;
+                }
+            }
+            NodeKind::Scan { collection, .. }
+            | NodeKind::IndexSeek { collection, .. }
+            | NodeKind::FtsSeek { collection, .. } => {
+                if scan_col.is_none() {
+                    *scan_col = Some(collection.clone());
+                    *scan_rows = stats
+                        .and_then(|s| s.inspect(collection))
+                        .map(|ts| ts.row_count)
+                        .unwrap_or_else(|| fallback.get(collection).round().max(0.0) as usize);
+                }
+                if matches!(n.kind, NodeKind::FtsSeek { .. }) {
+                    *has_gpu_incompat = true;
+                }
+            }
+            NodeKind::Get { collection, .. } => {
+                if scan_col.is_none() {
+                    *scan_col = Some(collection.clone());
+                    *scan_rows = 1;
+                }
+                *has_graph_or_point = true;
+            }
+            NodeKind::Hop { .. } | NodeKind::Graph { .. } | NodeKind::Match { .. } => {
+                *has_graph_or_point = true;
+            }
+            NodeKind::Window { .. }
+            | NodeKind::Search {
+                mode: SearchMode::Lex | SearchMode::Hybrid,
+                ..
+            } => {
+                *has_gpu_incompat = true;
+            }
+            NodeKind::Append { .. }
+            | NodeKind::InsertPack { .. }
+            | NodeKind::Cas { .. }
+            | NodeKind::BatchCAS { .. }
+            | NodeKind::Delete { .. }
+            | NodeKind::DeleteEdge { .. }
+            | NodeKind::Reembed { .. }
+            | NodeKind::Schema { .. } => {
+                *has_write = true;
+            }
+            _ => {}
+        }
+        for c in &n.children {
+            walk(
+                c,
+                stats,
+                fallback,
+                scan_col,
+                scan_rows,
+                has_write,
+                has_graph_or_point,
+                has_gpu_incompat,
+            );
+        }
+    }
+
+    walk(
+        node,
+        stats,
+        fallback,
+        &mut scan_col,
+        &mut scan_rows,
+        &mut has_write,
+        &mut has_graph_or_point,
+        &mut has_gpu_incompat,
+    );
+    (
+        scan_col,
+        scan_rows,
+        has_write,
+        has_graph_or_point,
+        has_gpu_incompat,
+    )
+}
+
+fn classify_backend_and_gpu(
+    root: &Node,
+    is_cold: bool,
+    gpu_attached: bool,
+    scan_rows: usize,
+    has_write: bool,
+    has_graph_or_point: bool,
+    has_gpu_incompat: bool,
+) -> (ExplainBackend, String) {
+    const GPU_CROSSOVER_ROWS: usize = 1024;
+    const BATCH_CROSSOVER_ROWS: usize = 256;
+
+    if has_write {
+        return (
+            ExplainBackend::InMemoryRow,
+            "ineligible: write or schema mutation executes on CPU row engine".into(),
+        );
+    }
+    if is_cold {
+        let gpu_reason = if !gpu_attached {
+            "ineligible: cold-disk collection scanned via mmap segments (and no GPU attached)"
+                .into()
+        } else {
+            "ineligible: cold-disk collection scanned via mmap segments before resident upload"
+                .into()
+        };
+        return (ExplainBackend::ColdDisk, gpu_reason);
+    }
+    if has_graph_or_point {
+        return (
+            ExplainBackend::InMemoryRow,
+            "ineligible: point lookup or graph traversal executes on CPU".into(),
+        );
+    }
+    if has_gpu_incompat {
+        let backend = if scan_rows >= BATCH_CROSSOVER_ROWS && is_columnar_pipeline(root) {
+            ExplainBackend::ColumnarBatch
+        } else {
+            ExplainBackend::InMemoryRow
+        };
+        return (
+            backend,
+            "ineligible: operator pipeline contains FTS/window/IDB step unsupported on GPU".into(),
+        );
+    }
+    if scan_rows >= GPU_CROSSOVER_ROWS {
+        if gpu_attached {
+            return (
+                ExplainBackend::GpuCandidate,
+                format!(
+                    "eligible: GPU attached and input cardinality ({scan_rows}) >= {GPU_CROSSOVER_ROWS} crossover"
+                ),
+            );
+        }
+        let cpu_backend = if is_columnar_pipeline(root) {
+            ExplainBackend::ColumnarBatch
+        } else {
+            ExplainBackend::InMemoryRow
+        };
+        return (
+            cpu_backend,
+            format!(
+                "ineligible: GPU not attached (pipeline is GPU-compatible at {scan_rows} rows)"
+            ),
+        );
+    }
+
+    let gpu_reason = if gpu_attached {
+        format!(
+            "ineligible: input cardinality ({scan_rows}) below GPU transfer crossover ({GPU_CROSSOVER_ROWS} rows)"
+        )
+    } else {
+        format!(
+            "ineligible: GPU not attached and input cardinality ({scan_rows}) below crossover ({GPU_CROSSOVER_ROWS} rows)"
+        )
+    };
+
+    let backend = if scan_rows >= BATCH_CROSSOVER_ROWS && is_columnar_pipeline(root) {
+        ExplainBackend::ColumnarBatch
+    } else {
+        ExplainBackend::InMemoryRow
+    };
+    (backend, gpu_reason)
+}
+
+fn is_columnar_pipeline(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::Reduce { .. }
+        | NodeKind::Scan { .. }
+        | NodeKind::IndexSeek { .. }
+        | NodeKind::Filter { .. }
+        | NodeKind::Project { .. }
+        | NodeKind::Without { .. }
+        | NodeKind::Sort { .. }
+        | NodeKind::Skip { .. }
+        | NodeKind::Take { .. }
+        | NodeKind::Agg { .. }
+        | NodeKind::Join { .. } => node.children.iter().all(is_columnar_pipeline),
+        _ => false,
+    }
+}
+
+fn build_explain_tree(
+    node: &Node,
+    cat: &Catalog,
+    stats: Option<&StatsCatalog>,
+    estimator: &CostEstimator,
+    fallback: &CollectionSizes,
+    plan_backend: ExplainBackend,
+    primary_col: Option<&str>,
+) -> ExplainNode {
+    let children: Vec<ExplainNode> = node
+        .children
+        .iter()
+        .map(|c| {
+            build_explain_tree(
+                c,
+                cat,
+                stats,
+                estimator,
+                fallback,
+                plan_backend,
+                primary_col,
+            )
+        })
+        .collect();
+
+    let c0_rows = children.first().and_then(|c| c.estimated_rows).unwrap_or(0);
+    let c0_conf = children.first().and_then(|c| c.confidence).unwrap_or(0.5);
+    let c1_rows = children.get(1).and_then(|c| c.estimated_rows).unwrap_or(0);
+
+    let avg_row_bytes_for = |col_name: &str, num_cols: usize| -> usize {
+        stats
+            .and_then(|s| s.inspect(col_name))
+            .map(|ts| ts.avg_row_bytes.max(24 * num_cols.max(1)))
+            .unwrap_or_else(|| 24 * num_cols.max(1))
+    };
+
+    let default_row_bytes = primary_col
+        .map(|c| avg_row_bytes_for(c, 3))
+        .unwrap_or(72);
+
+    let (est_rows, est_bytes, conf) = match &node.kind {
+        NodeKind::Reduce { .. } => {
+            let b = children
+                .first()
+                .and_then(|c| c.estimated_bytes)
+                .unwrap_or(c0_rows * default_row_bytes);
+            (c0_rows, b, c0_conf)
+        }
+        NodeKind::Scan { collection, cols } => match stats.and_then(|s| s.inspect(collection)) {
+            Some(ts) => {
+                let col_bytes = (cols.len().max(1) * 24).min(ts.avg_row_bytes.max(24));
+                (ts.row_count, ts.row_count * col_bytes, 1.0)
+            }
+            None => {
+                let r = fallback.get(collection).round().max(0.0) as usize;
+                (r, r * cols.len().max(1) * 24, 0.35)
+            }
+        },
+        NodeKind::Get { collection, .. } => {
+            let rb = avg_row_bytes_for(collection, 4);
+            (1, rb, 1.0)
+        }
+        NodeKind::IndexSeek { collection, fields } => {
+            match stats.and_then(|s| s.inspect(collection)) {
+                Some(ts) => {
+                    let ndv = fields
+                        .first()
+                        .and_then(|f| ts.columns.get(f))
+                        .map(|c| c.distinct_estimate.max(1))
+                        .unwrap_or(4);
+                    let r = (ts.row_count / ndv).max(usize::from(ts.row_count > 0));
+                    let rb = avg_row_bytes_for(collection, fields.len() + 1);
+                    (r, r * rb, 0.85)
+                }
+                None => {
+                    let r = (fallback.get(collection) * 0.25).round().max(1.0) as usize;
+                    (r, r * 48, 0.35)
+                }
+            }
+        }
+        NodeKind::FtsSeek { collection, .. } => match stats.and_then(|s| s.inspect(collection)) {
+            Some(ts) => {
+                let r = ((ts.row_count as f64) * 0.15).round() as usize;
+                let r = r.min(ts.row_count);
+                (r, r * avg_row_bytes_for(collection, 3), 0.6)
+            }
+            None => {
+                let r = (fallback.get(collection) * 0.15).round().max(1.0) as usize;
+                (r, r * 72, 0.35)
+            }
+        },
+        NodeKind::Filter { pred } => {
+            if let Some(col_name) = primary_col
+                && let Some(ts) = stats.and_then(|s| s.inspect(col_name))
+                && let Ok(parsed_pred) = crate::parse::parse_pred_src(pred)
+            {
+                let est = estimator.estimate_residual_filter(ts, &parsed_pred);
+                // When child is already narrowed (e.g. IndexSeek), cap by child rows or use est directly
+                // when child is IndexSeek on the same predicate!
+                let child_is_seek = node
+                    .children
+                    .first()
+                    .is_some_and(|c| matches!(c.kind, NodeKind::IndexSeek { .. }));
+                let r = if child_is_seek {
+                    est.rows.min(ts.row_count)
+                } else if ts.row_count > 0 && c0_rows < ts.row_count {
+                    let sel = est.rows as f64 / ts.row_count as f64;
+                    ((c0_rows as f64) * sel).round() as usize
+                } else {
+                    est.rows
+                };
+                (r, r * default_row_bytes, est.confidence)
+            } else {
+                let r = ((c0_rows as f64) * 0.35).round() as usize;
+                (r, r * default_row_bytes, (c0_conf * 0.6).clamp(0.1, 1.0))
+            }
+        }
+        NodeKind::Project { fields } => {
+            let rb = fields.len().max(1) * 24;
+            (c0_rows, c0_rows * rb, c0_conf)
+        }
+        NodeKind::Without { fields } => {
+            let rem = cat
+                .collection(primary_col.unwrap_or(""))
+                .map(|c| c.fields.len().saturating_sub(fields.len()).max(1))
+                .unwrap_or(2);
+            (c0_rows, c0_rows * rem * 24, c0_conf)
+        }
+        NodeKind::Sort { .. } => {
+            let bytes = estimator.estimate_sort_bytes(c0_rows, default_row_bytes, None);
+            (c0_rows, bytes, c0_conf)
+        }
+        NodeKind::Skip { n } => {
+            let r = c0_rows.saturating_sub((*n).max(0) as usize);
+            (r, r * default_row_bytes, c0_conf)
+        }
+        NodeKind::Take { n, .. } => {
+            let r = match n {
+                Some(k) => c0_rows.min((*k).max(0) as usize),
+                None => c0_rows,
+            };
+            let b = children
+                .first()
+                .map(|c| {
+                    let per_row = if c0_rows > 0 {
+                        c.estimated_bytes.unwrap_or(default_row_bytes) / c0_rows
+                    } else {
+                        default_row_bytes
+                    };
+                    r * per_row.max(24)
+                })
+                .unwrap_or(r * default_row_bytes);
+            (r, b, c0_conf)
+        }
+        NodeKind::Agg { by, .. } => {
+            if by == "*" {
+                (1, 32, c0_conf)
+            } else if let Some(col_name) = primary_col
+                && let Some(ts) = stats.and_then(|s| s.inspect(col_name))
+            {
+                let group_fields: Vec<&str> = by.split(',').map(str::trim).collect();
+                let g = estimator.estimate_agg_groups(ts, &group_fields).min(c0_rows.max(1));
+                let g = if c0_rows == 0 { 0 } else { g };
+                (g, g * 48, (c0_conf * 0.85).clamp(0.1, 1.0))
+            } else {
+                let g = if c0_rows == 0 { 0 } else { (c0_rows / 3).max(1) };
+                (g, g * 48, (c0_conf * 0.5).clamp(0.1, 1.0))
+            }
+        }
+        NodeKind::Join { left, fk } => {
+            let right_col = node.children.get(1).and_then(|c| match &c.kind {
+                NodeKind::Scan { collection, .. } => Some(collection.as_str()),
+                _ => None,
+            });
+            if let (Some(lcol), Some(rcol)) = (primary_col, right_col)
+                && let (Some(lts), Some(rts)) = (
+                    stats.and_then(|s| s.inspect(lcol)),
+                    stats.and_then(|s| s.inspect(rcol)),
+                )
+            {
+                let (lkey, rkey) = parse_fk_keys(fk);
+                let mut scaled_left = lts.clone();
+                scaled_left.row_count = c0_rows;
+                let j = estimator.estimate_join(&scaled_left, rts, lkey, rkey);
+                let out_r = if *left { j.output_rows.max(c0_rows) } else { j.output_rows };
+                (
+                    out_r,
+                    j.build_bytes + out_r * (default_row_bytes + 48),
+                    (c0_conf * 0.8).clamp(0.1, 1.0),
+                )
+            } else {
+                let out_r = if *left {
+                    c0_rows
+                } else {
+                    ((c0_rows as f64) * 0.8).round() as usize
+                };
+                (
+                    out_r,
+                    (c1_rows + out_r) * default_row_bytes,
+                    (c0_conf * 0.5).clamp(0.1, 1.0),
+                )
+            }
+        }
+        NodeKind::Hop { depth, cap, .. } | NodeKind::Graph { depth, cap, .. } => {
+            let est = estimator.estimate_graph_expansion(
+                c0_rows,
+                2.0,
+                (*depth).max(1) as usize,
+                (*cap).max(0) as usize,
+            );
+            (est.rows, est.rows * default_row_bytes, est.confidence)
+        }
+        NodeKind::Match { hops, cap, .. } => {
+            let est = estimator.estimate_graph_expansion(
+                c0_rows,
+                2.0,
+                hops.len().max(1),
+                (*cap).max(0) as usize,
+            );
+            (est.rows, est.rows * default_row_bytes, est.confidence)
+        }
+        NodeKind::Search { k, .. } | NodeKind::Rrf { k } => {
+            let r = c0_rows.min((*k).max(0) as usize);
+            (r, r * default_row_bytes, 0.75)
+        }
+        NodeKind::Union | NodeKind::Seq => {
+            let r = c0_rows + c1_rows;
+            (r, r * default_row_bytes, c0_conf)
+        }
+        NodeKind::Window { .. } => (c0_rows, c0_rows * (default_row_bytes + 16), c0_conf),
+        NodeKind::Append { n, .. } | NodeKind::InsertPack { n, .. } => (*n, *n * 64, 1.0),
+        _ => (c0_rows.max(1), default_row_bytes, 1.0),
+    };
+
+    let node_backend = match &node.kind {
+        NodeKind::Get { .. }
+        | NodeKind::Hop { .. }
+        | NodeKind::Graph { .. }
+        | NodeKind::Match { .. } => ExplainBackend::InMemoryRow,
+        _ => plan_backend,
+    };
+
+    ExplainNode {
+        operator: node.kind.short_name().to_string(),
+        detail: describe_node_detail(&node.kind),
+        backend: node_backend,
+        effect: node.effect.as_str().to_string(),
+        estimated_rows: Some(est_rows),
+        estimated_bytes: Some(est_bytes),
+        confidence: Some(conf),
+        notes: node.notes.clone(),
+        children,
+    }
+}
+
+fn parse_fk_keys(fk: &str) -> (&str, &str) {
+    if let Some((lhs, rhs)) = fk.split_once('→') {
+        let lk = lhs.rsplit('.').next().unwrap_or(lhs);
+        let rk = rhs.rsplit('.').next().unwrap_or("id");
+        (lk, rk)
+    } else {
+        ("id", "id")
+    }
+}
+
+fn describe_node_detail(kind: &NodeKind) -> String {
+    match kind {
+        NodeKind::Reduce {
+            effects,
+            snapshot,
+            embed,
+        } => {
+            let eff: Vec<&str> = effects.iter().copied().map(Effect::as_str).collect();
+            format!("effect={} snapshot={snapshot} embed={embed}", eff.join("+"))
+        }
+        NodeKind::Scan { collection, cols } => {
+            format!("{collection} cols=[{}]", cols.join(", "))
+        }
+        NodeKind::Filter { pred } => pred.clone(),
+        NodeKind::Project { fields } | NodeKind::Without { fields } => {
+            format!("[{}]", fields.join(", "))
+        }
+        NodeKind::Join { left, fk } => {
+            format!("{} fk={fk}", if *left { "left" } else { "inner" })
+        }
+        NodeKind::Hop { rel, depth, cap } | NodeKind::Graph { rel, depth, cap } => {
+            format!("{rel} depth={depth} cap={cap}")
+        }
+        NodeKind::Match { start, hops, cap } => {
+            let prefix = start.as_deref().unwrap_or("");
+            format!("{prefix} {} cap={cap}", hops.join(" "))
+                .trim()
+                .to_string()
+        }
+        NodeKind::Search { mode, query, k } => {
+            let m = match mode {
+                SearchMode::Hybrid => "hybrid",
+                SearchMode::Lex => "lex",
+                SearchMode::Vec => "vec",
+            };
+            format!("{m} {query:?} k={k}")
+        }
+        NodeKind::Rrf { k } => format!("k={k}"),
+        NodeKind::Agg { op, by } => format!("{op} by {by}"),
+        NodeKind::Sort { field, desc } => {
+            format!("{field} {}", if *desc { "desc" } else { "asc" })
+        }
+        NodeKind::Window {
+            func, as_field, ..
+        } => format!("{func} as {as_field}"),
+        NodeKind::Skip { n } => format!("{n}"),
+        NodeKind::Take { n, implicit } => match n {
+            Some(v) if *implicit => format!("{v} implicit"),
+            Some(v) => format!("{v}"),
+            None => "all".into(),
+        },
+        NodeKind::Get { collection, key } => format!("{collection} {key}"),
+        NodeKind::IndexSeek { collection, fields } => {
+            format!("index={collection}[{}]", fields.join(","))
+        }
+        NodeKind::FtsSeek {
+            collection,
+            fields,
+            query,
+        } => format!("{collection}[{}] query={query:?}", fields.join(",")),
+        NodeKind::Schema { detail } => detail.clone(),
+        NodeKind::Append { kind, detail, n } => format!("{kind} {detail} n={n}"),
+        NodeKind::InsertPack { collection, n, .. } => format!("{collection} n={n}"),
+        NodeKind::Cas { hash } => format!("hash={hash:?}"),
+        NodeKind::BatchCAS { n } => format!("n={n:?}"),
+        NodeKind::Reembed { collection, to } => format!("{collection} to={to:?}"),
+        NodeKind::Delete { collection } => collection.clone(),
+        NodeKind::DeleteEdge { rel, from, to } => format!("{rel} {from} -> {to}"),
+        NodeKind::Let { name } => name.clone(),
+        NodeKind::Union | NodeKind::Seq | NodeKind::Split | NodeKind::Exchange => String::new(),
+    }
+}
+
+/// Flatten the primary pipe spine in execution order (`Scan`/`IndexSeek` -> ... -> `Reduce`),
+/// preserving side-input `children` on multi-input operators (`Join`, `Union`, `Seq`).
+fn flatten_pipeline_spine(mut node: ExplainNode, out: &mut Vec<ExplainNode>) {
+    if !node.children.is_empty() {
+        let primary_child = node.children.remove(0);
+        flatten_pipeline_spine(primary_child, out);
+    }
+    out.push(node);
+}

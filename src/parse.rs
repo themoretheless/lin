@@ -3,6 +3,50 @@ use crate::error::Error;
 
 pub const DEFAULT_MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_AST_DEPTH: usize = 128;
+/// Surface language grammar version (`LIN-0472`).
+pub const SYNTAX_VERSION: u32 = 1;
+/// Maximum decoded UTF-8 byte length of a single unescaped string literal (`4 MiB`, `LIN-0448`).
+pub const MAX_DECODED_STRING_BYTES: usize = 4 * 1024 * 1024;
+
+/// Convert a byte offset in `src` into 1-based `(line, col)` coordinates (`LIN-0441`..`LIN-0444`).
+pub fn offset_to_line_col(src: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(src.len());
+    let mut boundary = clamped;
+    while boundary > 0 && !src.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let prefix = &src[..boundary];
+    let line = 1 + prefix.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    let line_start = prefix.rfind('\n').map_or(0, |idx| idx + 1);
+    let col = 1 + src[line_start..boundary].chars().count();
+    (line, col)
+}
+
+fn token_preview(rest: &str) -> String {
+    let trimmed = rest.trim_start();
+    if trimmed.is_empty() {
+        return "EOF".into();
+    }
+    let mut end = 0usize;
+    for (i, ch) in trimmed.char_indices() {
+        if i == 0 {
+            end = ch.len_utf8();
+            if !(ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '"') {
+                break;
+            }
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, '|' | ',' | ')' | ']' | '}' | '{' | '[' | '(') {
+            break;
+        }
+        end = i + ch.len_utf8();
+        if end >= 24 {
+            break;
+        }
+    }
+    let snippet = &trimmed[..end];
+    format!("{snippet:?}")
+}
 
 pub fn parse_pred_src(src: &str) -> Result<Pred, Error> {
     parse_pred_src_with_limits(src, DEFAULT_MAX_QUERY_BYTES, DEFAULT_MAX_AST_DEPTH)
@@ -25,7 +69,8 @@ pub fn parse_pred_src_with_limits(
     let pred = p.parse_pred()?;
     p.skip();
     if !p.eof() {
-        return Err(p.err("trailing input"));
+        let preview = token_preview(p.rest());
+        return Err(p.err(format!("unexpected trailing input {preview}")));
     }
     Ok(pred)
 }
@@ -47,7 +92,8 @@ pub fn parse_with_limits(src: &str, max_bytes: usize, max_depth: usize) -> Resul
     let stmt = p.parse_stmt()?;
     p.skip();
     if !p.eof() {
-        return Err(p.err("trailing input"));
+        let preview = token_preview(p.rest());
+        return Err(p.err(format!("unexpected trailing input {preview}")));
     }
     Ok(stmt)
 }
@@ -205,7 +251,15 @@ impl<'a> Parser<'a> {
     }
 
     fn err(&self, msg: impl Into<String>) -> Error {
-        Error::at(self.pos, msg)
+        let m = msg.into();
+        let (line, col) = offset_to_line_col(self.src, self.pos);
+        Error::at(self.pos, format!("{m} (line {line}:{col})"))
+    }
+
+    fn err_at(&self, pos: usize, msg: impl Into<String>) -> Error {
+        let m = msg.into();
+        let (line, col) = offset_to_line_col(self.src, pos);
+        Error::at(pos, format!("{m} (line {line}:{col})"))
     }
 
     #[inline]
@@ -301,8 +355,14 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_ident_str(&mut self) -> Result<&'a str, Error> {
-        self.eat_ident_str()
-            .ok_or_else(|| self.err("expected identifier"))
+        self.eat_ident_str().ok_or_else(|| {
+            if self.eof() {
+                self.err("expected identifier, found EOF")
+            } else {
+                let tok = token_preview(self.rest());
+                self.err(format!("expected identifier, unexpected token {tok}"))
+            }
+        })
     }
 
     fn expect_ident(&mut self) -> Result<String, Error> {
@@ -396,18 +456,31 @@ impl<'a> Parser<'a> {
         if bytes.get(self.pos) != Some(&b'"') {
             return Err(self.err("expected string"));
         }
+        let open_pos = self.pos;
         self.pos += 1;
         let start = self.pos;
         match memchr::memchr2(b'"', b'\\', &bytes[start..]) {
             Some(rel) if bytes[start + rel] == b'"' => {
                 let end = start + rel;
+                let len = end - start;
+                if len > MAX_DECODED_STRING_BYTES {
+                    return Err(self.err_at(
+                        open_pos,
+                        format!(
+                            "decoded string literal length {len} exceeds maximum allowed {MAX_DECODED_STRING_BYTES} bytes"
+                        ),
+                    ));
+                }
                 self.pos = end + 1;
                 Ok(self.src[start..end].to_owned())
             }
-            Some(rel) => self.expect_string_escaped_tail(start, start + rel),
+            Some(rel) => self.expect_string_escaped_tail(open_pos, start, start + rel),
             None => {
+                let (open_line, open_col) = offset_to_line_col(self.src, open_pos);
                 self.pos = bytes.len();
-                Err(self.err("unterminated string"))
+                Err(self.err(format!(
+                    "unterminated string (opened at {open_line}:{open_col})"
+                )))
             }
         }
     }
@@ -415,7 +488,7 @@ impl<'a> Parser<'a> {
     /// One escape after a backslash. Accepts the escapes string values are printed with
     /// (Rust `{:?}` form: `\n \t \r \0 \\ \" \' \u{..}`), so printed text parses back to
     /// the same value; any other escape is kept as written, backslash included.
-    fn string_escape(&mut self, out: &mut String) -> Result<(), Error> {
+    fn string_escape(&mut self, open_pos: usize, out: &mut String) -> Result<(), Error> {
         match self.bump() {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
@@ -447,7 +520,16 @@ impl<'a> Parser<'a> {
                     return Err(self.err("bad \\u{..} escape"));
                 }
                 let ch = char::from_u32(val).ok_or_else(|| self.err("bad \\u{..} escape"))?;
+                if out.len() + ch.len_utf8() > MAX_DECODED_STRING_BYTES {
+                    return Err(self.err_at(
+                        open_pos,
+                        format!(
+                            "decoded string literal exceeds maximum allowed {MAX_DECODED_STRING_BYTES} bytes"
+                        ),
+                    ));
+                }
                 out.push(ch);
+                return Ok(());
             }
             // Any other escape keeps its backslash, so regex patterns such as `"\d+"`
             // mean what they say (this used to drop the backslash and match `d+`).
@@ -455,7 +537,20 @@ impl<'a> Parser<'a> {
                 out.push('\\');
                 out.push(c);
             }
-            None => return Err(self.err("unterminated string")),
+            None => {
+                let (open_line, open_col) = offset_to_line_col(self.src, open_pos);
+                return Err(self.err(format!(
+                    "unterminated string (opened at {open_line}:{open_col})"
+                )));
+            }
+        }
+        if out.len() > MAX_DECODED_STRING_BYTES {
+            return Err(self.err_at(
+                open_pos,
+                format!(
+                    "decoded string literal exceeds maximum allowed {MAX_DECODED_STRING_BYTES} bytes"
+                ),
+            ));
         }
         Ok(())
     }
@@ -466,39 +561,71 @@ impl<'a> Parser<'a> {
         if bytes.get(self.pos) != Some(&b'"') {
             return Err(self.err("expected string"));
         }
+        let open_pos = self.pos;
         self.pos += 1;
         let start = self.pos;
         match memchr::memchr2(b'"', b'\\', &bytes[start..]) {
             Some(rel) if bytes[start + rel] == b'"' => {
                 let end = start + rel;
+                let len = end - start;
+                if len > MAX_DECODED_STRING_BYTES {
+                    return Err(self.err_at(
+                        open_pos,
+                        format!(
+                            "decoded string literal length {len} exceeds maximum allowed {MAX_DECODED_STRING_BYTES} bytes"
+                        ),
+                    ));
+                }
                 self.pos = end + 1;
                 Ok(std::sync::Arc::from(&self.src[start..end]))
             }
             Some(rel) => Ok(std::sync::Arc::from(
-                self.expect_string_escaped_tail(start, start + rel)?,
+                self.expect_string_escaped_tail(open_pos, start, start + rel)?,
             )),
             None => {
+                let (open_line, open_col) = offset_to_line_col(self.src, open_pos);
                 self.pos = bytes.len();
-                Err(self.err("unterminated string"))
+                Err(self.err(format!(
+                    "unterminated string (opened at {open_line}:{open_col})"
+                )))
             }
         }
     }
 
     fn expect_string_escaped_tail(
         &mut self,
+        open_pos: usize,
         start: usize,
         mut esc_pos: usize,
     ) -> Result<String, Error> {
         let bytes = self.src.as_bytes();
-        let mut out = String::with_capacity((esc_pos - start) + 16);
+        let prefix_len = esc_pos - start;
+        if prefix_len > MAX_DECODED_STRING_BYTES {
+            return Err(self.err_at(
+                open_pos,
+                format!(
+                    "decoded string literal exceeds maximum allowed {MAX_DECODED_STRING_BYTES} bytes"
+                ),
+            ));
+        }
+        let mut out = String::with_capacity((prefix_len + 16).min(MAX_DECODED_STRING_BYTES));
         out.push_str(&self.src[start..esc_pos]);
         loop {
             self.pos = esc_pos + 1;
-            self.string_escape(&mut out)?;
+            self.string_escape(open_pos, &mut out)?;
             let seg_start = self.pos;
             match memchr::memchr2(b'"', b'\\', &bytes[seg_start..]) {
                 Some(rel) => {
                     let hit = seg_start + rel;
+                    let seg_len = hit - seg_start;
+                    if out.len().saturating_add(seg_len) > MAX_DECODED_STRING_BYTES {
+                        return Err(self.err_at(
+                            open_pos,
+                            format!(
+                                "decoded string literal exceeds maximum allowed {MAX_DECODED_STRING_BYTES} bytes"
+                            ),
+                        ));
+                    }
                     out.push_str(&self.src[seg_start..hit]);
                     if bytes[hit] == b'"' {
                         self.pos = hit + 1;
@@ -507,8 +634,11 @@ impl<'a> Parser<'a> {
                     esc_pos = hit;
                 }
                 None => {
+                    let (open_line, open_col) = offset_to_line_col(self.src, open_pos);
                     self.pos = bytes.len();
-                    return Err(self.err("unterminated string"));
+                    return Err(self.err(format!(
+                        "unterminated string (opened at {open_line}:{open_col})"
+                    )));
                 }
             }
         }
@@ -880,7 +1010,10 @@ impl<'a> Parser<'a> {
         } else if matches!(self.peek(), Some('(' | '!')) {
             return Ok(Step::Filter(self.parse_pred()?));
         }
-        Err(self.err("expected a named step or a predicate after `|`"))
+        let tok = token_preview(self.rest());
+        Err(self.err(format!(
+            "expected a named step or a predicate after `|`, unexpected token {tok}"
+        )))
     }
 
     fn parse_frame_bound(&mut self) -> Result<crate::window::FrameBound, Error> {
@@ -1652,7 +1785,10 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
-        Err(self.err("expected comparison (`==`, `has`, `~`, …)"))
+        let tok = token_preview(self.rest());
+        Err(self.err(format!(
+            "expected comparison (`==`, `has`, `~`, …), unexpected token {tok}"
+        )))
     }
 
     fn parse_regex_lit(&mut self) -> Result<(String, String), Error> {
@@ -1757,7 +1893,8 @@ impl<'a> Parser<'a> {
                 _ => return Ok(Value::Name(ident.to_owned())),
             }
         }
-        Err(self.err("expected value"))
+        let tok = token_preview(self.rest());
+        Err(self.err(format!("expected value, unexpected token {tok}")))
     }
 
     fn parse_ago(&mut self) -> Result<Value, Error> {
@@ -2349,4 +2486,1267 @@ fn join_chain(mut terms: Vec<Pred>, join: fn(Box<Pred>, Box<Pred>) -> Pred) -> P
         terms = next;
     }
     terms.pop().expect("a chain has at least one term")
+}
+
+// ============================================================================
+// Parse-Only Inspection, Canonical AST Formatter & Malformed Query Minimizer
+// (`D12`: `LIN-0469`..`LIN-0472`, `LIN-0480`)
+// ============================================================================
+
+use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+
+/// Summary returned by [`parse_inspect`] without requiring a live [`crate::catalog::Catalog`] (`LIN-0469`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParseInspection {
+    pub stmt_count: usize,
+    pub referenced_collections: Vec<String>,
+    pub parameter_names: Vec<String>,
+    pub is_read_only: bool,
+}
+
+/// Parse `src` and extract referenced collections, `$param` bindings, statement count,
+/// and read-only classification (`LIN-0469`).
+pub fn parse_inspect(src: &str) -> Result<ParseInspection, Error> {
+    let stmts = parse_program(src)?;
+    let mut cols = BTreeSet::new();
+    let mut params = BTreeSet::new();
+    let mut let_names = BTreeSet::new();
+    let mut is_read_only = true;
+
+    for stmt in &stmts {
+        inspect_stmt(stmt, &mut cols, &mut params, &mut let_names, &mut is_read_only);
+    }
+
+    Ok(ParseInspection {
+        stmt_count: stmts.len(),
+        referenced_collections: cols.into_iter().collect(),
+        parameter_names: params.into_iter().collect(),
+        is_read_only,
+    })
+}
+
+fn inspect_stmt(
+    stmt: &Stmt,
+    cols: &mut BTreeSet<String>,
+    params: &mut BTreeSet<String>,
+    let_names: &mut BTreeSet<String>,
+    is_read_only: &mut bool,
+) {
+    match stmt {
+        Stmt::Query(q) | Stmt::IdbSlice { query: q } => {
+            inspect_query(q, cols, params, let_names);
+        }
+        Stmt::Let { name, query } => {
+            inspect_query(query, cols, params, let_names);
+            let_names.insert(name.clone());
+        }
+        Stmt::IdbPull { .. } => {}
+        Stmt::AppendFacts { records } => {
+            *is_read_only = false;
+            cols.insert("facts".into());
+            for r in records {
+                inspect_record(r, params);
+            }
+        }
+        Stmt::AppendEdges { edges } => {
+            *is_read_only = false;
+            for e in edges {
+                inspect_value(&e.from, params);
+                inspect_value(&e.to, params);
+            }
+        }
+        Stmt::Insert {
+            collection,
+            records,
+            edges,
+        } => {
+            *is_read_only = false;
+            cols.insert(collection.clone());
+            for r in records {
+                inspect_record(r, params);
+            }
+            for e in edges {
+                if let EdgeTarget::Value(v) = &e.target {
+                    inspect_value(v, params);
+                }
+            }
+        }
+        Stmt::InsertRows { collection, .. } => {
+            *is_read_only = false;
+            cols.insert(collection.clone());
+        }
+        Stmt::Update {
+            collection,
+            pred,
+            record,
+            ..
+        } => {
+            *is_read_only = false;
+            cols.insert(collection.clone());
+            if let Some(p) = pred {
+                inspect_pred(p, params);
+            }
+            inspect_record(record, params);
+        }
+        Stmt::Delete {
+            collection, pred, ..
+        } => {
+            *is_read_only = false;
+            cols.insert(collection.clone());
+            inspect_pred(pred, params);
+        }
+        Stmt::DeleteEdge { from, to, .. } => {
+            *is_read_only = false;
+            inspect_value(from, params);
+            inspect_value(to, params);
+        }
+        Stmt::Reembed { collection, .. } => {
+            *is_read_only = false;
+            cols.insert(collection.clone());
+        }
+        Stmt::Decl(d) => {
+            *is_read_only = false;
+            match d {
+                Decl::Col { name, .. } => {
+                    cols.insert(name.clone());
+                }
+                Decl::Fk {
+                    from_col, to_col, ..
+                } => {
+                    cols.insert(from_col.clone());
+                    cols.insert(to_col.clone());
+                }
+                Decl::Guard {
+                    collection, pred, ..
+                } => {
+                    cols.insert(collection.clone());
+                    inspect_pred(pred, params);
+                }
+                Decl::Filter {
+                    collection, pred, ..
+                } => {
+                    cols.insert(collection.clone());
+                    if let Some(p) = pred {
+                        inspect_pred(p, params);
+                    }
+                }
+                Decl::Index {
+                    collection, pred, ..
+                } => {
+                    cols.insert(collection.clone());
+                    if let Some(p) = pred {
+                        inspect_pred(p, params);
+                    }
+                }
+                Decl::Rel { .. } | Decl::RelReverse { .. } | Decl::Owned { .. } => {}
+            }
+        }
+        Stmt::IdbPush
+        | Stmt::Snapshot { .. }
+        | Stmt::Restore { .. }
+        | Stmt::Pin { .. }
+        | Stmt::Unpin { .. } => {
+            *is_read_only = false;
+        }
+    }
+}
+
+fn inspect_query(
+    q: &Query,
+    cols: &mut BTreeSet<String>,
+    params: &mut BTreeSet<String>,
+    let_names: &BTreeSet<String>,
+) {
+    match &q.source {
+        Source::Collection(c) => {
+            if !let_names.contains(c) {
+                cols.insert(c.clone());
+            }
+        }
+        Source::Page(_) => {
+            cols.insert("docs".into());
+        }
+        Source::Catalog => {
+            cols.insert("catalog".into());
+        }
+    }
+    for step in &q.steps {
+        match step {
+            Step::Filter(p) => inspect_pred(p, params),
+            Step::Join { collection, .. } => {
+                cols.insert(collection.clone());
+            }
+            Step::Union(rhs) => inspect_query(rhs, cols, params, let_names),
+            _ => {}
+        }
+    }
+}
+
+fn inspect_record(rec: &Record, params: &mut BTreeSet<String>) {
+    for (_, v) in &rec.fields {
+        inspect_value(v, params);
+    }
+}
+
+fn inspect_pred(pred: &Pred, params: &mut BTreeSet<String>) {
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            inspect_pred(a, params);
+            inspect_pred(b, params);
+        }
+        Pred::Not(inner) => inspect_pred(inner, params),
+        Pred::Cmp { value, .. } => inspect_value(value, params),
+        Pred::In { values, .. } => {
+            for v in values {
+                inspect_value(v, params);
+            }
+        }
+        Pred::IsNull { .. }
+        | Pred::Has { .. }
+        | Pred::Contains { .. }
+        | Pred::Regex { .. } => {}
+    }
+}
+
+fn inspect_value(val: &Value, params: &mut BTreeSet<String>) {
+    if let Value::Param(p) = val {
+        params.insert(p.to_string());
+    }
+}
+
+/// Canonical, deterministic AST formatter for a program of statements (`LIN-0470`).
+pub fn format_program_canonical(stmts: &[Stmt]) -> String {
+    let mut out = String::new();
+    for (i, stmt) in stmts.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format_stmt_canonical(stmt));
+    }
+    out
+}
+
+/// Canonical, deterministic AST formatter that round-trips through [`parse`] to an equal [`Stmt`] (`LIN-0470`, `LIN-0471`).
+pub fn format_stmt_canonical(stmt: &Stmt) -> String {
+    let mut out = String::new();
+    fmt_stmt_canon(&mut out, stmt);
+    out
+}
+
+/// Canonical formatter for a [`Query`] (`LIN-0470`).
+pub fn format_query_canonical(q: &Query) -> String {
+    let mut out = String::new();
+    fmt_query_canon(&mut out, q);
+    out
+}
+
+fn fmt_stmt_canon(out: &mut String, stmt: &Stmt) {
+    use std::fmt::Write as _;
+    match stmt {
+        Stmt::Query(q) => fmt_query_canon(out, q),
+        Stmt::Let { name, query } => {
+            let _ = write!(out, "let {name} = ");
+            fmt_query_canon(out, query);
+        }
+        Stmt::AppendFacts { records } => {
+            out.push_str("append facts ");
+            fmt_record_list_canon(out, records, true);
+        }
+        Stmt::AppendEdges { edges } => {
+            if edges.len() == 1 {
+                out.push_str("append edge ");
+                fmt_edge_lit_canon(out, &edges[0]);
+            } else {
+                out.push_str("append edges [");
+                for (i, e) in edges.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    fmt_edge_lit_canon(out, e);
+                }
+                out.push(']');
+            }
+        }
+        Stmt::Insert {
+            collection,
+            records,
+            edges,
+        } => {
+            let _ = write!(out, "insert {collection} ");
+            if records.len() == 1 {
+                fmt_record_canon(out, &records[0]);
+                if !edges.is_empty() {
+                    out.push_str(" with");
+                    for e in edges {
+                        out.push_str(" edge ");
+                        out.push_str(&e.rel);
+                        out.push_str(" -> ");
+                        match &e.target {
+                            EdgeTarget::Page(p) => {
+                                out.push_str("page ");
+                                fmt_string_canon(out, p);
+                            }
+                            EdgeTarget::Value(v) => fmt_value_canon(out, v),
+                        }
+                    }
+                }
+            } else {
+                fmt_record_list_canon(out, records, true);
+            }
+        }
+        Stmt::InsertRows { collection, rows } => {
+            let _ = write!(out, "insert {collection} /* staged rows={rows} */");
+        }
+        Stmt::Update {
+            collection,
+            pred,
+            cas,
+            cas_each,
+            record,
+        } => {
+            out.push_str("update ");
+            out.push_str(collection);
+            if let Some(p) = pred {
+                out.push('[');
+                fmt_pred_canon(out, p, 0);
+                out.push(']');
+            }
+            fmt_cas_canon(out, cas.as_deref(), *cas_each);
+            out.push(' ');
+            fmt_record_canon(out, record);
+        }
+        Stmt::Delete {
+            collection,
+            pred,
+            cas,
+            cas_each,
+        } => {
+            out.push_str("delete ");
+            out.push_str(collection);
+            out.push('[');
+            fmt_pred_canon(out, pred, 0);
+            out.push(']');
+            fmt_cas_canon(out, cas.as_deref(), *cas_each);
+        }
+        Stmt::DeleteEdge { rel, from, to } => {
+            out.push_str("delete edge ");
+            out.push_str(rel);
+            out.push(' ');
+            fmt_value_canon(out, from);
+            out.push_str(" -> ");
+            fmt_value_canon(out, to);
+        }
+        Stmt::Reembed { collection, to } => {
+            out.push_str("reembed ");
+            out.push_str(collection);
+            if let Some(t) = to {
+                let _ = write!(out, " to {}/{}/{}", t.provider, t.model, t.dim);
+            }
+        }
+        Stmt::Decl(d) => fmt_decl_canon(out, d),
+        Stmt::IdbSlice { query } => {
+            out.push_str("idb slice ");
+            fmt_query_canon(out, query);
+        }
+        Stmt::IdbPull { since, take } => {
+            let _ = write!(out, "pull idb since {since}");
+            if let Some(n) = take {
+                let _ = write!(out, " take {n}");
+            }
+        }
+        Stmt::IdbPush => out.push_str("push idb"),
+        Stmt::Snapshot { name } => {
+            out.push_str("snapshot ");
+            fmt_string_canon(out, name);
+        }
+        Stmt::Restore { name } => {
+            out.push_str("restore ");
+            fmt_string_canon(out, name);
+        }
+        Stmt::Pin { name } => {
+            out.push_str("pin ");
+            fmt_string_canon(out, name);
+        }
+        Stmt::Unpin { name } => {
+            out.push_str("unpin ");
+            fmt_string_canon(out, name);
+        }
+    }
+}
+
+fn fmt_cas_canon(out: &mut String, cas: Option<&str>, cas_each: bool) {
+    if cas_each {
+        out.push_str(" cas each");
+    } else if let Some(h) = cas {
+        out.push_str(" cas ");
+        fmt_string_canon(out, h);
+    }
+}
+
+fn fmt_edge_lit_canon(out: &mut String, e: &EdgeLit) {
+    out.push_str(&e.rel);
+    out.push(' ');
+    fmt_value_canon(out, &e.from);
+    out.push_str(" -> ");
+    fmt_value_canon(out, &e.to);
+}
+
+fn fmt_record_list_canon(out: &mut String, records: &[Record], force_brackets: bool) {
+    if !force_brackets && records.len() == 1 {
+        fmt_record_canon(out, &records[0]);
+        return;
+    }
+    out.push('[');
+    for (i, r) in records.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        fmt_record_canon(out, r);
+    }
+    out.push(']');
+}
+
+fn fmt_record_canon(out: &mut String, rec: &Record) {
+    out.push_str("{ ");
+    for (i, (k, v)) in rec.fields.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(k);
+        out.push_str(": ");
+        fmt_value_canon(out, v);
+    }
+    out.push_str(" }");
+}
+
+fn fmt_decl_canon(out: &mut String, d: &Decl) {
+    use std::fmt::Write as _;
+    match d {
+        Decl::Col {
+            name,
+            append,
+            fields,
+        } => {
+            out.push_str("col ");
+            out.push_str(name);
+            if *append {
+                out.push_str(" append");
+            }
+            out.push_str(" { ");
+            for (i, (fname, ty)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(fname);
+                out.push_str(": ");
+                fmt_type_expr_canon(out, ty);
+            }
+            out.push_str(" }");
+        }
+        Decl::Rel { name, stub } => {
+            out.push_str("rel ");
+            out.push_str(name);
+            if *stub {
+                out.push_str(" stub");
+            }
+        }
+        Decl::RelReverse { name, of } => {
+            let _ = write!(out, "rel {name} = reverse {of}");
+        }
+        Decl::Fk {
+            from_col,
+            from_field,
+            to_col,
+            to_field,
+        } => {
+            let _ = write!(out, "fk {from_col}.{from_field} -> {to_col}.{to_field}");
+        }
+        Decl::Guard {
+            collection,
+            field,
+            pred,
+        } => {
+            let _ = write!(out, "guard {collection}.{field} immutable when ");
+            fmt_pred_canon(out, pred, 0);
+        }
+        Decl::Filter {
+            collection,
+            pred,
+            src,
+        } => match pred {
+            None => {
+                let _ = write!(out, "unfilter {collection}");
+            }
+            Some(p) => {
+                let _ = write!(out, "filter {collection} ");
+                if !src.is_empty() && parse_pred_src(src).ok().as_ref() == Some(p) {
+                    out.push_str(src);
+                } else {
+                    fmt_pred_canon(out, p, 0);
+                }
+            }
+        },
+        Decl::Index {
+            collection,
+            unique,
+            fields,
+            pred,
+        } => {
+            out.push_str("index ");
+            out.push_str(collection);
+            if *unique {
+                out.push_str(" unique");
+            }
+            out.push_str(" [");
+            out.push_str(&fields.join(", "));
+            out.push(']');
+            if let Some(p) = pred {
+                out.push_str(" where ");
+                fmt_pred_canon(out, p, 0);
+            }
+        }
+        Decl::Owned { name, fields } => {
+            let _ = write!(out, "owned {name} {{ ");
+            for (i, (fname, ty)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(fname);
+                out.push_str(": ");
+                fmt_type_expr_canon(out, ty);
+            }
+            out.push_str(" }");
+        }
+    }
+}
+
+fn fmt_type_expr_canon(out: &mut String, ty: &TypeExpr) {
+    use std::fmt::Write as _;
+    match ty {
+        TypeExpr::Named(n) => out.push_str(n),
+        TypeExpr::Vec { dim, model } => {
+            let _ = write!(out, "vec[{dim}]@{model}");
+        }
+    }
+}
+
+fn fmt_query_canon(out: &mut String, q: &Query) {
+    match &q.source {
+        Source::Collection(c) => out.push_str(c),
+        Source::Page(uri) => {
+            out.push_str("page ");
+            fmt_string_canon(out, uri);
+        }
+        Source::Catalog => out.push_str("catalog"),
+    }
+    if q.ignore_filter {
+        out.push_str(" all");
+    }
+    for step in &q.steps {
+        out.push_str(" | ");
+        fmt_step_canon(out, step);
+    }
+    if let Some(exp) = q.explain {
+        out.push_str(" | explain");
+        match exp {
+            ExplainKind::Tree => {}
+            ExplainKind::Cost => out.push_str(" cost"),
+            ExplainKind::Run => out.push_str(" run"),
+            ExplainKind::Backend => out.push_str(" backend"),
+            ExplainKind::Graph => out.push_str(" graph"),
+            ExplainKind::Dot => out.push_str(" dot"),
+        }
+    }
+}
+
+fn fmt_step_canon(out: &mut String, step: &Step) {
+    use std::fmt::Write as _;
+    match step {
+        Step::Filter(p) => {
+            out.push_str("where ");
+            fmt_pred_canon(out, p, 0);
+        }
+        Step::Project(fields) => {
+            out.push_str("pick { ");
+            fmt_fields_canon(out, fields);
+            out.push_str(" }");
+        }
+        Step::Without(fields) => {
+            out.push_str("without { ");
+            fmt_fields_canon(out, fields);
+            out.push_str(" }");
+        }
+        Step::Join {
+            left,
+            collection,
+            on,
+        } => {
+            out.push_str("join ");
+            if *left {
+                out.push_str("left ");
+            }
+            let _ = write!(out, "{collection} on {on}");
+        }
+        Step::Hop { rel, depth } => {
+            out.push_str("hop ");
+            out.push_str(rel);
+            if let Some(d) = depth {
+                let _ = write!(out, " depth={d}");
+            }
+        }
+        Step::Graph { rel, depth } => {
+            out.push_str("graph ");
+            out.push_str(rel);
+            if let Some(d) = depth {
+                let _ = write!(out, " depth={d}");
+            }
+        }
+        Step::Match { start, hops } => {
+            out.push_str("match ");
+            if let Some(s) = start {
+                out.push_str(s);
+                out.push(' ');
+            }
+            for (i, h) in hops.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                let _ = write!(out, "{h}");
+            }
+        }
+        Step::Search { mode, query } => {
+            out.push_str("search ");
+            match mode {
+                SearchMode::Hybrid => {}
+                SearchMode::Lex => out.push_str("lex "),
+                SearchMode::Vec => out.push_str("vec "),
+            }
+            fmt_string_canon(out, query);
+        }
+        Step::Count { by } => {
+            out.push_str("count");
+            if let Some(f) = by {
+                out.push_str(" by ");
+                out.push_str(&f.as_str());
+            }
+        }
+        Step::Sum { field, by } => fmt_legacy_agg_canon(out, "sum", field, by.as_ref()),
+        Step::Min { field, by } => fmt_legacy_agg_canon(out, "min", field, by.as_ref()),
+        Step::Max { field, by } => fmt_legacy_agg_canon(out, "max", field, by.as_ref()),
+        Step::Avg { field, by } => fmt_legacy_agg_canon(out, "avg", field, by.as_ref()),
+        Step::Summarize { specs, by } => {
+            out.push_str("summarize { ");
+            for (i, s) in specs.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&s.alias);
+                out.push_str(": ");
+                match &s.func {
+                    AggFunc::Count => out.push_str("count"),
+                    AggFunc::Sum(f) => {
+                        let _ = write!(out, "sum({f})");
+                    }
+                    AggFunc::Avg(f) => {
+                        let _ = write!(out, "avg({f})");
+                    }
+                    AggFunc::Min(f) => {
+                        let _ = write!(out, "min({f})");
+                    }
+                    AggFunc::Max(f) => {
+                        let _ = write!(out, "max({f})");
+                    }
+                    AggFunc::DCount(f) => {
+                        let _ = write!(out, "dcount({f})");
+                    }
+                    AggFunc::Percentile { field, pct } => {
+                        let _ = write!(out, "percentile({field}, ");
+                        fmt_float_canon(out, *pct);
+                        out.push(')');
+                    }
+                    AggFunc::ArgMax { order, value } => {
+                        let _ = write!(out, "arg_max({order}, {value})");
+                    }
+                    AggFunc::ArgMin { order, value } => {
+                        let _ = write!(out, "arg_min({order}, {value})");
+                    }
+                }
+            }
+            out.push_str(" }");
+            fmt_by_keys_canon(out, by);
+        }
+        Step::ArgExtremum { is_max, order, by } => {
+            let fn_name = if *is_max { "arg_max" } else { "arg_min" };
+            let _ = write!(out, "{fn_name}({order}, *)");
+            fmt_by_keys_canon(out, by);
+        }
+        Step::Sort { field, desc } => {
+            let _ = write!(out, "sort {field} {}", if *desc { "desc" } else { "asc" });
+        }
+        Step::Window {
+            func,
+            field,
+            by,
+            order,
+            frame,
+            as_field,
+        } => {
+            out.push_str("window ");
+            match func {
+                crate::window::WindowFunction::RowNumber => out.push_str("row_number"),
+                crate::window::WindowFunction::Rank => out.push_str("rank"),
+                crate::window::WindowFunction::DenseRank => out.push_str("dense_rank"),
+                crate::window::WindowFunction::Lead { offset } => {
+                    let _ = write!(out, "lead({offset}) {}", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::Lag { offset } => {
+                    let _ = write!(out, "lag({offset}) {}", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::FirstValue => {
+                    let _ = write!(out, "first_value({})", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::LastValue => {
+                    let _ = write!(out, "last_value({})", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::Sum => {
+                    let _ = write!(out, "sum({})", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::Avg => {
+                    let _ = write!(out, "avg({})", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::Min => {
+                    let _ = write!(out, "min({})", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::Max => {
+                    let _ = write!(out, "max({})", field.as_ref().unwrap());
+                }
+                crate::window::WindowFunction::Count => match field {
+                    Some(f) => {
+                        let _ = write!(out, "count({f})");
+                    }
+                    None => out.push_str("count(*)"),
+                },
+            }
+            if !by.is_empty() {
+                out.push_str(" by [");
+                fmt_fields_canon(out, by);
+                out.push(']');
+            }
+            if !order.is_empty() {
+                out.push_str(" sort [");
+                for (i, s) in order.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(
+                        out,
+                        "{} {}",
+                        s.field,
+                        if s.desc { "desc" } else { "asc" }
+                    );
+                }
+                out.push(']');
+            }
+            if let Some(fr) = frame {
+                let _ = write!(out, " {fr}");
+            }
+            let _ = write!(out, " as {as_field}");
+        }
+        Step::Skip { n } => {
+            let _ = write!(out, "skip {n}");
+        }
+        Step::Take { n } => match n {
+            Some(v) => {
+                let _ = write!(out, "take {v}");
+            }
+            None => out.push_str("take all"),
+        },
+        Step::Union(rhs) => {
+            out.push_str("union (");
+            fmt_query_canon(out, rhs);
+            out.push(')');
+        }
+    }
+}
+
+fn fmt_legacy_agg_canon(out: &mut String, kw: &str, field: &Field, by: Option<&Field>) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{kw}({field})");
+    if let Some(b) = by {
+        let _ = write!(out, " by {b}");
+    }
+}
+
+fn fmt_by_keys_canon(out: &mut String, by: &[GroupKey]) {
+    use std::fmt::Write as _;
+    if by.is_empty() {
+        return;
+    }
+    out.push_str(" by [");
+    for (i, gk) in by.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&gk.alias);
+        out.push_str(": ");
+        match &gk.expr {
+            GroupExpr::Field(f) => {
+                let _ = write!(out, "{f}");
+            }
+            GroupExpr::Bin { field, step } => {
+                let _ = write!(out, "bin({field}, ");
+                match step {
+                    BinStep::Duration(ms) => fmt_millis_as_duration(out, *ms),
+                    BinStep::Int(n) => {
+                        let _ = write!(out, "{n}");
+                    }
+                    BinStep::Float(f) => fmt_float_canon(out, *f),
+                }
+                out.push(')');
+            }
+        }
+    }
+    out.push(']');
+}
+
+fn fmt_millis_as_duration(out: &mut String, ms: i64) {
+    use std::fmt::Write as _;
+    let units = [
+        (7 * 86_400_000, 'w'),
+        (86_400_000, 'd'),
+        (3_600_000, 'h'),
+        (60_000, 'm'),
+        (1_000, 's'),
+    ];
+    for ( factor, ch) in units {
+        if ms >= factor && ms % factor == 0 {
+            let _ = write!(out, "{}{ch}", ms / factor);
+            return;
+        }
+    }
+    let secs = (ms / 1_000).max(1);
+    let _ = write!(out, "{secs}s");
+}
+
+fn fmt_fields_canon(out: &mut String, fields: &[Field]) {
+    use std::fmt::Write as _;
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{f}");
+    }
+}
+
+/// Precedence levels for exact parenthesization:
+/// - `0`: top-level (`Or` context)
+/// - `1`: `Or` right-hand side (wrap nested `Or` so `(a or (b or c))` stays right-associated!)
+/// - `2`: `And` left-hand side (wrap `Or`)
+/// - `3`: `And` right-hand side (wrap `Or` and `And` so `(a and (b and c))` stays right-associated!)
+/// - `4`: `Not` operand (wrap `And` and `Or`)
+fn fmt_pred_canon(out: &mut String, pred: &Pred, ctx_prec: u8) {
+    use std::fmt::Write as _;
+    match pred {
+        Pred::Or(a, b) => {
+            let wrap = ctx_prec >= 1;
+            if wrap {
+                out.push('(');
+            }
+            fmt_pred_canon(out, a, 0);
+            out.push_str(" or ");
+            fmt_pred_canon(out, b, 1);
+            if wrap {
+                out.push(')');
+            }
+        }
+        Pred::And(a, b) => {
+            let wrap = ctx_prec >= 3;
+            if wrap {
+                out.push('(');
+            }
+            fmt_pred_canon(out, a, 2);
+            out.push_str(" and ");
+            fmt_pred_canon(out, b, 3);
+            if wrap {
+                out.push(')');
+            }
+        }
+        Pred::Not(inner) => {
+            out.push_str("not ");
+            match inner.as_ref() {
+                Pred::And(_, _) | Pred::Or(_, _) => {
+                    out.push('(');
+                    fmt_pred_canon(out, inner, 0);
+                    out.push(')');
+                }
+                _ => fmt_pred_canon(out, inner, 4),
+            }
+        }
+        Pred::Cmp { field, op, value } => {
+            let _ = write!(out, "{field} {} ", op.as_str());
+            fmt_value_canon(out, value);
+        }
+        Pred::IsNull { field, negated } => {
+            if *negated {
+                let _ = write!(out, "{field} is not null");
+            } else {
+                let _ = write!(out, "{field} is null");
+            }
+        }
+        Pred::In { field, values } => {
+            let _ = write!(out, "{field} in [");
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                fmt_value_canon(out, v);
+            }
+            out.push(']');
+        }
+        Pred::Has { field, ci, needle } => {
+            let _ = write!(out, "{field} {}", if *ci { "has ci " } else { "has " });
+            fmt_string_canon(out, needle);
+        }
+        Pred::Contains { field, needle } => {
+            let _ = write!(out, "{field} ~ ");
+            fmt_string_canon(out, needle);
+        }
+        Pred::Regex {
+            field,
+            pattern,
+            flags,
+        } => {
+            let _ = write!(out, "{field} ~ /{pattern}/{flags}");
+        }
+    }
+}
+
+fn fmt_value_canon(out: &mut String, val: &Value) {
+    use std::fmt::Write as _;
+    match val {
+        Value::String(s) => fmt_string_canon(out, s),
+        Value::Int(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::Float(f) => fmt_float_canon(out, *f),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Timestamp(ms) => {
+            let _ = write!(out, "timestamp({ms})");
+        }
+        Value::Now => out.push_str("now"),
+        Value::NowMinus(d) => {
+            let _ = write!(out, "now - {d}");
+        }
+        Value::Duration(d) => {
+            let _ = write!(out, "{d}");
+        }
+        Value::Name(n) => out.push_str(n),
+        Value::Param(p) => {
+            out.push('$');
+            out.push_str(p);
+        }
+    }
+}
+
+fn fmt_float_canon(out: &mut String, f: f64) {
+    use std::fmt::Write as _;
+    if f == 0.0 && f.is_sign_negative() {
+        out.push_str("-0.0");
+        return;
+    }
+    let start = out.len();
+    let _ = write!(out, "{f}");
+    if f.is_finite() && !out[start..].contains('.') {
+        out.push_str(".0");
+    }
+}
+
+fn fmt_string_canon(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Delta-debugging (`ddmin`) line/stage/token shrinker for malformed queries (`LIN-0480`).
+///
+/// Preserves the compile failure class (syntax failure vs checker diagnostic category) while
+/// deterministically stripping irrelevant statements, pipe stages, and tokens.
+pub fn minimize_malformed_query(src: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailureSig<'a> {
+        Empty,
+        Parse(&'a str),
+        Check(&'a str),
+    }
+
+    fn classify_msg<'a>(msg: &str, prefixes: &'a [&'a str], fallback: &'a str) -> &'a str {
+        for &p in prefixes {
+            if msg.contains(p) {
+                return p;
+            }
+        }
+        fallback
+    }
+
+    const PARSE_SIGS: &[&str] = &[
+        "unterminated string",
+        "unterminated regex",
+        "decoded string literal",
+        "AST recursion depth",
+        "query length",
+        "mutation on pipe",
+        "trailing input",
+        "`explain` must be the last step",
+        "with not allowed on bulk insert",
+        "ago requires a duration",
+        "bad \\u{..} escape",
+        "empty list",
+        "expected",
+    ];
+
+    const CHECK_SIGS: &[&str] = &[
+        "unknown collection",
+        "unknown field",
+        "unknown rel",
+        "type mismatch",
+        "join requires fk",
+        "immutable field",
+        "update requires cas",
+        "delete requires cas",
+        "cannot bind over collection",
+        "union columns mismatch",
+        "union type mismatch",
+        "requires numeric field",
+        "requires text",
+        "search vec requires embedding",
+        "search lex requires fts",
+    ];
+
+    let cat = crate::catalog::fixture();
+    let probe = |candidate: &str| -> Option<FailureSig<'static>> {
+        match parse_program(candidate) {
+            Err(e) => {
+                if e.message.contains("empty program") {
+                    Some(FailureSig::Empty)
+                } else {
+                    Some(FailureSig::Parse(classify_msg(
+                        &e.message,
+                        PARSE_SIGS,
+                        "parse_err",
+                    )))
+                }
+            }
+            Ok(stmts) => match crate::check::check_program(&stmts, &cat) {
+                Err(e) => Some(FailureSig::Check(classify_msg(
+                    &e.message,
+                    CHECK_SIGS,
+                    "check_err",
+                ))),
+                Ok(_) => None,
+            },
+        }
+    };
+
+    let Some(target_sig) = probe(src) else {
+        return src.to_string();
+    };
+    if target_sig == FailureSig::Empty {
+        return String::new();
+    }
+
+    let budget = std::cell::Cell::new(512usize);
+    let mut same_failure = |cand: &str| -> bool {
+        let rem = budget.get();
+        if cand.trim().is_empty() || rem == 0 {
+            return false;
+        }
+        budget.set(rem - 1);
+        probe(cand) == Some(target_sig)
+    };
+
+    let mut current = src.trim().to_string();
+
+    // Pass 1: Line-level ddmin
+    let lines: Vec<String> = current.lines().map(str::to_string).collect();
+    if lines.len() > 1 {
+        let shrunk_lines = ddmin_units(&lines, "\n", &mut same_failure);
+        let joined = shrunk_lines.join("\n");
+        if joined.len() < current.len() {
+            current = joined;
+        }
+    }
+
+    // Pass 2: Pipe-stage ddmin (keep source `parts[0]`, shrink pipe steps `parts[1..]`)
+    if current.contains('|') && !current.contains('\n') {
+        let (head, cur_stages_init) = {
+            let parts: Vec<&str> = current.split('|').map(str::trim).collect();
+            (
+                parts[0].to_string(),
+                parts[1..].iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            )
+        };
+        if cur_stages_init.len() >= 2 {
+            let mut gran = 2usize;
+            let mut cur_stages = cur_stages_init;
+            while cur_stages.len() >= 2 && budget.get() > 0 {
+                let chunk_size = cur_stages.len().div_ceil(gran);
+                let mut reduced = false;
+                let mut idx = 0;
+                while idx < cur_stages.len() {
+                    let end = (idx + chunk_size).min(cur_stages.len());
+                    if cur_stages.len() - (end - idx) >= 1 {
+                        let mut cand_stages = Vec::with_capacity(cur_stages.len() - (end - idx));
+                        cand_stages.extend_from_slice(&cur_stages[..idx]);
+                        cand_stages.extend_from_slice(&cur_stages[end..]);
+                        let cand = format!("{head} | {}", cand_stages.join(" | "));
+                        if same_failure(&cand) {
+                            cur_stages = cand_stages;
+                            current = cand;
+                            gran = (gran - 1).max(2);
+                            reduced = true;
+                            break;
+                        }
+                    }
+                    idx += chunk_size;
+                }
+                if !reduced {
+                    if gran >= cur_stages.len() {
+                        break;
+                    }
+                    gran = (gran * 2).min(cur_stages.len());
+                }
+            }
+        }
+    }
+
+    // Pass 3: Whitespace-separated token ddmin
+    let tokens: Vec<String> = split_shrink_tokens(&current);
+    if tokens.len() > 1 {
+        let shrunk_toks = ddmin_units(&tokens, " ", &mut same_failure);
+        let candidate = shrunk_toks.join(" ");
+        if candidate.len() < current.len() && (probe(&candidate) == Some(target_sig)) {
+            current = candidate;
+        }
+    }
+
+    current
+}
+
+fn ddmin_units(
+    initial: &[String],
+    sep: &str,
+    test: &mut impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    let mut units = initial.to_vec();
+    let mut n = 2usize;
+    while units.len() >= 2 {
+        let chunk_len = units.len().div_ceil(n);
+        let mut changed = false;
+
+        // Try reducing directly to a single subset first when n == 2..8
+        if n <= 8 {
+            let mut i = 0;
+            while i < units.len() {
+                let end = (i + chunk_len).min(units.len());
+                let subset = &units[i..end];
+                if subset.len() < units.len() {
+                    let cand = subset.join(sep);
+                    if test(&cand) {
+                        units = subset.to_vec();
+                        n = 2;
+                        changed = true;
+                        break;
+                    }
+                }
+                i += chunk_len;
+            }
+            if changed {
+                continue;
+            }
+        }
+
+        // Try removing each complement chunk
+        let mut i = 0;
+        while i < units.len() {
+            let end = (i + chunk_len).min(units.len());
+            if end - i < units.len() {
+                let mut comp = Vec::with_capacity(units.len() - (end - i));
+                comp.extend_from_slice(&units[..i]);
+                comp.extend_from_slice(&units[end..]);
+                let cand = comp.join(sep);
+                if test(&cand) {
+                    units = comp;
+                    n = (n - 1).max(2);
+                    changed = true;
+                    break;
+                }
+            }
+            i += chunk_len;
+        }
+        if !changed {
+            if n >= units.len() {
+                break;
+            }
+            n = (n * 2).min(units.len());
+        }
+    }
+    units
+}
+
+fn split_shrink_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(s[start..i].to_string());
+            continue;
+        }
+        let start = i;
+        if matches!(bytes[i], b'|' | b'{' | b'}' | b'[' | b']' | b'(' | b')' | b',') {
+            i += 1;
+        } else {
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && !matches!(bytes[i], b'|' | b'{' | b'}' | b'[' | b']' | b'(' | b')' | b',')
+            {
+                let ch = s[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+            }
+        }
+        out.push(s[start..i].to_string());
+    }
+    out
 }

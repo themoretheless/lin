@@ -1,8 +1,154 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::ast::*;
 use crate::catalog::{self, Catalog, Type};
 use crate::error::Error;
+
+/// Bounded Levenshtein edit distance (`<= max_dist`), returning `None` when distance exceeds `max_dist` (`LIN-0505`).
+pub fn bounded_levenshtein(a: &str, b: &str, max_dist: usize) -> Option<usize> {
+    if a == b {
+        return Some(0);
+    }
+    let ac: smallvec::SmallVec<[char; 32]> = a.chars().collect();
+    let bc: smallvec::SmallVec<[char; 32]> = b.chars().collect();
+    if ac.len().abs_diff(bc.len()) > max_dist {
+        return None;
+    }
+    if ac.is_empty() {
+        return (bc.len() <= max_dist).then_some(bc.len());
+    }
+    if bc.is_empty() {
+        return (ac.len() <= max_dist).then_some(ac.len());
+    }
+    let mut prev: Vec<usize> = (0..=bc.len()).collect();
+    let mut curr: Vec<usize> = vec![0; bc.len() + 1];
+    for (i, &ca) in ac.iter().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+        for (j, &cb) in bc.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            let del = prev[j + 1] + 1;
+            let ins = curr[j] + 1;
+            let sub = prev[j] + cost;
+            let v = del.min(ins).min(sub);
+            curr[j + 1] = v;
+            row_min = row_min.min(v);
+        }
+        if row_min > max_dist {
+            return None;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    let dist = prev[bc.len()];
+    (dist <= max_dist).then_some(dist)
+}
+
+fn suggest_closest<'a>(
+    target: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if target.is_empty() || target.len() > 64 {
+        return None;
+    }
+    let target_chars = target.chars().count();
+    let max_d = if target_chars <= 1 { 1 } else { 2 };
+    let mut best: Option<(usize, usize, &str)> = None;
+    for cand in candidates {
+        if cand == target || cand.is_empty() {
+            continue;
+        }
+        let cand_chars = cand.chars().count();
+        if target_chars <= 1 && cand_chars > 2 {
+            continue;
+        }
+        if let Some(d) = bounded_levenshtein(target, cand, max_d) {
+            let len_diff = target_chars.abs_diff(cand_chars);
+            let replace = match best {
+                None => true,
+                Some((bd, bl, bc)) => (d, len_diff, cand) < (bd, bl, bc),
+            };
+            if replace {
+                best = Some((d, len_diff, cand));
+            }
+        }
+    }
+    best.map(|(_, _, c)| c.to_string())
+}
+
+fn unknown_collection_err(name: &str, cat: &Catalog, env: Option<&Bindings>) -> Error {
+    let mut cands: Vec<&str> = cat.collections.keys().map(String::as_str).collect();
+    if !cands.contains(&"catalog") {
+        cands.push("catalog");
+    }
+    if let Some(e) = env {
+        for k in e.scopes.keys() {
+            cands.push(k.as_str());
+        }
+    }
+    if let Some(sug) = suggest_closest(name, cands) {
+        Error::new(format!(
+            "unknown collection: {name} (did you mean '{sug}'?)"
+        ))
+    } else {
+        Error::new(format!("unknown collection: {name}"))
+    }
+}
+
+fn unknown_col_field_err(field: &str, col: &catalog::Collection) -> Error {
+    if let Some(sug) = suggest_closest(field, col.fields.keys().map(String::as_str)) {
+        Error::new(format!("unknown field: {field} (did you mean '{sug}'?)"))
+    } else {
+        Error::new(format!("unknown field: {field}"))
+    }
+}
+
+fn unknown_qualified_field_err(col_name: &str, field: &str, col: &catalog::Collection) -> Error {
+    if let Some(sug) = suggest_closest(field, col.fields.keys().map(String::as_str)) {
+        Error::new(format!(
+            "unknown field: {col_name}.{field} (did you mean '{sug}'?)"
+        ))
+    } else {
+        Error::new(format!("unknown field: {col_name}.{field}"))
+    }
+}
+
+fn unknown_scope_field_err(field: &str, scope: &Scope, cat: &Catalog) -> Error {
+    let cands: Vec<&str> = scope
+        .materialized_fields(cat)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    if let Some(sug) = suggest_closest(field, cands) {
+        Error::new(format!("unknown field: {field} (did you mean '{sug}'?)"))
+    } else {
+        Error::new(format!("unknown field: {field}"))
+    }
+}
+
+/// Machine-readable diagnostic category returned by [`check_diagnostics`] (`LIN-0508`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiagnosticKind {
+    SyntaxError,
+    UnknownCollection,
+    UnknownField,
+    UnknownRel,
+    TypeMismatch,
+    ConstraintError,
+    SemanticError,
+}
+
+/// Structured compile/typecheck diagnostic with source span and recovery suggestion (`LIN-0505`, `LIN-0506`, `LIN-0508`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDiagnostic {
+    pub kind: DiagnosticKind,
+    pub message: String,
+    pub collection: Option<String>,
+    pub field: Option<String>,
+    pub suggestion: Option<String>,
+    pub span: Option<(usize, usize)>,
+}
 
 #[expect(dead_code)]
 pub fn check(stmt: &Stmt, cat: &Catalog) -> Result<(), Error> {
@@ -16,7 +162,7 @@ pub(crate) fn check_single_insert(
 ) -> Result<(), Error> {
     let col = cat
         .collection(collection)
-        .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+        .ok_or_else(|| unknown_collection_err(collection, cat, None))?;
     if col.append_only {
         return Err(Error::new(format!(
             "{collection} is append-only; use `append`"
@@ -32,7 +178,7 @@ pub(crate) fn check_single_insert_borrowed(
 ) -> Result<(), Error> {
     let col = cat
         .collection(collection)
-        .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+        .ok_or_else(|| unknown_collection_err(collection, cat, None))?;
     if col.append_only {
         return Err(Error::new(format!(
             "{collection} is append-only; use `append`"
@@ -41,7 +187,7 @@ pub(crate) fn check_single_insert_borrowed(
     for (name, value) in fields {
         let info = col
             .field(name)
-            .ok_or_else(|| Error::new(format!("unknown field: {name}")))?;
+            .ok_or_else(|| unknown_col_field_err(name, col))?;
         check_value_as(value, info.ty, cat)?;
     }
     Ok(())
@@ -106,7 +252,7 @@ fn check_records_bulk(
         for (name, value) in &record.fields {
             let info = col
                 .field(name)
-                .ok_or_else(|| Error::new(format!("unknown field: {name}")))?;
+                .ok_or_else(|| unknown_col_field_err(name, col))?;
             check_value_as(value, info.ty, cat)?;
             shape_cache.push((name.as_str(), info.ty));
         }
@@ -150,7 +296,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
         } => {
             let col = cat
                 .collection(collection)
-                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                .ok_or_else(|| unknown_collection_err(collection, cat, Some(env)))?;
             if col.append_only {
                 return Err(Error::new(format!(
                     "{collection} is append-only; use `append`"
@@ -174,7 +320,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
         Stmt::InsertRows { collection, rows } => {
             let col = cat
                 .collection(collection)
-                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                .ok_or_else(|| unknown_collection_err(collection, cat, Some(env)))?;
             if col.append_only {
                 return Err(Error::new(format!(
                     "{collection} is append-only; use `append`"
@@ -196,7 +342,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
             }
             let col = cat
                 .collection(collection)
-                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                .ok_or_else(|| unknown_collection_err(collection, cat, Some(env)))?;
             if col.append_only {
                 return Err(Error::new(format!(
                     "{collection} is append-only; cannot update"
@@ -211,7 +357,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
         Stmt::Reembed { collection, to } => {
             let col = cat
                 .collection(collection)
-                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                .ok_or_else(|| unknown_collection_err(collection, cat, Some(env)))?;
             if !col.has_vec() {
                 return Err(Error::new(format!(
                     "reembed requires embedding: {collection}"
@@ -231,7 +377,7 @@ fn check_in(stmt: &Stmt, cat: &Catalog, env: &Bindings) -> Result<(), Error> {
         } => {
             let col = cat
                 .collection(collection)
-                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                .ok_or_else(|| unknown_collection_err(collection, cat, Some(env)))?;
             if !col.append_only && cas.is_none() && !*cas_each {
                 return Err(Error::new("delete requires cas"));
             }
@@ -307,17 +453,15 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
         } => {
             let from = cat
                 .collection(from_col)
-                .ok_or_else(|| Error::new(format!("unknown collection: {from_col}")))?;
+                .ok_or_else(|| unknown_collection_err(from_col, cat, None))?;
             let to = cat
                 .collection(to_col)
-                .ok_or_else(|| Error::new(format!("unknown collection: {to_col}")))?;
+                .ok_or_else(|| unknown_collection_err(to_col, cat, None))?;
             if from.field(from_field).is_none() {
-                return Err(Error::new(format!(
-                    "unknown field: {from_col}.{from_field}"
-                )));
+                return Err(unknown_qualified_field_err(from_col, from_field, from));
             }
             if to.field(to_field).is_none() {
-                return Err(Error::new(format!("unknown field: {to_col}.{to_field}")));
+                return Err(unknown_qualified_field_err(to_col, to_field, to));
             }
         }
         Decl::Guard {
@@ -327,6 +471,9 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
         } => {
             let scope = scope_of(collection, cat)?;
             if scope.ty_of(field, cat).is_none() {
+                if let Some(col) = cat.collection(collection) {
+                    return Err(unknown_qualified_field_err(collection, field, col));
+                }
                 return Err(Error::new(format!("unknown field: {collection}.{field}")));
             }
             check_pred(pred, &scope, cat)?;
@@ -370,13 +517,13 @@ fn check_decl(d: &Decl, cat: &Catalog) -> Result<(), Error> {
         } => {
             let col = cat
                 .collection(collection)
-                .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+                .ok_or_else(|| unknown_collection_err(collection, cat, None))?;
             if fields.is_empty() {
                 return Err(Error::new("empty index"));
             }
             for f in fields {
                 if col.field(f).is_none() {
-                    return Err(Error::new(format!("unknown field: {f}")));
+                    return Err(unknown_col_field_err(f, col));
                 }
             }
             if let Some(p) = pred {
@@ -404,7 +551,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             } else if let Some(s) = env.get(name) {
                 s.clone()
             } else {
-                return Err(Error::new(format!("unknown collection: {name}")));
+                return Err(unknown_collection_err(name, cat, Some(env)));
             }
         }
         Source::Page(_) => scope_of("docs", cat)?,
@@ -438,7 +585,7 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
                         )));
                     };
                     if require_field(&scope, f, cat).is_err() {
-                        return Err(Error::new(format!("unknown field: {name}")));
+                        return Err(unknown_scope_field_err(name, &scope, cat));
                     }
                     next.remove(name);
                 }
@@ -449,13 +596,13 @@ fn check_query(q: &Query, cat: &Catalog, env: &Bindings) -> Result<Scope, Error>
             }
             Step::Join { collection, on, .. } => {
                 if cat.collection(collection).is_none() {
-                    return Err(Error::new(format!("unknown collection: {collection}")));
+                    return Err(unknown_collection_err(collection, cat, Some(env)));
                 }
                 if scope.ty_of(on, cat).is_none()
                     && (scope.fields.is_empty()
                         || scope.ty_of(&format!("{}.{on}", scope.primary), cat).is_none())
                 {
-                    return Err(Error::new(format!("unknown field: {on}")));
+                    return Err(unknown_scope_field_err(on, &scope, cat));
                 }
                 if cat.find_fk(&scope.primary, on, collection).is_none() {
                     return Err(Error::new(format!(
@@ -920,7 +1067,7 @@ fn check_record_col(
     for (name, value) in &record.fields {
         let info = col
             .field(name)
-            .ok_or_else(|| Error::new(format!("unknown field: {name}")))?;
+            .ok_or_else(|| unknown_col_field_err(name, col))?;
         if is_update
             && name == "layer"
             && let Value::String(s) = value
@@ -1152,7 +1299,7 @@ fn require_pred_field<'p>(
                 .copied()
                 .or_else(|| base_col.and_then(|c| c.field(leaf)).map(|i| i.ty))
         };
-        let ty = found.ok_or_else(|| Error::new(format!("unknown field: {leaf}")))?;
+        let ty = found.ok_or_else(|| unknown_scope_field_err(leaf, scope, cat))?;
         *last_field = Some((leaf, ty));
         return Ok(ty);
     }
@@ -1313,7 +1460,7 @@ fn require_field(scope: &Scope, field: &Field, cat: &Catalog) -> Result<Type, Er
     let key = field.as_cow_str();
     scope
         .ty_of(&key, cat)
-        .ok_or_else(|| Error::new(format!("unknown field: {key}")))
+        .ok_or_else(|| unknown_scope_field_err(&key, scope, cat))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1463,7 +1610,7 @@ impl Scope {
 fn scope_of(collection: &str, cat: &Catalog) -> Result<Scope, Error> {
     let col = cat
         .collection(collection)
-        .ok_or_else(|| Error::new(format!("unknown collection: {collection}")))?;
+        .ok_or_else(|| unknown_collection_err(collection, cat, None))?;
     Ok(Scope::from_col(collection, col))
 }
 
@@ -1473,4 +1620,444 @@ pub fn collection_of(source: &Source) -> &str {
         Source::Page(_) => "docs",
         Source::Catalog => "catalog",
     }
+}
+
+/// Typecheck `stmts` and also report the final query's ordered output `(field_name, type_name)` annotations (`LIN-0507`).
+pub(crate) fn check_program_output_fields(
+    stmts: &[Stmt],
+    cat: &Catalog,
+) -> Result<(Option<Catalog>, Vec<(String, String)>), Error> {
+    let mut env = Bindings::new();
+    let mut staged: Option<Catalog> = None;
+    let mut last_output: Vec<(String, String)> = Vec::new();
+
+    for stmt in stmts {
+        let view = staged.as_ref().unwrap_or(cat);
+        if let Stmt::Let { name, query } = stmt {
+            if view.collection(name).is_some() || name == "catalog" {
+                return Err(Error::new(format!("cannot bind over collection: {name}")));
+            }
+            let scope = check_query(query, view, &env)?;
+            if env.contains(name) {
+                return Err(Error::new(format!("binding exists: {name}")));
+            }
+            env.insert(name.clone(), scope);
+            last_output.clear();
+            continue;
+        }
+        match stmt {
+            Stmt::Query(q) | Stmt::IdbSlice { query: q } => {
+                let scope = check_query(q, view, &env)?;
+                last_output = extract_ordered_output_fields(q, &scope, view);
+            }
+            _ => {
+                check_in(stmt, view, &env)?;
+                last_output.clear();
+            }
+        }
+        if let Stmt::Decl(d) = stmt {
+            staged.get_or_insert_with(|| cat.clone()).apply_decl(d)?;
+        }
+    }
+    Ok((staged, last_output))
+}
+
+fn extract_ordered_output_fields(
+    q: &Query,
+    scope: &Scope,
+    cat: &Catalog,
+) -> Vec<(String, String)> {
+    // Preserve explicit projection order when the last shaping step is `Project`.
+    for step in q.steps.iter().rev() {
+        match step {
+            Step::Take { .. } | Step::Skip { .. } | Step::Sort { .. } | Step::Filter(_) => continue,
+            Step::Project(fields) => {
+                return fields
+                    .iter()
+                    .map(|f| {
+                        let key = f.as_str();
+                        let ty = scope.ty_of(&key, cat).unwrap_or(Type::Var);
+                        (key, ty.name().to_string())
+                    })
+                    .collect();
+            }
+            Step::Summarize { specs, by } => {
+                let mut out = Vec::with_capacity(by.len() + specs.len());
+                for gk in by {
+                    let ty = scope.ty_of(&gk.alias, cat).unwrap_or(Type::Var);
+                    out.push((gk.alias.clone(), ty.name().to_string()));
+                }
+                for sp in specs {
+                    let ty = scope.ty_of(&sp.alias, cat).unwrap_or(Type::Var);
+                    out.push((sp.alias.clone(), ty.name().to_string()));
+                }
+                return out;
+            }
+            _ => break,
+        }
+    }
+    scope
+        .materialized_fields(cat)
+        .into_iter()
+        .map(|(k, ty)| (k.to_string(), ty.name().to_string()))
+        .collect()
+}
+
+/// Collect machine-readable [`CheckDiagnostic`]s against the default fixture catalog (`LIN-0505`, `LIN-0506`, `LIN-0508`).
+pub fn check_diagnostics(src: &str) -> Vec<CheckDiagnostic> {
+    let cat = catalog::fixture();
+    check_diagnostics_with_catalog(src, &cat)
+}
+
+/// Collect machine-readable [`CheckDiagnostic`]s against an explicit [`Catalog`] (`LIN-0505`, `LIN-0506`, `LIN-0508`).
+pub fn check_diagnostics_with_catalog(src: &str, cat: &Catalog) -> Vec<CheckDiagnostic> {
+    let stmts = match crate::parse::parse_program(src) {
+        Ok(s) => s,
+        Err(err) => {
+            let span = err.pos.map(|p| token_span_around(src, p));
+            return vec![CheckDiagnostic {
+                kind: DiagnosticKind::SyntaxError,
+                message: err.message,
+                collection: None,
+                field: None,
+                suggestion: None,
+                span,
+            }];
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut env = Bindings::new();
+    let mut staged: Option<Catalog> = None;
+
+    for stmt in &stmts {
+        let view = staged.as_ref().unwrap_or(cat);
+        if let Stmt::Let { name, query } = stmt {
+            if view.collection(name).is_some() || name == "catalog" {
+                out.push(CheckDiagnostic {
+                    kind: DiagnosticKind::SemanticError,
+                    message: format!("cannot bind over collection: {name}"),
+                    collection: Some(name.clone()),
+                    field: None,
+                    suggestion: None,
+                    span: find_ident_span(src, name),
+                });
+                continue;
+            }
+            match check_query(query, view, &env) {
+                Ok(scope) => {
+                    if env.contains(name) {
+                        out.push(CheckDiagnostic {
+                            kind: DiagnosticKind::SemanticError,
+                            message: format!("binding exists: {name}"),
+                            collection: None,
+                            field: None,
+                            suggestion: None,
+                            span: find_ident_span(src, name),
+                        });
+                    } else {
+                        env.insert(name.clone(), scope);
+                    }
+                }
+                Err(e) => {
+                    out.push(diagnostic_from_error(
+                        src,
+                        &e,
+                        Some(collection_of(&query.source)),
+                        Some(query),
+                        view,
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if let Err(e) = check_in(stmt, view, &env) {
+            let (stmt_col, stmt_q) = stmt_context(stmt);
+            out.push(diagnostic_from_error(src, &e, stmt_col, stmt_q, view));
+            continue;
+        }
+        if let Stmt::Decl(d) = stmt
+            && let Err(e) = staged.get_or_insert_with(|| cat.clone()).apply_decl(d)
+        {
+            let err_view = staged.as_ref().unwrap_or(cat);
+            out.push(diagnostic_from_error(src, &e, None, None, err_view));
+        }
+    }
+
+    out
+}
+
+fn stmt_context(stmt: &Stmt) -> (Option<&str>, Option<&Query>) {
+    match stmt {
+        Stmt::Query(q) | Stmt::IdbSlice { query: q } => (Some(collection_of(&q.source)), Some(q)),
+        Stmt::Insert { collection, .. }
+        | Stmt::InsertRows { collection, .. }
+        | Stmt::Update { collection, .. }
+        | Stmt::Delete { collection, .. }
+        | Stmt::Reembed { collection, .. } => (Some(collection.as_str()), None),
+        Stmt::AppendFacts { .. } => (Some("facts"), None),
+        Stmt::Decl(Decl::Guard { collection, .. })
+        | Stmt::Decl(Decl::Filter { collection, .. })
+        | Stmt::Decl(Decl::Index { collection, .. }) => (Some(collection.as_str()), None),
+        _ => (None, None),
+    }
+}
+
+fn diagnostic_from_error(
+    src: &str,
+    err: &Error,
+    context_col: Option<&str>,
+    query: Option<&Query>,
+    cat: &Catalog,
+) -> CheckDiagnostic {
+    let msg = &err.message;
+    let suggestion = extract_did_you_mean(msg);
+
+    if let Some(rest) = msg.strip_prefix("unknown collection: ") {
+        let bad_col = rest.split(" (did you mean").next().unwrap_or(rest).trim();
+        return CheckDiagnostic {
+            kind: DiagnosticKind::UnknownCollection,
+            message: msg.clone(),
+            collection: Some(bad_col.to_string()),
+            field: None,
+            suggestion,
+            span: find_ident_span(src, bad_col),
+        };
+    }
+
+    if let Some(rest) = msg.strip_prefix("unknown field: ") {
+        let raw_field = rest.split(" (did you mean").next().unwrap_or(rest).trim();
+        let (col_opt, field_name) = if let Some((c, f)) = raw_field.split_once('.') {
+            if cat.collection(c).is_some() {
+                (Some(c.to_string()), f.to_string())
+            } else {
+                (context_col.map(str::to_string), raw_field.to_string())
+            }
+        } else {
+            (context_col.map(str::to_string), raw_field.to_string())
+        };
+        let span = find_ident_span(src, &field_name).or_else(|| find_ident_span(src, raw_field));
+        return CheckDiagnostic {
+            kind: DiagnosticKind::UnknownField,
+            message: msg.clone(),
+            collection: col_opt,
+            field: Some(field_name),
+            suggestion,
+            span,
+        };
+    }
+
+    if let Some(rest) = msg.strip_prefix("unknown rel: ") {
+        let rel = rest.trim();
+        let rel_sug = suggest_closest(rel, cat.rels.keys().map(String::as_str));
+        return CheckDiagnostic {
+            kind: DiagnosticKind::UnknownRel,
+            message: msg.clone(),
+            collection: context_col.map(str::to_string),
+            field: None,
+            suggestion: rel_sug,
+            span: find_ident_span(src, rel),
+        };
+    }
+
+    if msg.contains("type mismatch") || msg.contains("requires numeric") || msg.contains("requires text") {
+        let (mismatch_field, type_sug) =
+            infer_type_mismatch_hint(query, context_col, cat).unwrap_or((None, None));
+        let span = mismatch_field
+            .as_deref()
+            .and_then(|f| find_ident_span(src, f))
+            .or_else(|| err.pos.map(|p| token_span_around(src, p)));
+        return CheckDiagnostic {
+            kind: DiagnosticKind::TypeMismatch,
+            message: msg.clone(),
+            collection: context_col.map(str::to_string),
+            field: mismatch_field,
+            suggestion: type_sug,
+            span,
+        };
+    }
+
+    if msg.contains("immutable field")
+        || msg.contains("requires cas")
+        || msg.contains("requires fk")
+        || msg.contains("append-only")
+    {
+        return CheckDiagnostic {
+            kind: DiagnosticKind::ConstraintError,
+            message: msg.clone(),
+            collection: context_col.map(str::to_string),
+            field: None,
+            suggestion,
+            span: context_col.and_then(|c| find_ident_span(src, c)),
+        };
+    }
+
+    CheckDiagnostic {
+        kind: DiagnosticKind::SemanticError,
+        message: msg.clone(),
+        collection: context_col.map(str::to_string),
+        field: None,
+        suggestion,
+        span: err.pos.map(|p| token_span_around(src, p)),
+    }
+}
+
+fn extract_did_you_mean(msg: &str) -> Option<String> {
+    let marker = "(did you mean '";
+    let idx = msg.find(marker)?;
+    let tail = &msg[idx + marker.len()..];
+    let end = tail.find("'?)").or_else(|| tail.find("')"))?;
+    Some(tail[..end].to_string())
+}
+
+fn infer_type_mismatch_hint(
+    query: Option<&Query>,
+    context_col: Option<&str>,
+    cat: &Catalog,
+) -> Option<(Option<String>, Option<String>)> {
+    let q = query?;
+    let col = cat.collection(context_col?)?;
+    for step in &q.steps {
+        if let Step::Filter(pred) = step
+            && let Some(hit) = find_pred_type_hint(pred, col)
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn find_pred_type_hint(
+    pred: &Pred,
+    col: &catalog::Collection,
+) -> Option<(Option<String>, Option<String>)> {
+    match pred {
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            find_pred_type_hint(a, col).or_else(|| find_pred_type_hint(b, col))
+        }
+        Pred::Not(inner) => find_pred_type_hint(inner, col),
+        Pred::Cmp { field, value, .. } => {
+            let fname = field.leaf()?;
+            let info = col.field(fname)?;
+            match (info.ty, value) {
+                (Type::I64 | Type::F64, Value::String(s)) => {
+                    if s.trim().parse::<f64>().is_ok() {
+                        return Some((
+                            Some(fname.to_string()),
+                            Some(format!("use unquoted numeric literal {}", s.trim())),
+                        ));
+                    }
+                    Some((Some(fname.to_string()), None))
+                }
+                (Type::Text | Type::Id | Type::Uri, Value::Int(n)) => Some((
+                    Some(fname.to_string()),
+                    Some(format!("quote string literal \"{n}\"")),
+                )),
+                (Type::Text | Type::Id | Type::Uri, Value::Float(f)) => Some((
+                    Some(fname.to_string()),
+                    Some(format!("quote string literal \"{f}\"")),
+                )),
+                (Type::Bool, Value::String(s))
+                    if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") =>
+                {
+                    Some((
+                        Some(fname.to_string()),
+                        Some(format!("use boolean literal {}", s.to_ascii_lowercase())),
+                    ))
+                }
+                _ => None,
+            }
+        }
+        Pred::Has { field, .. } | Pred::Contains { field, .. } | Pred::Regex { field, .. } => {
+            let fname = field.leaf()?;
+            let info = col.field(fname)?;
+            if !info.ty.is_textish() {
+                return Some((
+                    Some(fname.to_string()),
+                    Some(format!(
+                        "field `{fname}` has type `{}`; use `==` / `<` / `>` instead of text match",
+                        info.ty.name()
+                    )),
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn token_span_around(src: &str, pos: usize) -> (usize, usize) {
+    let start = pos.min(src.len());
+    if start >= src.len() {
+        return (src.len(), src.len());
+    }
+    let bytes = src.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return (start, src.len());
+    }
+    let tok_start = i;
+    if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        (tok_start, i)
+    } else {
+        let ch_len = src[tok_start..].chars().next().map_or(1, char::len_utf8);
+        (tok_start, tok_start + ch_len)
+    }
+}
+
+/// Locate an identifier token outside string literals and `--` comments (`LIN-0506`).
+fn find_ident_span(src: &str, ident: &str) -> Option<(usize, usize)> {
+    if ident.is_empty() {
+        return None;
+    }
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip `--` line comments
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Skip string literals
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip regex literals `/.../` if preceded by `~` or `regex` (conservative: only ident scan below)
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if &src[start..i] == ident {
+                return Some((start, i));
+            }
+            continue;
+        }
+        let ch = src[i..].chars().next()?;
+        i += ch.len_utf8();
+    }
+    None
 }
